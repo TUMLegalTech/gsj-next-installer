@@ -3,8 +3,10 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 
 
@@ -57,17 +59,67 @@ def local_path(data):
     return text.encode()
 
 
+PAYLOADS = frozenset(item[0] for item in SOURCES.values())
+
+
+def own_directory(path):
+    """The output directory: created here, private, or an existing plain
+    directory this user owns, not writable by group or others, holding nothing
+    but plain files this user owns, named as add-on payloads (a partial fetch
+    resumes; a previous run's inventory.json is not admitted). Anything else
+    is refused by name BEFORE any write: a symlink in place of the directory
+    or of an entry would otherwise turn a write here into a write elsewhere.
+    So would a symlink another user planted higher up the path (a shared
+    /tmp): a symlinked ancestor is admitted only when root or this user owns
+    it, and no ancestor is created here. Every check is an lstat. Returns the
+    refusal, or None."""
+    for ancestor in path.absolute().parents:
+        try:
+            link = os.lstat(ancestor)
+        except FileNotFoundError:
+            return f"refusing {path}: its parent {ancestor} does not exist (this run creates only the output directory itself)"
+        if stat.S_ISLNK(link.st_mode) and link.st_uid not in (0, os.geteuid()):
+            return f"refusing {path}: {ancestor} is a symlink owned by uid {link.st_uid}, neither root nor this user"
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        os.mkdir(path, 0o700)
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return f"refusing {path}: it is a symlink"
+    if not stat.S_ISDIR(info.st_mode):
+        return f"refusing {path}: not a directory"
+    if info.st_uid != os.geteuid():
+        return f"refusing {path}: owned by uid {info.st_uid}, not by this user (uid {os.geteuid()})"
+    if info.st_mode & 0o022:
+        return f"refusing {path}: writable by group or others (mode {stat.S_IMODE(info.st_mode):o})"
+    with os.scandir(path) as entries:
+        for entry in sorted(entries, key=lambda item: item.name):
+            found = entry.stat(follow_symlinks=False)
+            if entry.name not in PAYLOADS:
+                return f"refusing {path}: it holds {entry.name}; only an empty directory or a partial fetch of the fixed add-on files is admitted"
+            if stat.S_ISLNK(found.st_mode) or not stat.S_ISREG(found.st_mode):
+                return f"refusing {path}: {entry.name} is not a plain file"
+            if found.st_uid != os.geteuid():
+                return f"refusing {path}: {entry.name} is owned by uid {found.st_uid}, not by this user"
+    return None
+
+
+def write_new(path, data):
+    """Create-only: O_EXCL fails on any existing name, a link included, and
+    O_NOFOLLOW never opens through one."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(data)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    # An earlier run leaves its inventory.json beside the three payloads; a
-    # re-run over that directory is admitted (the payloads are byte-compared
-    # below, the inventory is rewritten). Anything else there is refused.
-    allowed = {item[0] for item in SOURCES.values()} | {"inventory.json"}
-    if args.output.exists() and any(p.name not in allowed for p in args.output.iterdir()):
-        parser.error("output must be empty or a previous preparation: only these fixed addon files and inventory.json")
-    args.output.mkdir(parents=True, exist_ok=True)
+    refusal = own_directory(args.output)
+    if refusal:
+        parser.error(refusal)
     addons, inputs = {}, {}
     for name, (filename, url, expected) in SOURCES.items():
         raw = subprocess.run(["curl", "--fail", "--silent", "--show-error", "--location", "--retry", "3", "--max-time", "120", url], check=True, capture_output=True).stdout
@@ -75,16 +127,17 @@ def main():
             raise ValueError("upstream addon hash mismatch: " + name)
         data = local_path(raw) if name == "localPath" else raw
         target = args.output / filename
-        if target.exists() and target.read_bytes() != data:
-            raise ValueError("refusing to replace a different existing addon payload")
-        if not target.exists():
-            target.write_bytes(data)
+        if target.exists():    # a partial fetch: own_directory admitted it as a plain file of this user's
+            if target.read_bytes() != data:
+                raise ValueError("refusing to replace a different existing addon payload")
+        else:
+            write_new(target, data)
         addon = {"path": "addons/" + filename, "sha256": digest(data), "sourceUrl": url, "sourceSha256": expected, "images": IMAGES[name]}
         if name == "localPath":
             addon.update(namespace="gsj-storage", provisioner="rancher.io/gsj-local-path", dataPath="/var/local-path-provisioner/gsj-managed", storageClassIncluded=False)
         addons[name] = addon
         inputs[filename] = {"path": str(target.resolve()), "sha256": digest(data)}
-    (args.output / "inventory.json").write_text(json.dumps({"addons": addons, "buildAddons": inputs}, sort_keys=True, indent=2) + "\n")
+    write_new(args.output / "inventory.json", (json.dumps({"addons": addons, "buildAddons": inputs}, sort_keys=True, indent=2) + "\n").encode())
     print(args.output / "inventory.json")
 
 

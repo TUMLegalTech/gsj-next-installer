@@ -328,10 +328,15 @@ disposable cluster that can pull the private images). No CI system runs any
 of this: the repository's workflow runs the tests alone, holds no secret and
 uses no self-hosted runner.
 
-Prepare the pinned optional cluster addons with:
+Prepare the pinned optional cluster addons into a fresh private directory
+— never a fixed path under `/tmp`, which another local user could have
+created or seeded (the preparation refuses a directory it did not create
+unless it is a plain directory of this user's, not group- or world-writable,
+holding only plain add-on files of this user's; a symlink in place of the
+directory or of any entry is refused by name before any write):
 
 ```sh
-python3 -B ops/installer/prepare-addons.py --output /tmp/gsj-addon-inputs
+python3 -B ops/installer/prepare-addons.py --output "$(mktemp -d)"
 ```
 
 The emitted `inventory.json` has `addons` for the public manifest and

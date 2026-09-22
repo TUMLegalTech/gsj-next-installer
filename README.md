@@ -161,14 +161,20 @@ GSJ_NEXT_DIR="$(pwd)/../gsj-next" GSJ_NEXT_WEB_DIR="$(pwd)/../gsj-next-web" \
 # installs it last: remove the client and put the embedded package back
 .venv/bin/pip uninstall -y chromadb-client
 .venv/bin/pip install --force-reinstall --no-deps chromadb==1.5.9
-# the add-on chart archives three tests read (fetched by hash, ~420 KB)
+# the add-on chart archives three tests read (fetched by hash, ~420 KB), into
+# a directory this run creates and owns (its parent must exist); to
+# re-stage, remove it first
+mkdir -p ops/.build && rm -rf ops/.build/installer-addons
 python3 -B ops/installer/prepare-addons.py --output ops/.build/installer-addons
 .venv/bin/python -m pytest -q
 ```
 
 Without the chromadb commands the fixtures that open a local Chroma store
 error at setup with "Chroma is running in http-only client mode"; without the
-staged add-on archives the three add-on cases skip. After a re-pin, reinstall
+staged add-on archives the three add-on cases skip (the preparation refuses
+a directory it did not create unless it is a plain directory of this user's
+holding only its own add-on files; a previous run's `inventory.json` counts
+as foreign, hence the removal first). After a re-pin, reinstall
 the product explicitly — `pip install --force-reinstall --no-deps
 "gsj-web[dev] @ git+file://…/gsj-next-web@<the new commit>"` — because pip
 keeps an installed `gsj-web` whose version number did not change even when

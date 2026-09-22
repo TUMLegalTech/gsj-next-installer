@@ -71,7 +71,7 @@ def missing_prerequisites():
     for name in ADDON_FILES:
         if not (ADDONS / name).is_file():
             missing.append(f"the add-on archive {ADDONS.relative_to(ROOT) / name} is not staged "
-                           "(README: python3 -B ops/installer/prepare-addons.py --output ops/.build/installer-addons)")
+                           "(README: mkdir -p ops/.build && rm -rf ops/.build/installer-addons, then python3 -B ops/installer/prepare-addons.py --output ops/.build/installer-addons)")
     if not ssl.create_default_context().verify_flags & ssl.VERIFY_X509_STRICT:
         missing.append("this interpreter is not X.509-strict by default (Python 3.13 or newer is); two tests skip on it")
     if not any(Path(p).is_file() for p in CA_BUNDLES):
