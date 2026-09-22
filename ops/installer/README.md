@@ -401,9 +401,18 @@ no private input.
    hold (the paragraph on the binding, above).
 4. **Build, sign, verify** (below), with the private key outside every
    repository.
-5. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
-   and populated upgrade/restore), then publication of the exact signed
-   bytes (`ci/stage.py`).
+5. **Staging** (`ci/stage.py`): the exact signed files — `gsj-install.sh`,
+   `installer-descriptor.sig`, then `installer-descriptor.json` last — are
+   created, create-only, at the version URL below `release_base_url` and read
+   back; its receipt (`staging.json`) is what qualification checks.
+6. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
+   and populated upgrade/restore): the populated upgrade acquires the
+   candidate from the staged version URL and holds the read-back receipt to
+   the staged bytes; the gate (`ci/qualify.py gate`) then requires every
+   report and receipt.
+7. **Publication**: the release assets (below) — `verify-release.sh`, the
+   public key, the descriptor, its signature and the installer — after the
+   gate has passed for these exact signed bytes.
 
 Build, sign, then verify the same installer bytes:
 
