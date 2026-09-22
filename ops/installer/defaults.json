@@ -1,0 +1,170 @@
+{
+  "schema_version": "gsj.site/1",
+  "target": {
+    "context": "",
+    "namespace": "gsj",
+    "release": "gsj"
+  },
+  "public_url": "",
+  "operator": {
+    "login": "operator",
+    "password_file": "",
+    "secret": "gsj-operator"
+  },
+  "registry": {
+    "config_file": "",
+    "pull_secret": ""
+  },
+  "llm": {
+    "base_url": "",
+    "model": "",
+    "context_window": 0,
+    "output_tokens": 0,
+    "flags": [],
+    "credential": {
+      "file": "",
+      "secret": ""
+    },
+    "allowed_origins": []
+  },
+  "ocr": {
+    "url": "",
+    "model": "glm-ocr",
+    "credential": {
+      "file": "",
+      "secret": ""
+    }
+  },
+  "storage": {
+    "profile": "reuse",
+    "class": "",
+    "node": "",
+    "backend_path": "/var/local-path-provisioner/gsj-managed",
+    "transfer_path": "",
+    "minimum_free_bytes": 21474836480,
+    "data": {
+      "size": "20Gi",
+      "existing_claim": ""
+    },
+    "forgejo": {
+      "size": "10Gi",
+      "existing_claim": ""
+    },
+    "chroma": {
+      "size": "20Gi",
+      "existing_claim": ""
+    }
+  },
+  "ingress": {
+    "profile": "reuse",
+    "class": "gsj-ingress",
+    "namespace": "gsj-ingress",
+    "service_type": "LoadBalancer",
+    "http_node_port": 30080,
+    "https_node_port": 30443
+  },
+  "tls": {
+    "profile": "existing",
+    "secret": "gsj-tls",
+    "certificate_file": "",
+    "private_key_file": "",
+    "ca_file": "",
+    "issuer": "",
+    "email": "",
+    "acme_server": "https://acme-v02.api.letsencrypt.org/directory"
+  },
+  "limits": {
+    "upload_mb": 64,
+    "worktree_cache_mb": 2048,
+    "turn_seconds": 600
+  },
+  "resources": {
+    "web": {
+      "requests": {
+        "cpu": "200m",
+        "memory": "2Gi"
+      },
+      "limits": {
+        "memory": "4Gi"
+      }
+    },
+    "mcp": {
+      "requests": {
+        "cpu": "200m",
+        "memory": "1Gi"
+      },
+      "limits": {
+        "memory": "2Gi"
+      }
+    },
+    "runner": {
+      "requests": {
+        "cpu": "100m",
+        "memory": "512Mi"
+      },
+      "limits": {
+        "memory": "2Gi"
+      }
+    },
+    "forgejo": {
+      "requests": {
+        "cpu": "100m",
+        "memory": "256Mi"
+      },
+      "limits": {
+        "memory": "1Gi"
+      }
+    },
+    "chroma": {
+      "requests": {
+        "cpu": "100m",
+        "memory": "4Gi"
+      },
+      "limits": {
+        "memory": "6Gi"
+      }
+    },
+    "initializer": {
+      "requests": {
+        "cpu": "2",
+        "memory": "4Gi"
+      },
+      "limits": {
+        "memory": "6Gi"
+      }
+    }
+  },
+  "trust": {
+    "ca_file": "",
+    "proxy_file": ""
+  },
+  "deadlines": {
+    "dependencies_seconds": 900,
+    "initialization_seconds": 86400,
+    "verification_seconds": 1800,
+    "attempts": 3
+  },
+  "backup": {
+    "directory": "",
+    "passphrase_file": "",
+    "offbox_url": "",
+    "ca_file": "",
+    "auth_header_file": ""
+  },
+  "verification": {
+    "connect_host": "",
+    "connect_port": 0,
+    "ca_file": ""
+  },
+  "corpus": {
+    "allow_update": false,
+    "repair_generation": 0,
+    "vectors_url": "",
+    "vectors_path": "",
+    "vectors_sha256": ""
+  },
+  "delivery": {
+    "ca_file": "",
+    "auth_header_file": ""
+  }
+}

@@ -1,0 +1,1049 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gsj.site/1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "x-ownership": "release-fixed",
+      "enum": [
+        "gsj.site/1"
+      ],
+      "default": "gsj.site/1"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "pattern": "^[^\u0000-\u001f\u007f]+$(?![\\s\\S])",
+          "default": ""
+        },
+        "namespace": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "gsj"
+        },
+        "release": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "gsj"
+        }
+      },
+      "required": [
+        "context",
+        "namespace",
+        "release"
+      ]
+    },
+    "public_url": {
+      "type": "string",
+      "x-ownership": "site-supplied",
+      "pattern": "^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/?$(?![\\s\\S])",
+      "default": ""
+    },
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "login": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "operator"
+        },
+        "password_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "default": ""
+        },
+        "secret": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "gsj-operator"
+        }
+      },
+      "required": [
+        "login",
+        "password_file",
+        "secret"
+      ]
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[a-z0-9]+(?:(?:\\.|_|__|-+)[a-z0-9]+)*)*)?$(?![\\s\\S])",
+          "x-format-hint": "a registry host with an optional path prefix, such as registry.example.org/team/project: no scheme, no trailing slash, no tag or digest, and a lowercase path"
+        },
+        "config_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "pull_secret": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        }
+      },
+      "required": [
+        "config_file",
+        "pull_secret"
+      ]
+    },
+    "llm": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^https?://[^/@?#:\\s][^/@?#\\s]*(/[^?#\\s]*)?$(?![\\s\\S])",
+          "default": ""
+        },
+        "model": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "pattern": "^[^#\\s]+$(?![\\s\\S])",
+          "default": ""
+        },
+        "context_window": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 0
+        },
+        "flags": {
+          "type": "array",
+          "x-ownership": "site-supplied",
+          "items": {
+            "type": "string",
+            "x-ownership": "site-supplied",
+            "enum": [
+              "no_think"
+            ]
+          },
+          "uniqueItems": true,
+          "default": []
+        },
+        "credential": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            },
+            "secret": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            }
+          },
+          "required": [
+            "file",
+            "secret"
+          ]
+        },
+        "allowed_origins": {
+          "type": "array",
+          "x-ownership": "site-supplied",
+          "items": {
+            "type": "string",
+            "x-ownership": "site-supplied",
+            "pattern": "^https?://[^/@?#:\\s][^/@?#\\s]*$(?![\\s\\S])"
+          },
+          "uniqueItems": true,
+          "default": []
+        }
+      },
+      "required": [
+        "base_url",
+        "model",
+        "context_window",
+        "output_tokens",
+        "flags",
+        "credential",
+        "allowed_origins"
+      ]
+    },
+    "ocr": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^https?://[^/@?#:\\s][^/@?#\\s]*/[^?#\\s]+$(?![\\s\\S])",
+          "default": ""
+        },
+        "model": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "default": "glm-ocr"
+        },
+        "credential": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            },
+            "secret": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            }
+          },
+          "required": [
+            "file",
+            "secret"
+          ]
+        }
+      },
+      "required": [
+        "url",
+        "model",
+        "credential"
+      ]
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "enum": [
+            "reuse",
+            "managed-local-path"
+          ],
+          "default": "reuse"
+        },
+        "class": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "default": ""
+        },
+        "node": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "backend_path": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^/[^.].*",
+          "default": "/var/local-path-provisioner/gsj-managed"
+        },
+        "transfer_path": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^(/[^.].*)?$",
+          "default": ""
+        },
+        "minimum_free_bytes": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 1073741824,
+          "maximum": 109951162777600,
+          "default": 21474836480
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti|m)?$",
+              "default": "20Gi"
+            },
+            "existing_claim": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            }
+          },
+          "required": [
+            "size",
+            "existing_claim"
+          ]
+        },
+        "forgejo": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti|m)?$",
+              "default": "10Gi"
+            },
+            "existing_claim": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            }
+          },
+          "required": [
+            "size",
+            "existing_claim"
+          ]
+        },
+        "chroma": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti|m)?$",
+              "default": "20Gi"
+            },
+            "existing_claim": {
+              "type": "string",
+              "x-ownership": "site-supplied",
+              "default": ""
+            }
+          },
+          "required": [
+            "size",
+            "existing_claim"
+          ]
+        }
+      },
+      "required": [
+        "profile",
+        "class",
+        "node",
+        "backend_path",
+        "minimum_free_bytes",
+        "data",
+        "forgejo",
+        "chroma"
+      ]
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "enum": [
+            "reuse",
+            "managed-traefik"
+          ],
+          "default": "reuse"
+        },
+        "class": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "gsj-ingress"
+        },
+        "namespace": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "gsj-ingress"
+        },
+        "service_type": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "enum": [
+            "LoadBalancer",
+            "NodePort"
+          ],
+          "default": "LoadBalancer"
+        },
+        "http_node_port": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 30000,
+          "maximum": 32767,
+          "default": 30080
+        },
+        "https_node_port": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 30000,
+          "maximum": 32767,
+          "default": 30443
+        }
+      },
+      "required": [
+        "profile",
+        "class",
+        "namespace",
+        "service_type",
+        "http_node_port",
+        "https_node_port"
+      ]
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "enum": [
+            "existing",
+            "files",
+            "managed-acme",
+            "managed-local-ca"
+          ],
+          "default": "existing"
+        },
+        "secret": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "default": "gsj-tls"
+        },
+        "certificate_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "private_key_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "ca_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "issuer": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "email": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "acme_server": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^https://[^\\s]+$(?![\\s\\S])",
+          "default": "https://acme-v02.api.letsencrypt.org/directory"
+        }
+      },
+      "required": [
+        "profile",
+        "secret",
+        "certificate_file",
+        "private_key_file",
+        "ca_file",
+        "issuer",
+        "email",
+        "acme_server"
+      ]
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "upload_mb": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 1,
+          "maximum": 2048,
+          "default": 64
+        },
+        "worktree_cache_mb": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 64,
+          "maximum": 2147483647,
+          "default": 2048
+        },
+        "turn_seconds": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 60,
+          "maximum": 7200,
+          "default": 600
+        }
+      },
+      "required": [
+        "upload_mb",
+        "worktree_cache_mb",
+        "turn_seconds"
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "web": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "default": "200m"
+                },
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "2Gi"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ]
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "4Gi"
+                },
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "description": "Optional CPU ceiling; omission leaves CPU unbounded by this container configuration."
+                }
+              },
+              "required": [
+                "memory"
+              ]
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ]
+        },
+        "mcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "default": "200m"
+                },
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "1Gi"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ]
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "2Gi"
+                },
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "description": "Optional CPU ceiling; omission leaves CPU unbounded by this container configuration."
+                }
+              },
+              "required": [
+                "memory"
+              ]
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ]
+        },
+        "runner": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "default": "100m"
+                },
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "512Mi"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ]
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "2Gi"
+                },
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "description": "Optional CPU ceiling; omission leaves CPU unbounded by this container configuration."
+                }
+              },
+              "required": [
+                "memory"
+              ]
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ]
+        },
+        "forgejo": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "default": "100m"
+                },
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "256Mi"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ]
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "1Gi"
+                },
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "description": "Optional CPU ceiling; omission leaves CPU unbounded by this container configuration."
+                }
+              },
+              "required": [
+                "memory"
+              ]
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ]
+        },
+        "chroma": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "default": "100m"
+                },
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "4Gi"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ]
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "6Gi"
+                },
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "description": "Optional CPU ceiling; omission leaves CPU unbounded by this container configuration."
+                }
+              },
+              "required": [
+                "memory"
+              ]
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ]
+        },
+        "initializer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "default": "2"
+                },
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "4Gi"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ]
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "memory": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(Ki|Mi|Gi|Ti)?$",
+                  "default": "6Gi"
+                },
+                "cpu": {
+                  "type": "string",
+                  "x-ownership": "site-supplied",
+                  "pattern": "^[1-9][0-9]*(m)?$",
+                  "description": "Optional CPU ceiling; omission leaves CPU unbounded by this container configuration."
+                }
+              },
+              "required": [
+                "memory"
+              ]
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ]
+        }
+      },
+      "required": [
+        "web",
+        "mcp",
+        "runner",
+        "forgejo",
+        "chroma",
+        "initializer"
+      ]
+    },
+    "trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ca_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "proxy_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        }
+      },
+      "required": [
+        "ca_file",
+        "proxy_file"
+      ]
+    },
+    "deadlines": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dependencies_seconds": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 60,
+          "maximum": 7200,
+          "default": 900
+        },
+        "initialization_seconds": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 600,
+          "maximum": 172800,
+          "default": 86400
+        },
+        "verification_seconds": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 300,
+          "maximum": 14400,
+          "default": 1800
+        },
+        "attempts": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        }
+      },
+      "required": [
+        "dependencies_seconds",
+        "initialization_seconds",
+        "verification_seconds",
+        "attempts"
+      ]
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "directory": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "default": ""
+        },
+        "passphrase_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "minLength": 1,
+          "default": ""
+        },
+        "offbox_url": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": "",
+          "pattern": "^$(?![\\s\\S])|^https://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[A-Za-z0-9._~/-]*)?$(?![\\s\\S])"
+        },
+        "ca_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "auth_header_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        }
+      },
+      "required": [
+        "directory",
+        "passphrase_file",
+        "offbox_url",
+        "ca_file",
+        "auth_header_file"
+      ]
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connect_host": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        },
+        "connect_port": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 0
+        },
+        "ca_file": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "default": ""
+        }
+      },
+      "required": [
+        "connect_host",
+        "connect_port",
+        "ca_file"
+      ]
+    },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow_update": {
+          "type": "boolean",
+          "x-ownership": "site-supplied",
+          "default": false
+        },
+        "repair_generation": {
+          "type": "integer",
+          "x-ownership": "site-supplied",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 0
+        },
+        "vectors_url": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^(https://.*|http://localhost:.*|http://127\\.0\\.0\\.1:.*)?$",
+          "default": ""
+        },
+        "vectors_path": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^(/[^.].*)?$",
+          "default": ""
+        },
+        "vectors_sha256": {
+          "type": "string",
+          "x-ownership": "site-supplied",
+          "pattern": "^([0-9a-f]{64})?$",
+          "default": ""
+        }
+      },
+      "required": [
+        "allow_update",
+        "repair_generation"
+      ]
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ca_file",
+        "auth_header_file"
+      ],
+      "properties": {
+        "ca_file": {
+          "type": "string",
+          "default": "",
+          "x-ownership": "site-supplied"
+        },
+        "auth_header_file": {
+          "type": "string",
+          "default": "",
+          "x-ownership": "site-supplied"
+        }
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "target",
+    "public_url",
+    "operator",
+    "registry",
+    "llm",
+    "ocr",
+    "storage",
+    "ingress",
+    "tls",
+    "limits",
+    "resources",
+    "trust",
+    "deadlines",
+    "backup",
+    "verification",
+    "corpus",
+    "delivery"
+  ]
+}

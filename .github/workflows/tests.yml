@@ -1,0 +1,36 @@
+# The installer's tests, on GitHub-hosted runners, with no secret and no
+# self-hosted runner: this repository is public, and a pull request from
+# anyone runs this workflow. The product it installs is private, so the
+# tests that read the pinned chart or import the product package are skipped
+# here (tests/conftest.py and tests/pinned_web.py name them); a maintainer runs
+# the whole suite with the siblings in place (README, Building and testing).
+# Building, signing, qualifying and publishing a release are hand-run.
+name: tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Engineering clients by their catalog hashes (helm); jq from the runner image
+        run: |
+          set -eu
+          python3 -B ops/installer/ci/release.py clients --output "$RUNNER_TEMP/gsj-clients"
+          echo "$RUNNER_TEMP/gsj-clients" >> "$GITHUB_PATH"
+          jq --version
+      - name: Test environment (the product package is absent here; its tests skip)
+        run: |
+          set -eu
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check -r ops/installer/ci/regression-requirements.txt
+      - name: Tests
+        run: .venv/bin/python -m pytest -q -rs -p no:cacheprovider

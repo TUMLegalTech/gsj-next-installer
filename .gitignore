@@ -1,0 +1,18 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# engineering build inputs staged locally: the bare clones of the pinned core
+# and product repositories, the add-on chart archives, corpus payloads and
+# model files. Never committed; the README says how to stage them.
+ops/.build
+
+# a maintainer's own notes from local qualification runs are kept beside the
+# installer and never committed.
+ops/installer/ACCEPTANCE.md
+
+# editor/os noise
+.DS_Store

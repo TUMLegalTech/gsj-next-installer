@@ -1,0 +1,23 @@
+# THE PINS. The installer's engineering environment installs the exact
+# product it builds against and the exact library that product ships, both
+# from local Git clones at immutable commits. web-pin.json is the authority for
+# the product commit; tests/test_web_pin.py holds this file to it and the
+# library tag to the product's own pin home (requirements-local.txt at the
+# pinned commit). Neither pin is a working tree: pip clones the named commit.
+#
+# Install (sibling layout: ../gsj-next and ../gsj-next-web beside this clone):
+#   python3 -m venv .venv
+#   GSJ_NEXT_DIR="$(pwd)/../gsj-next" GSJ_NEXT_WEB_DIR="$(pwd)/../gsj-next-web" \
+#     .venv/bin/pip install -r requirements-local.txt
+#
+# Then, because the library depends on chromadb-client (which ships the same
+# `chromadb` package as the embedded chromadb the tests need and overwrites it
+# when pip installs it last):
+#   .venv/bin/pip uninstall -y chromadb-client
+#   .venv/bin/pip install --force-reinstall --no-deps chromadb==1.5.9
+#
+# The generated installer needs none of this: it runs on Bash, jq, kubectl and
+# Helm. These are the tests' and the builder's dependencies only.
+gsj[cli] @ git+file://${GSJ_NEXT_DIR}@v4.12.1-snowflake
+gsj-web[dev] @ git+file://${GSJ_NEXT_WEB_DIR}@3604ba471a80192beed4ddddc5d212d192dfc660
+-r ops/installer/ci/regression-requirements.txt

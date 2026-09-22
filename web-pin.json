@@ -1,0 +1,18 @@
+{
+  "schema": "gsj.web-pin/1",
+  "repository": "TUMLegalTech/gsj-next-web",
+  "commit": "3604ba471a80192beed4ddddc5d212d192dfc660",
+  "release": "",
+  "chart": {
+    "version": "0.10.0-beta.5",
+    "tree": "eb2cf0f5dfe4297cdd6a1d84c759700ba9aeebde",
+    "sha256": "3a390fba848ef44287edb166f0cefa9833583668852c31ae68303bd836d45a60"
+  },
+  "gsj_deploy": {
+    "tree": "cad78b4e929393f374d09c74c6991a63ef30f2ac"
+  },
+  "core": {
+    "tag": "v4.12.1-snowflake"
+  },
+  "images": {}
+}

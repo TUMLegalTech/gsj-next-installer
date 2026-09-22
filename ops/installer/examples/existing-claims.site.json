@@ -1,0 +1,71 @@
+{
+  "schema_version": "gsj.site/1",
+  "target": {
+    "context": "production",
+    "namespace": "gsj",
+    "release": "gsj"
+  },
+  "public_url": "https://cases.example.org",
+  "operator": {
+    "login": "operator",
+    "password_file": "credentials/operator-password"
+  },
+  "llm": {
+    "base_url": "https://models.example.org/v1",
+    "model": "your-deployed-model",
+    "context_window": 131072,
+    "output_tokens": 8192,
+    "credential": {
+      "file": "credentials/llm-key"
+    },
+    "allowed_origins": []
+  },
+  "ocr": {
+    "url": "https://ocr.example.org/v1/chat/completions",
+    "model": "glm-ocr",
+    "credential": {
+      "file": "credentials/ocr-key"
+    }
+  },
+  "storage": {
+    "profile": "reuse",
+    "class": "local-path",
+    "node": "worker-1",
+    "transfer_path": "/srv/gsj/transfer",
+    "data": {
+      "existing_claim": "gsj-data"
+    },
+    "forgejo": {
+      "existing_claim": "gsj-forgejo"
+    },
+    "chroma": {
+      "existing_claim": "gsj-chroma"
+    }
+  },
+  "ingress": {
+    "profile": "reuse",
+    "class": "nginx",
+    "namespace": "ingress-nginx"
+  },
+  "tls": {
+    "profile": "files",
+    "secret": "gsj-tls",
+    "certificate_file": "certificates/fullchain.pem",
+    "private_key_file": "credentials/tls-key.pem"
+  },
+  "backup": {
+    "directory": "/backups/application",
+    "passphrase_file": "credentials/backup-passphrase"
+  },
+  "deadlines": {
+    "initialization_seconds": 86400
+  },
+  "registry": {
+    "config_file": "credentials/registry-auth.json",
+    "pull_secret": "gsj-pull"
+  },
+  "corpus": {
+    "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.f93c956f/vectors.json",
+    "vectors_sha256": "15bf3fb0530af8e2cb3941f0b35bf2454cc3d21bad55a467465f5939a502399c"
+  }
+}
