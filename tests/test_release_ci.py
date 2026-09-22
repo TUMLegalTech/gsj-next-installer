@@ -120,6 +120,27 @@ def test_the_preparation_reports_its_own_refusal_in_words_and_a_transport_error_
     assert err.strip() == "Release preparation failed: ValueError" and "s3cr3t" not in err
 
 
+def test_a_digest_mismatch_names_the_image_and_both_digests_through_the_cli(modules, tmp_path, monkeypatch, capsys):
+    """The registry serves a digest other than the approved one: the refusal
+    names the image, the digest the registry serves and the approved one, and
+    the CLI prints that sentence -- it is the refusal whose values the
+    maintainer most needs."""
+    module = modules[0]
+    served, approved = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: served + "\n")
+    with pytest.raises(module.Refused) as refused:
+        module.inspect_image("registry.example/gsj-web@" + approved)
+    sentence = str(refused.value)
+    assert "registry.example/gsj-web" in sentence and served in sentence and approved in sentence, sentence
+    monkeypatch.setattr(module, "build", lambda destination: module.inspect_image("registry.example/gsj-web@" + approved))
+    monkeypatch.setattr(sys, "argv", ["release.py", "build", "--output", str(tmp_path)])
+    with pytest.raises(SystemExit) as stopped:
+        module.main()
+    assert stopped.value.code == 1
+    err = capsys.readouterr().err
+    assert "Release preparation failed: remote image differs from its approved digest: registry.example/gsj-web is " + served in err and approved in err, err
+
+
 def installed_state(module):
     manifest = {"identity": "target-identity", "images": {"web": "fixed"}, "corpus": {"fingerprint": "a" * 64}}
     report = {"status": "passed", "cleanup_users": "passed", "case_and_pat_cleanup": "passed",

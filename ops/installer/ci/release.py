@@ -39,8 +39,9 @@ FROM = re.compile(r"\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*",
 
 
 class Refused(ValueError):
-    """This script's own refusals: fixed sentences that carry no URL, token or
-    file content. Only these are printed in words by main(); every other
+    """This script's own refusals: sentences that carry no URL, token or file
+    content (the digest mismatch names the image and the two digests it
+    disagrees on). Only these are printed in words by main(); every other
     exception, a library ValueError included, is reported by its type alone
     (http.client's "Invalid header value" quotes the whole bearer token)."""
 
@@ -159,7 +160,9 @@ def inspect_image(reference, *, allow_additional_platforms=False):
     digest = run("docker", "buildx", "imagetools", "inspect", reference, "--format", "{{.Manifest.Digest}}", capture=True).strip()
     require(DIGEST.fullmatch(digest), "remote image digest is unavailable")
     repository = reference.rsplit("@", 1)[0] if "@" in reference else reference.rsplit(":", 1)[0]
-    require("@" not in reference or reference.rsplit("@", 1)[1] == digest, "remote image differs from its approved digest")
+    if "@" in reference and reference.rsplit("@", 1)[1] != digest:
+        # The one refusal whose values the maintainer needs: the image, the digest approved for it and the one the registry serves.
+        raise Refused(f"remote image differs from its approved digest: {repository} is {digest} in the registry, {reference.rsplit('@', 1)[1]} was approved")
     immutable = repository + "@" + digest
     raw = json.loads(run("docker", "buildx", "imagetools", "inspect", immutable, "--raw", capture=True))
     if "manifests" in raw:
@@ -295,7 +298,7 @@ def main():
     try:
         {"inputs": inputs, "build": build, "clients": clients}[args.command](args.output.resolve())
     except Refused as exc:
-        # Only this script's own fixed sentences are said in words.
+        # Only this script's own refusal sentences are said in words.
         print("Release preparation failed: " + str(exc), file=sys.stderr)
         raise SystemExit(1)
     except Exception as exc:
