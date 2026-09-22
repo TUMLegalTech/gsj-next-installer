@@ -2836,8 +2836,11 @@ the client-tool cache has always had the same property, but a 1.5 GiB object
 leaves the window open far longer.
 
 **No egress?** Download the eight assets on a machine that has it (about
-1.6 GiB land in a fresh directory under its `TMPDIR`, else `/tmp` — `export
-TMPDIR=<a directory with room>` first if that is small), copy them into one
+1.6 GiB land in a fresh private directory that `mktemp -d` makes and the
+block prints — what is guaranteed is a private directory of your own, not
+where it sits: Linux places it under `TMPDIR`, else `/tmp`; macOS may place it
+elsewhere whatever `TMPDIR` says — so read the printed path and make sure
+that filesystem has the room), copy them into one
 directory on the installer host, `chmod 600 vectors.json`, and name the
 manifest with `corpus.vectors_path` instead — the blocks must sit beside it.
 The manifest names them, so nothing has to be guessed:
@@ -2851,7 +2854,7 @@ build the URL there:
 if [ -z "${FP:-}" ]; then
   echo 'set first, then paste this block again -- FP=<the corpus.fingerprint you carried from the installer host>' >&2
 elif ! VECTORS_DIR=$(mktemp -d) || ! cd "$VECTORS_DIR"; then
-  echo 'NO DOWNLOAD -- this block needs a writable temporary directory on this machine (export TMPDIR=<a directory with room> first)' >&2
+  echo 'NO DOWNLOAD -- this block needs a writable temporary directory on this machine (mktemp -d failed; on Linux, export TMPDIR=<a writable directory with room> first)' >&2
 else
   pwd                                         # a fresh private directory of your own: the eight files land here, to be carried over
   VECTORS_URL="https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.${FP:0:8}/vectors.json"
