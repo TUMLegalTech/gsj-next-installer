@@ -35,8 +35,8 @@ def test_the_pin_file_is_well_formed():
 
 @pytest.mark.parametrize("mutation", [
     lambda p: p.update(commit="abc"),
-    lambda p: p.update(release="v0.10.0"),                       # a release with no images
-    lambda p: p.update(images={"web": {"repository": "r", "digest": "sha256:" + "a" * 64}}),  # images with no release
+    lambda p: p.update(release="v0.10.0", images={}),            # a release with no images
+    lambda p: p.update(release="", images={"web": {"repository": "r", "digest": "sha256:" + "a" * 64}}),  # images with no release
     lambda p: p["chart"].update(sha256="short"),
     lambda p: p.pop("gsj_deploy"),
     lambda p: p["core"].update(tag="4.12.1"),
