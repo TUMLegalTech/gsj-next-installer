@@ -898,9 +898,9 @@ of it — run these from there, or re-point `INSTALLER` at an absolute path:
 cd "$HOME/gsj-operator/releases/r1"       # where payload/marker resolve
 FP=$(payload release.json | jq -r .corpus.fingerprint)
 VECTORS_URL="https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.${FP:0:8}/vectors.json"
-curl -fsSL "$VECTORS_URL" -o /tmp/vectors.json
-sha256sum /tmp/vectors.json                                  # -> corpus.vectors_sha256
-jq -r .corpus_fingerprint /tmp/vectors.json                  # must equal $FP exactly
+VECTORS_DIR=$(mktemp -d) && curl -fsSL "$VECTORS_URL" -o "$VECTORS_DIR/vectors.json"   # a private directory of your own, never a fixed /tmp path another user could pre-seed; no directory, no download
+sha256sum "$VECTORS_DIR/vectors.json"                        # -> corpus.vectors_sha256
+jq -r .corpus_fingerprint "$VECTORS_DIR/vectors.json"        # must equal $FP exactly
 ```
 
 The tag's leading part names this corpus generation's model and dimensions; the
@@ -2835,10 +2835,12 @@ both refuse with a hash mismatch. Re-running either one afterwards recovers;
 the client-tool cache has always had the same property, but a 1.5 GiB object
 leaves the window open far longer.
 
-**No egress?** Download the eight assets on a machine that has it, copy them
-into one directory on the installer host, `chmod 600 vectors.json`, and name
-the manifest with `corpus.vectors_path` instead — the blocks must sit beside
-it. The manifest names them, so nothing has to be guessed:
+**No egress?** Download the eight assets on a machine that has it (about
+1.6 GiB land in a fresh directory under its `TMPDIR`, else `/tmp` — `export
+TMPDIR=<a directory with room>` first if that is small), copy them into one
+directory on the installer host, `chmod 600 vectors.json`, and name the
+manifest with `corpus.vectors_path` instead — the blocks must sit beside it.
+The manifest names them, so nothing has to be guessed:
 
 Carry your release's `corpus.fingerprint` to that machine — a 64-character
 sha256, of which the tag uses the **first eight**; read it with
@@ -2848,7 +2850,10 @@ build the URL there:
 ```sh
 if [ -z "${FP:-}" ]; then
   echo 'set first, then paste this block again -- FP=<the corpus.fingerprint you carried from the installer host>' >&2
+elif ! VECTORS_DIR=$(mktemp -d) || ! cd "$VECTORS_DIR"; then
+  echo 'NO DOWNLOAD -- this block needs a writable temporary directory on this machine (export TMPDIR=<a directory with room> first)' >&2
 else
+  pwd                                         # a fresh private directory of your own: the eight files land here, to be carried over
   VECTORS_URL="https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.${FP:0:8}/vectors.json"
   curl -fsSL "$VECTORS_URL" -o vectors.json
   jq -r '.shards[].archive' vectors.json      # the block filenames it names
