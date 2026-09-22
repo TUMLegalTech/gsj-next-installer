@@ -38,9 +38,16 @@ PLATFORM = "linux/amd64"
 FROM = re.compile(r"\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*", re.I)
 
 
+class Refused(ValueError):
+    """This script's own refusals: fixed sentences that carry no URL, token or
+    file content. Only these are printed in words by main(); every other
+    exception, a library ValueError included, is reported by its type alone
+    (http.client's "Invalid header value" quotes the whole bearer token)."""
+
+
 def require(value, message):
     if not value:
-        raise ValueError(message)
+        raise Refused(message)
 
 
 def run(*args, capture=False, **kw):
@@ -62,7 +69,7 @@ def save(path, value):
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
-        raise ValueError("release inputs must use their final HTTPS origin; redirects are refused")
+        raise Refused("release inputs must use their final HTTPS origin; redirects are refused")
 
 
 class PublicHttpsRedirect(urllib.request.HTTPRedirectHandler):
@@ -287,8 +294,13 @@ def main():
     os.umask(0o077)
     try:
         {"inputs": inputs, "build": build, "clients": clients}[args.command](args.output.resolve())
+    except Refused as exc:
+        # Only this script's own fixed sentences are said in words.
+        print("Release preparation failed: " + str(exc), file=sys.stderr)
+        raise SystemExit(1)
     except Exception as exc:
-        # Transport exceptions may contain signed URLs; report type only.
+        # Everything else, a library ValueError included, may quote a signed
+        # URL, a header or file content: report the type only.
         print("Release preparation failed: " + type(exc).__name__, file=sys.stderr)
         raise SystemExit(1)
 

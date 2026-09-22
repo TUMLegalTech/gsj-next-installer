@@ -90,6 +90,36 @@ def test_a_release_build_refuses_a_pin_without_a_product_release(modules, tmp_pa
         modules[0].build(tmp_path)
 
 
+def test_the_preparation_reports_its_own_refusal_in_words_and_a_transport_error_by_type_only(modules, tmp_path, monkeypatch, capsys):
+    """`main` used to print only the exception's type, hiding the sentence a
+    refusal carries (the pin's). Its own refusals are `Refused`, fixed
+    sentences with no URL: they are printed. Anything else -- a transport
+    error, a library ValueError quoting a header or a URL -- stays a bare
+    type name."""
+    module = modules[0]
+    (tmp_path / "inputs.json").write_text("{}")
+    pin = dict(module.webpin.load())
+    pin.update(release="", images={})
+    monkeypatch.setattr(module.webpin, "load", lambda path=None: pin)
+    monkeypatch.setattr(sys, "argv", ["release.py", "build", "--output", str(tmp_path)])
+    with pytest.raises(SystemExit) as stopped:
+        module.main()
+    assert stopped.value.code == 1
+    assert "Release preparation failed: web-pin.json names no product release yet" in capsys.readouterr().err
+    import urllib.error
+    monkeypatch.setattr(module, "build", lambda destination: (_ for _ in ()).throw(urllib.error.URLError("https://token@origin.example/signed")))
+    with pytest.raises(SystemExit):
+        module.main()
+    err = capsys.readouterr().err
+    assert err.strip() == "Release preparation failed: URLError" and "token@" not in err
+    monkeypatch.setattr(module, "inputs", lambda destination: (_ for _ in ()).throw(ValueError("Invalid header value b'Bearer s3cr3t\\r'")))
+    monkeypatch.setattr(sys, "argv", ["release.py", "inputs", "--output", str(tmp_path / "inputs")])
+    with pytest.raises(SystemExit):
+        module.main()
+    err = capsys.readouterr().err
+    assert err.strip() == "Release preparation failed: ValueError" and "s3cr3t" not in err
+
+
 def installed_state(module):
     manifest = {"identity": "target-identity", "images": {"web": "fixed"}, "corpus": {"fingerprint": "a" * 64}}
     report = {"status": "passed", "cleanup_users": "passed", "case_and_pat_cleanup": "passed",
