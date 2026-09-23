@@ -537,3 +537,53 @@ def test_proof_pod_retry_preserves_raw_quantity_intent_and_same_uid(pods):
     assert state['object']['spec']['containers'][0]['resources']['limits']=={'cpu':'1','memory':'1Gi'}
     assert (m['saved']/'pods/gsj-proof.uid').read_text().strip()==state['object']['metadata']['uid']=='owned-uid'
     assert sum(a[0]=='create' for a in state['calls'])==1
+
+
+# --- The misattribution pass: a fingerprint that could not be read is not "credentials changed" ----
+
+def test_a_fingerprint_over_a_partial_snapshot_is_a_failure_not_a_digest(shell):
+    """backup_credential_fingerprint runs inside $(...), where bash does not
+    inherit set -e: a kubectl that failed part-way left a partial snapshot,
+    the function still printed a digest of it, and the caller read
+    "credentials changed". A snapshot that could not be taken must be a
+    failure, never a digest."""
+    body = '''backup_resources() { printf '{"items":[]}' > "$GSJ_WORK/cluster-private.json"; return 1; }
+if out=$(backup_credential_fingerprint); then echo "DIGEST:$out"; else echo "FAILED:${out:-empty}"; fi
+'''
+    result = shell['run'](body)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == 'FAILED:empty', result.stdout
+
+
+def test_every_fingerprint_read_in_the_recovery_helper_captures_its_failure():
+    """The three comparisons in startup-recovery.sh must read the fingerprint
+    into a variable and stop with the fingerprint's own words when the read
+    fails; a bare `[[ $(backup_credential_fingerprint) == … ]]` compares an
+    empty string and blames the credentials."""
+    import re
+    text = HELPER.read_text()
+    uses = [line for line in text.splitlines() if 'backup_credential_fingerprint' in line]
+    assert len(uses) >= 3
+    for line in uses:
+        assert re.search(r'=\$\(backup_credential_fingerprint\) \|\| fail ', line), line
+        assert '[[ $(backup_credential_fingerprint)' not in line, line
+
+
+def test_a_proof_that_ends_with_the_lock_code_names_the_lock_not_a_failed_inventory(shell):
+    body = '''assert_owner() { :; }; startup_proof_progress() { :; }
+mkdir -p "$STATE_DIR/startup-source-$OPERATION"
+startup_proof_run "$GSJ_WORK/result.json" bash -c 'echo receipt-words >&2; exit 78'
+'''
+    result = shell['run'](body)
+    assert result.returncode == 1
+    assert 'inventory proof failed' not in result.stderr
+    assert 'holds the lock' in result.stderr and '78' in result.stderr
+    body2 = '''assert_owner() { :; }; startup_proof_progress() { :; }
+mkdir -p "$STATE_DIR/startup-source-$OPERATION"
+startup_proof_run "$GSJ_WORK/result.json" bash -c 'echo receipt-words >&2; exit 3'
+'''
+    result = shell['run'](body2)
+    assert result.returncode == 1
+    assert 'did not complete (exit 3)' in result.stderr and 'receipt-words' not in result.stderr
+    receipt = shell['state'] / f'startup-source-{OP}' / 'proof-private.log'
+    assert receipt.is_file() and 'receipt-words' in receipt.read_text()

@@ -2856,7 +2856,7 @@ prepare_backup_round() {
  if jq -e 'has("storage_bindings")' "$snapshot" >/dev/null; then
    jq -e --slurpfile current "$GSJ_WORK/round-bindings.json" '.storage_bindings==$current[0]' "$snapshot" >/dev/null || fail 'source PV identity changed since the previous backup round'
  fi
- fingerprint=$(backup_credential_fingerprint)
+ fingerprint=$(backup_credential_fingerprint) || fail 'the credential fingerprint could not be read from the cluster; nothing was compared' || fail 'the credential fingerprint could not be read from the cluster; nothing was compared' || fail 'the credential fingerprint could not be read from the cluster; nothing was compared'
  k get deploy -l "app.kubernetes.io/instance=$RELEASE" -o json > "$GSJ_WORK/round-controllers.json"
  jq -e --slurpfile before "$GSJ_WORK/backup-source-controllers.json" 'def exact: [.items[]|{name:.metadata.name,uid:.metadata.uid,generation:.metadata.generation,spec}]|sort_by(.name); exact==($before[0]|exact)' "$GSJ_WORK/round-controllers.json" >/dev/null || fail 'source controllers changed while preparing a backup round'
  jq -n --arg operation "$OPERATION" --argjson round "$round" --arg archive "$BACKUP_DIR/$OPERATION.r$round.tar.gz.enc" --arg target "$(jq -r .target "$STATE_DIR/operation.json")" --arg site "$(sha_file "$SITE")" --arg previous "$previous" --arg receipt "$(sha_file "$previous.json")" --arg fingerprint "$fingerprint" --slurpfile installed "$GSJ_WORK/installed.json" --slurpfile controllers "$GSJ_WORK/round-controllers.json" --slurpfile bindings "$GSJ_WORK/round-bindings.json" '{format:"gsj.backup-round/1",operation:$operation,round:$round,archive:$archive,target:$target,site_sha256:$site,previous_archive:$previous,previous_receipt_sha256:$receipt,source:{format:"gsj.quiescence/1",operation:$operation,round:$round,credential_fingerprint:$fingerprint,installed:$installed[0],controllers:$controllers[0],storage_bindings:$bindings[0]}}' > "$GSJ_WORK/round-candidate.json"
@@ -2873,6 +2873,12 @@ prepare_backup_round() {
 backup_credential_fingerprint() {
  # Hash the combined credential/config bundle, not individual low-entropy
  # passwords. Only this digest enters the private quiescence record.
+ # Always called inside $(...), where bash does not inherit set -e: a kubectl
+ # that failed part-way used to leave a partial snapshot whose digest was
+ # then printed -- and read by the caller as "credentials changed". Errexit
+ # is switched on here explicitly, so a snapshot that could not be taken is
+ # a failure of this function, never a digest (the misattribution pass).
+ set -eo pipefail
  backup_resources
  jq -cS '[.items[]|select(.kind=="Secret" or .kind=="ConfigMap")|{kind,name:.metadata.name,namespace:.metadata.namespace,type,data,immutable}]|sort_by(.kind,.namespace,.name)' "$GSJ_WORK/cluster-private.json" | openssl dgst -sha256 | awk '{print $NF}'
 }
@@ -3098,7 +3104,7 @@ quiesce() {
          .name=="GSJ_DEPLOYMENT_GENERATION" and (.value|startswith($s.manifest.identity+":"))) and
      ($s.status=="complete" or $s.status=="verification-pending")
    ' "$GSJ_WORK/controllers-current.json" >/dev/null || fail 'live controllers do not prove the recorded source release; refusing a backup of a partially changed target'
-   local credential_fingerprint; credential_fingerprint=$(backup_credential_fingerprint)
+   local credential_fingerprint; credential_fingerprint=$(backup_credential_fingerprint) || fail 'the credential fingerprint could not be read from the cluster; nothing was compared'
    backup_storage_bindings > "$GSJ_WORK/quiescence-bindings.json"
    jq -n --arg operation "$OPERATION" --argjson round "$(backup_round_number)" --arg fingerprint "$credential_fingerprint" --slurpfile installed "$GSJ_WORK/installed.json" --slurpfile controllers "$GSJ_WORK/controllers-current.json" --slurpfile bindings "$GSJ_WORK/quiescence-bindings.json" '{format:"gsj.quiescence/1",operation:$operation,round:$round,credential_fingerprint:$fingerprint,installed:$installed[0],controllers:$controllers[0],storage_bindings:$bindings[0]}' > "$GSJ_WORK/quiescence-candidate.json"
    validate_quiescence_snapshot "$GSJ_WORK/quiescence-candidate.json"

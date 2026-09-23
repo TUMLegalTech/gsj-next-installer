@@ -313,7 +313,15 @@ startup_proof_run() {
  wait "$pid" || rc=$?
  GSJ_ADDON_COMMAND_PID=''
  startup_proof_progress "$private" "$progress"
- (( rc == 0 )) || fail 'source inventory proof failed; inspect its private receipt and safe shard progress'
+ if (( rc != 0 )); then
+   # The receipt the refusal names must outlive the working directory, which
+   # is removed at exit; and exit 78 is the helpers' lock code, not a failed
+   # inventory (the misattribution pass).
+   local receipt="$STATE_DIR/startup-source-$OPERATION/proof-private.log"
+   mkdir -p "$STATE_DIR/startup-source-$OPERATION"; cp "$private" "$receipt" 2>/dev/null || : > "$receipt"; chmod 600 "$receipt"
+   if (( rc == 78 )); then fail "source inventory proof did not run: another verifier, restore or source proof holds the lock (exit 78); wait, then resume"; fi
+   fail "source inventory proof did not complete (exit $rc); the corpus was not judged. Its private receipt is at $receipt and the safe shard progress at $progress"
+ fi
  assert_owner
 }
 
@@ -366,14 +374,14 @@ startup_source_complete() {
      startup_source_projection_matches "$GSJ_WORK/startup-saved-projection.json" "$STARTUP_CONTROL_DIR/expected.json" || fail 'partially recorded startup workloads differ from the signed source'
      jq -e --slurpfile control "$saved/control.json" '[.[]|{kind,name:.metadata.name,uid:.metadata.uid}]==$control[0].resources' "$saved/actual.json" >/dev/null || fail 'partially recorded startup workload identities differ'
    else startup_intent_file "$STARTUP_CONTROL_DIR/actual.json" "$saved/actual.json"; fi
-   fingerprint=$(backup_credential_fingerprint)
+   fingerprint=$(backup_credential_fingerprint) || fail 'the credential fingerprint could not be read from the cluster; nothing was compared'
    backup_storage_bindings > "$GSJ_WORK/startup-bindings.json"
    jq -n --arg operation "$OPERATION" --arg fingerprint "$fingerprint" --slurpfile installed "$GSJ_WORK/installed.json" --slurpfile actual "$saved/actual.json" --slurpfile bindings "$GSJ_WORK/startup-bindings.json" '{format:"gsj.quiescence/1",operation:$operation,round:0,credential_fingerprint:$fingerprint,installed:$installed[0],controllers:{items:[$actual[0][]|select(.kind=="Deployment")]},storage_bindings:$bindings[0]}' > "$GSJ_WORK/startup-quiescence-intent.json"
    startup_intent_file "$GSJ_WORK/startup-quiescence-intent.json" "$saved/quiescence-intent.json"
    # The pointer commits before any application scale operation.
    jq --arg control "$(sha_file "$saved/control.json")" --arg quiescence "$(sha_file "$saved/quiescence-intent.json")" --arg identity "$(jq -r .manifest.identity "$GSJ_WORK/installed.json")" '.startup_source={release_identity:$identity,control_sha256:$control,quiescence_sha256:$quiescence}|.status="startup-proving"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
  fi
- fingerprint=$(backup_credential_fingerprint)
+ fingerprint=$(backup_credential_fingerprint) || fail 'the credential fingerprint could not be read from the cluster; nothing was compared'
  [[ $fingerprint == $(jq -r .credential_fingerprint "$saved/quiescence-intent.json") ]] || fail 'startup credentials/configuration changed during recovery'
  if [[ ! -f $saved/source.json ]]; then
    if [[ ! -f $saved/data-proof.json ]]; then
@@ -400,7 +408,8 @@ startup_source_complete() {
    startup_delete_pod "$pod"
    # Re-check source identities after both actual read-only runtime proofs.
    startup_source_select
-   [[ $(backup_credential_fingerprint) == "$fingerprint" ]] || fail 'source credentials changed during proof'
+   local current; current=$(backup_credential_fingerprint) || fail 'the credential fingerprint could not be read from the cluster; nothing was compared'
+   [[ $current == "$fingerprint" ]] || fail 'source credentials changed during proof'
    jq --arg control "$(sha_file "$saved/control.json")" --arg proof "$(sha_file "$saved/data-proof.json")" --arg credential "$(sha_file "$saved/credentials.json")" '.status="startup-complete"|.startup_proof={control_sha256:$control,data_sha256:$proof,credentials_sha256:$credential}|.application_readiness_verified=false' "$GSJ_WORK/installed.json" | immutable_file "$saved/source.json"
  fi
  cp "$saved/source.json" "$GSJ_WORK/installed.json"
