@@ -156,7 +156,49 @@ def inputs(destination):
         download(item, destination / "baseline" / {"installer": "gsj-install.sh", "descriptor": "installer-descriptor.json", "signature": "installer-descriptor.sig", "trust": "release.pem"}[role], input_token(item["url"]))
 
 
-def inspect_image(reference, *, allow_additional_platforms=False):
+def remote_config(reference):
+    """The image config of ONE single-platform manifest, read from the
+    registry (`imagetools inspect --format '{{json .Image}}'`): its OS and
+    architecture and its rootfs diff_ids, without pulling a layer. A
+    multi-platform reference answers a map per platform, which is not what a
+    child digest names; it is refused rather than guessed at."""
+    config = json.loads(run("docker", "buildx", "imagetools", "inspect", reference, "--format", "{{json .Image}}", capture=True))
+    require(isinstance(config, dict) and isinstance(config.get("os"), str) and isinstance(config.get("architecture"), str)
+            and isinstance(config.get("rootfs", {}).get("diff_ids"), list), "remote image config is unavailable for a single manifest")
+    return config
+
+
+def native_child(image):
+    """The pulled/inspected reference of an inventory entry: the repository at
+    its native-platform CHILD digest. The index digest is what the release
+    pins and the registry serves; the child is the only manifest a
+    single-platform engine ever holds locally, so every `docker image
+    inspect`, `docker create` and `docker run` below names the child. The
+    PROMOTION preparation inspected the index and found "No such image" on a
+    clean engine until the four product images had been pulled by hand."""
+    return image["repository"] + "@" + image["platforms"][PLATFORM]
+
+
+def present(reference):
+    """Whether the engine already holds this exact reference (a pull is then
+    a no-op that still costs a registry request, so it is not made)."""
+    try:
+        run("docker", "image", "inspect", reference, capture=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def inspect_image(reference, *, allow_additional_platforms=False, pull=False):
+    """Inspect one image in its registry: the digest it serves (refused by
+    name when it differs from an approved one), its native child, and that
+    child's platform. `pull=True` also pulls the child, once -- an image
+    already present is not pulled again -- for the four product images whose
+    packages are listed offline and whose corpus manifest is copied out.
+    Everything else (base images, add-on images, the two upstream copies) is
+    verified from the registry alone: no layer is downloaded, and Docker
+    Hub's anonymous pull budget is charged one manifest read per image, not
+    a pull per image per run."""
     digest = run("docker", "buildx", "imagetools", "inspect", reference, "--format", "{{.Manifest.Digest}}", capture=True).strip()
     require(DIGEST.fullmatch(digest), "remote image digest is unavailable")
     repository = reference.rsplit("@", 1)[0] if "@" in reference else reference.rsplit(":", 1)[0]
@@ -172,15 +214,22 @@ def inspect_image(reference, *, allow_additional_platforms=False):
         child = children[PLATFORM]
     else:
         child = digest
-    run("docker", "pull", "--platform", PLATFORM, repository + "@" + child)
-    actual = run("docker", "image", "inspect", repository + "@" + child,
-                 "--format", "{{.Os}}/{{.Architecture}}", capture=True).strip()
+    image = {"repository": repository, "digest": digest, "platforms": {PLATFORM: child}}
+    if pull:
+        if not present(native_child(image)):
+            run("docker", "pull", "--platform", PLATFORM, native_child(image))
+        actual = run("docker", "image", "inspect", native_child(image),
+                     "--format", "{{.Os}}/{{.Architecture}}", capture=True).strip()
+    else:
+        config = remote_config(native_child(image))
+        actual = config["os"] + "/" + config["architecture"]
     require(actual == PLATFORM, "remote image platform does not match the release")
-    return {"repository": repository, "digest": digest, "platforms": {PLATFORM: child}}
+    return image
 
 
 def base_images(dockerfile):
-    """Resolve every external FROM reference immediately before its build."""
+    """Resolve every external FROM reference immediately before its build --
+    in the registry only; a base image is never pulled here."""
     froms = [match for match in map(FROM.fullmatch, dockerfile.read_text().splitlines()) if match]
     stages = {match[2].lower() for match in froms if match[2]}
     require(froms and froms[-1][1].lower() not in stages, "final build stage must extend an external base image")
@@ -189,13 +238,17 @@ def base_images(dockerfile):
             for ref in external]
 
 
-def installed(reference, bases):
-    """Bind the final base as a layer prefix; list installed packages offline."""
-    def layers(image):
-        return json.loads(run("docker", "image", "inspect", image, "--format", "{{json .RootFS.Layers}}", capture=True))
+def installed(image, bases):
+    """Bind the final base as a layer prefix; list installed packages offline.
+
+    `image` is an inventory entry whose child was pulled (inspect_image with
+    pull=True); the base's layers come from its remote config, so the
+    comparison is the pulled child's diff_ids against the registry's."""
+    reference = native_child(image)
     final = next(base for base in bases if base["final"])
-    prefix = layers(final["repository"] + "@" + final["platforms"][PLATFORM])
-    require(layers(reference)[:len(prefix)] == prefix, "built image does not extend its resolved base image")
+    prefix = remote_config(native_child(final))["rootfs"]["diff_ids"]
+    layers = json.loads(run("docker", "image", "inspect", reference, "--format", "{{json .RootFS.Layers}}", capture=True))
+    require(layers[:len(prefix)] == prefix, "built image does not extend its resolved base image")
     offline = ("docker", "run", "--rm", "--network", "none", "--read-only", "--entrypoint")
     return {"bases": bases,
             "python": run(*offline, "python", reference, "-m", "pip", "freeze", "--all",
@@ -204,9 +257,11 @@ def installed(reference, bases):
                           capture=True).splitlines()}
 
 
-def corpus_manifest_from_image(reference, destination):
-    """Copy /corpus/manifest.json out of the pinned decisions-data image, and
-    require the image's own label to name the same bytes. Nothing runs."""
+def corpus_manifest_from_image(image, destination):
+    """Copy /corpus/manifest.json out of the pinned decisions-data image (its
+    pulled child), and require the image's own label to name the same bytes.
+    Nothing runs."""
+    reference = native_child(image)
     manifest_sha = run("docker", "image", "inspect", reference, "--format",
                        '{{index .Config.Labels "io.gsj.corpus.manifest-sha256"}}', capture=True).strip()
     require(HEX.fullmatch(manifest_sha), "the decisions-data image carries no corpus manifest label")
@@ -251,7 +306,11 @@ def build(destination):
     references = {role: image["repository"] + "@" + image["digest"] for role, image in pin["images"].items()}
     references.update({role: source for role, source in catalog["upstreamImages"].items()})
     require(set(references) == set(ROLES), "six-image release inventory is incomplete")
-    inventory = {role: inspect_image(reference) for role, reference in references.items()}
+    # Only the four product images are pulled (their child, once): the
+    # package lists and the corpus manifest come from the local copies.
+    # Forgejo and Chroma, like every base and add-on image, are verified in
+    # the registry alone.
+    inventory = {role: inspect_image(reference, pull=role in pin["images"]) for role, reference in references.items()}
     # The product's Dockerfiles at the pin name each image's base; the base
     # is verified as a layer prefix of the published image, and the installed
     # Python and Debian packages are listed offline, as evidence.
@@ -260,9 +319,9 @@ def build(destination):
     (dockerfiles / "web").write_bytes(webpin.show("ops/Dockerfile", pin))
     (dockerfiles / "runner").write_bytes(webpin.show("ops/Dockerfile.runner", pin))
     (dockerfiles / "mcp").write_bytes(run("git", "--git-dir=" + str(core_git), "show", core_commit + ":services/mcp/Dockerfile", capture=True).encode())
-    dependencies = {role: installed(references[role], base_images(dockerfiles / role)) for role in ("web", "runner", "mcp")}
+    dependencies = {role: installed(inventory[role], base_images(dockerfiles / role)) for role in ("web", "runner", "mcp")}
     (destination / "corpus").mkdir()
-    corpus = corpus_manifest_from_image(references["decisionsData"], destination / "corpus")
+    corpus = corpus_manifest_from_image(inventory["decisionsData"], destination / "corpus")
     require(corpus.get("format") == "gsj.corpus/1", "the decisions-data image carries no gsj.corpus/1 manifest")
     require(corpus["embedding"] == catalog["model"], "approved model contract differs from the corpus the data image carries")
     require(corpus.get("core_commit") == core_commit, "the corpus was built at another library commit than the pinned product ships")

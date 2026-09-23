@@ -350,6 +350,7 @@ def test_failed_delivery_preflight_prevents_source_install_or_cluster_mutation(m
     descriptors = {target: {"releaseId": "target", "version": "1.1.0", "installer": {"sha256": "a" * 64}},
                    target / "baseline": {"releaseId": "source", "version": "1.0.0", "installer": {"sha256": "b" * 64}}}
     monkeypatch.setattr(module, "bundle", lambda path: descriptors[path])
+    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the environment's concern, tested on its own
     def unavailable(*args):
         raise ValueError("delivery readback unavailable")
     monkeypatch.setattr(module, "release_readback", unavailable)
@@ -817,12 +818,12 @@ def test_the_manifest_the_release_preparation_writes_builds_under_the_pin_and_a_
         monkeypatch.setattr(webpin, "core_tag", lambda pin=None: core_tag)
         monkeypatch.setattr(webpin, "show", lambda path, pin=None: b"FROM example.test/base@sha256:" + b"0" * 64 + b"\n")
     # the registry, stubbed: every image answers with its approved digest on linux/amd64
-    def inspect_image(reference, *, allow_additional_platforms=False):
+    def inspect_image(reference, *, allow_additional_platforms=False, pull=False):
         repository, digest = reference.rsplit("@", 1)
         return {"repository": repository, "digest": digest, "platforms": {release.PLATFORM: digest}}
     monkeypatch.setattr(release, "inspect_image", inspect_image)
     monkeypatch.setattr(release, "base_images", lambda dockerfile: [])
-    monkeypatch.setattr(release, "installed", lambda reference, bases: {"bases": bases, "python": [], "system": []})
+    monkeypatch.setattr(release, "installed", lambda image, bases: {"bases": bases, "python": [], "system": []})
     model = {"model": "synthetic/model", "revision": "a" * 40, "manifest_sha256": "b" * 64, "dimensions": 768, "distance": "cosine", "encoding": "synthetic-encoding-v1"}
     def corpus_manifest_from_image(reference, destination):
         corpus = {"format": "gsj.corpus/1", "core_commit": core_commit, "source_sha256": "d" * 64, "rows": 1, "chunks": 1,
@@ -862,3 +863,207 @@ def test_the_manifest_the_release_preparation_writes_builds_under_the_pin_and_a_
     (destination / "manifest.json").write_text(json.dumps(tampered))
     with pytest.raises(ValueError, match=r"images\.mcp: the manifest names .*9{64}, web-pin\.json pins .*3{64}"):
         builder.prepare(destination / "manifest.json")
+
+
+def test_the_preparation_pulls_only_the_four_product_images_and_inspects_only_native_children_on_a_clean_engine(modules, tmp_path, monkeypatch):
+    """PROMOTION's `ci/release.py build` failed twice on a clean engine and
+    once more on Docker Hub's budget: `installed()` and
+    `corpus_manifest_from_image()` ran `docker image inspect` on the INDEX
+    digest the pin records, while `inspect_image` had pulled only the amd64
+    CHILD (a single-platform engine never holds the index by that name), and
+    every base image of every Dockerfile plus every add-on image was pulled
+    by digest on every run. Here the engine starts EMPTY and is modelled
+    strictly: a local inspect, create or run of anything not pulled -- or of
+    an index reference -- is "No such image", and every pull is counted. The
+    whole preparation must complete, pulling exactly the four product
+    children once; a second run on the now-populated engine pulls nothing."""
+    release = modules[0]
+    version, core_tag = "v0.10.0-beta.1", "v4.9.2-synthetic"
+    source = tmp_path / "installer-repo"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    (source / "README").write_text("synthetic installer repository\n")
+    (source / ".gitignore").write_text("ops/.build\n")
+    git = ["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid"]
+    subprocess.run([*git, "add", "README", ".gitignore"], check=True)
+    subprocess.run([*git, "commit", "-qm", "synthetic installer"], check=True)
+    core_git, core_commit = _bare_core(tmp_path, source / "ops/.build/gsj-next.git", core_tag)
+    monkeypatch.setattr(release, "ROOT", source)
+    index = {role: "sha256:" + char * 64 for role, char in zip(release.webpin.IMAGE_ROLES, "1234")}
+    child = {digest: "sha256:" + digest[7] + "c" * 63 for digest in index.values()}   # the amd64 child of each product index
+    images = {role: {"repository": "registry.example.test/" + role.lower(), "digest": digest} for role, digest in index.items()}
+    pin = {"schema": "gsj.web-pin/1", "repository": "example/product", "commit": "f" * 40, "release": version,
+           "chart": {"version": version[1:], "tree": "1" * 40, "sha256": "0" * 64},
+           "gsj_deploy": {"tree": "2" * 40}, "core": {"tag": core_tag}, "images": images}
+    base = "example.test/base@sha256:" + "0" * 64
+    monkeypatch.setattr(release.webpin, "load", lambda path=None: pin)
+    monkeypatch.setattr(release.webpin, "core_tag", lambda pin=None: core_tag)
+    monkeypatch.setattr(release.webpin, "show", lambda path, pin=None: ("FROM node:22 AS spa\nFROM " + base + "\n").encode())
+    upstream = {"forgejo": "registry.example.test/forgejo@sha256:" + "5" * 64, "chroma": "registry.example.test/chroma@sha256:" + "6" * 64}
+    addon_image = "example/controller@sha256:" + "e" * 64
+    single = {upstream["forgejo"], upstream["chroma"], base, addon_image}        # single-platform manifests: child == digest
+    tag_digest = {"node:22": "sha256:" + "7" * 64}                               # a multi-platform tag resolves to an index
+    tag_child = {"sha256:" + "7" * 64: "sha256:" + "7" + "c" * 63}
+    model = {"model": "synthetic/model", "revision": "a" * 40, "manifest_sha256": "b" * 64, "dimensions": 768, "distance": "cosine", "encoding": "synthetic-encoding-v1"}
+    corpus = {"format": "gsj.corpus/1", "core_commit": core_commit, "source_sha256": "d" * 64, "rows": 1, "chunks": 1,
+              "files": [{"chunks": 1}], "publication_ready": True, "release_owner": "Example Owner",
+              "source_provenance": "synthetic source", "embedding": model}
+    corpus["fingerprint"] = hashlib.sha256(json.dumps(corpus, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    corpus_bytes = (json.dumps(corpus, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode()
+    engine = {"pulled": set(), "pulls": [], "local_refs": [], "config_reads": []}
+    layers = ["sha256:" + "a" * 64, "sha256:" + "b" * 64]
+
+    def no_such_image(reference):
+        raise subprocess.CalledProcessError(1, ["docker", "image", "inspect", reference], stderr="Error: No such image: " + reference)
+
+    def resolve(reference):
+        """What the registry serves for a reference: (index digest, child digest)."""
+        if "@" in reference:
+            digest = reference.rsplit("@", 1)[1]
+            if reference in single: return digest, digest
+            if digest in child: return digest, child[digest]
+            if digest in tag_child: return digest, tag_child[digest]
+            if digest in child.values() or digest in tag_child.values(): return digest, digest   # a child named directly
+            raise AssertionError("unknown reference " + reference)
+        digest = tag_digest[reference.rsplit(":", 1)[1] and reference]
+        return digest, tag_child[digest]
+
+    def fake_run(*args, capture=False, **kw):
+        args = list(map(str, args))
+        if args[0] == "git":
+            return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE if capture else None, **kw).stdout
+        assert args[0] == "docker", args
+        if args[1:4] == ["buildx", "imagetools", "inspect"]:
+            reference = args[4]
+            digest, native = resolve(reference)
+            if args[5:] == ["--format", "{{.Manifest.Digest}}"]:
+                return digest + "\n"
+            if args[5:] == ["--raw"]:
+                if digest == native:
+                    return json.dumps({"schemaVersion": 2, "config": {"digest": "sha256:" + "f" * 64}})
+                return json.dumps({"manifests": [{"platform": {"os": "linux", "architecture": "amd64"}, "digest": native},
+                                                 {"platform": {"os": "unknown", "architecture": "unknown"}, "digest": "sha256:" + "9" * 64}]})
+            if args[5:] == ["--format", "{{json .Image}}"]:
+                engine["config_reads"].append(reference)
+                # a multi-platform reference answers a MAP per platform, as buildx does; only a child answers one config
+                if digest != native:
+                    return json.dumps({"linux/amd64": {"os": "linux", "architecture": "amd64", "rootfs": {"diff_ids": layers}}})
+                return json.dumps({"os": "linux", "architecture": "amd64", "rootfs": {"diff_ids": layers}})
+            raise AssertionError("unexpected imagetools call " + " ".join(args))
+        if args[1] == "pull":
+            reference = args[-1]
+            assert args[2:4] == ["--platform", release.PLATFORM]
+            digest, native = resolve(reference)
+            assert reference.rsplit("@", 1)[1] == native, "pulled by index, not by the native child: " + reference
+            engine["pulls"].append(reference); engine["pulled"].add(reference)
+            return ""
+        # everything below is LOCAL: the engine holds only what was pulled, by its child reference
+        if args[1:3] == ["image", "inspect"]:
+            reference = args[3]
+            engine["local_refs"].append(reference)
+            if reference not in engine["pulled"]: no_such_image(reference)
+            fmt = args[args.index("--format") + 1] if "--format" in args else ""
+            if fmt == "{{.Os}}/{{.Architecture}}": return "linux/amd64\n"
+            if fmt == "{{json .RootFS.Layers}}": return json.dumps(layers + ["sha256:" + "d" * 64])
+            if "manifest-sha256" in fmt: return hashlib.sha256(corpus_bytes).hexdigest() + "\n"
+            return ""
+        if args[1] == "create":
+            reference = args[-1]
+            engine["local_refs"].append(reference)
+            if reference not in engine["pulled"]: no_such_image(reference)
+            return "synthetic-container\n"
+        if args[1] == "cp":
+            Path(args[3]).write_bytes(corpus_bytes)
+            return ""
+        if args[1] == "rm":
+            return ""
+        if args[1] == "run":
+            reference = args[args.index("--entrypoint") + 2]
+            engine["local_refs"].append(reference)
+            if reference not in engine["pulled"]: no_such_image(reference)
+            return "synthetic-package=1\n"
+        raise AssertionError("unexpected docker call " + " ".join(args))
+
+    monkeypatch.setattr(release, "run", fake_run)
+
+    def inputs(destination):
+        (destination / "addons").mkdir(parents=True)
+        addons = {}
+        for role, name in (("traefik", "traefik.tgz"), ("certManager", "cert-manager.tgz"), ("localPath", "local-path.yaml")):
+            (destination / "addons" / name).write_bytes(b"synthetic addon " + name.encode())
+            addons[role] = {"path": "addons/" + name, "sha256": hashlib.sha256((destination / "addons" / name).read_bytes()).hexdigest(),
+                            "images": {"controller": addon_image}}
+        client = {release.PLATFORM: {"url": "https://example.test/fixed-binary", "sha256": "a" * 64}}
+        catalog = {"schema": "gsj.release-inputs/1", "upstreamImages": upstream, "addons": addons,
+                   "clients": {tool: client for tool in ("helm", "kubectl", "jq")}, "model": model,
+                   "release_base_url": "https://releases.example.test/gsj"}
+        (destination / "inputs.json").write_text(json.dumps(catalog))
+        return destination
+
+    release.build(inputs(tmp_path / "release-1"))
+    written = json.loads((tmp_path / "release-1/manifest.json").read_text())
+    product_children = sorted(images[role]["repository"] + "@" + child[index[role]] for role in images)
+    assert sorted(engine["pulls"]) == product_children                       # the four product children, each once
+    assert all(ref in engine["pulled"] for ref in engine["local_refs"])       # nothing local was ever asked about an index or an unpulled image
+    assert {ref.rsplit("@", 1)[1] for ref in engine["local_refs"]} == set(child.values())
+    assert written["images"]["web"] == {"repository": images["web"]["repository"], "digest": index["web"], "platforms": {release.PLATFORM: child[index["web"]]}}
+    assert written["images"]["forgejo"]["platforms"][release.PLATFORM] == "sha256:" + "5" * 64
+    inventory = json.loads((tmp_path / "release-1/image-inventory.json").read_text())
+    assert inventory["all_remote_manifests_verified"] is True
+    assert inventory["dependencies"]["web"]["bases"][-1]["reference"] == base and inventory["dependencies"]["web"]["python"] == ["synthetic-package=1"]
+    # the base of every Dockerfile and the add-on image were read from the registry only: never pulled, never inspected locally
+    assert all(ref in engine["config_reads"] for ref in (base, addon_image)) and base not in engine["pulled"]
+    assert json.loads((tmp_path / "release-1/corpus/manifest.json").read_bytes()) == corpus
+    # a second preparation on the now-populated engine pulls nothing
+    engine["pulls"].clear()
+    release.build(inputs(tmp_path / "release-2"))
+    assert engine["pulls"] == []
+    assert json.loads((tmp_path / "release-2/manifest.json").read_text())["images"] == written["images"]
+
+
+def test_qualification_refuses_a_missing_pinned_git_directory_in_its_first_second_and_in_words(modules, tmp_path, monkeypatch, capsys):
+    """PROMOTION's first ordinary run reached `expected_checks()` after a
+    two-hour install and died on a bare `ValueError` because the launch
+    shell carried no GSJ_NEXT_WEB_GIT_DIR. The check list is now the first
+    thing `qualify` resolves: with no Git directory it refuses before the
+    bundle is verified, before any kubectl, and the CLI prints the recipe
+    webpin names rather than a type name."""
+    module = modules[1]
+    def missing(path, pin=None):
+        raise ValueError("the pinned gsj-next-web commit 228ba86b8b69 is in no Git directory here; stage one with `git clone --bare <gsj-next-web> ops/.build/gsj-next-web.git` (or set GSJ_NEXT_WEB_GIT_DIR, or keep a ../gsj-next-web sibling that carries the commit)")
+    monkeypatch.setattr(module.webpin, "show", missing)
+    monkeypatch.setattr(module, "bundle", lambda path: pytest.fail("the bundle was verified before the environment was"))
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: pytest.fail("a subprocess ran before the environment was checked: " + " ".join(map(str, args))))
+    site = tmp_path / "ordinary/site.json"
+    site.parent.mkdir()
+    site.write_text(json.dumps({"target": {"context": "disposable", "namespace": "gsj-qualification-test", "release": "gsj"}}))
+    site.chmod(0o600)
+    report = tmp_path / "report.json"
+    args = SimpleNamespace(bundle=tmp_path / "candidate", config=site, report=report, mode="ordinary", disposable_target=True)
+    with pytest.raises(module.Refused, match="GSJ_NEXT_WEB_GIT_DIR"):
+        module.qualify(args)
+    assert not report.exists()                                              # nothing was written, nothing ran
+    monkeypatch.setattr(sys, "argv", ["qualify.py", "run", "--bundle", str(tmp_path / "candidate"), "--config", str(site),
+                                      "--report", str(report), "--mode", "ordinary", "--disposable-target"])
+    with pytest.raises(SystemExit) as stopped:
+        module.main()
+    assert stopped.value.code == 1
+    err = capsys.readouterr().err
+    assert "Installer qualification failed: the pinned product's check list cannot be read before the install: the pinned gsj-next-web commit 228ba86b8b69 is in no Git directory here" in err
+    assert "ops/.build/gsj-next-web.git" in err and "GSJ_NEXT_WEB_GIT_DIR" in err
+    # with the directory present, the same launch proceeds to the cluster (the first read is the namespace)
+    monkeypatch.setattr(module.webpin, "show", lambda path, pin=None: b"REQUIRED_CHECKS = {\"synthetic-check\"}\n")
+    monkeypatch.setattr(module, "bundle", lambda path: {"releaseId": "target", "version": "1.1.0", "installer": {"sha256": "a" * 64}})
+    (tmp_path / "candidate").mkdir()
+    (tmp_path / "candidate/manifest.json").write_text(json.dumps({"identity": "target", "corpus": {"fingerprint": "f" * 64, "rows": 3, "chunks": 3}}))
+    (tmp_path / "candidate/gsj-install.sh").write_text("must not execute")
+    calls = []
+    def cluster(*args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("synthetic cluster unavailable")
+    monkeypatch.setattr(module, "run", cluster)
+    monkeypatch.setattr(module, "sha", lambda path: "a" * 64)
+    with pytest.raises(ValueError, match="qualification did not pass"):
+        module.qualify(args)
+    assert calls and calls[0][:7] == ("kubectl", "--context", "disposable", "--namespace", "gsj-qualification-test", "get", "namespace")
+    assert json.loads(report.read_bytes())["failure_phase"] == "target-preflight"

@@ -20,7 +20,7 @@ import tarfile
 import tempfile
 import time
 
-from release import ROOT, download, require, run, save, sha, webpin
+from release import ROOT, Refused, download, require, run, save, sha, webpin
 
 
 def prepare(destination):
@@ -52,9 +52,21 @@ def prepare(destination):
 
 
 def expected_checks():
-    # The verifier ships inside the product's web image; its check list is read
-    # from the PINNED product commit (web-pin.json), never from a working tree.
-    syntax = ast.parse(webpin.show("gsj_deploy/verify.py").decode())
+    """The verifier's check list, read from the PINNED product commit
+    (web-pin.json), never from a working tree.
+
+    It needs a Git directory carrying that commit -- GSJ_NEXT_WEB_GIT_DIR, the
+    staged bare clone or the ../gsj-next-web sibling (webpin.git_dir) -- which
+    is a fact about the machine the harness runs on, not about the installer.
+    qualify() therefore resolves it ONCE, in its first second, before the
+    bundle is verified or the cluster is touched: the first PROMOTION run
+    reached this call after a two-hour install and died on a bare ValueError.
+    Here a missing directory is this harness's own refusal, in words."""
+    try:
+        source = webpin.show("gsj_deploy/verify.py").decode()
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        raise Refused("the pinned product's check list cannot be read before the install: " + str(exc)) from None
+    syntax = ast.parse(source)
     return next(ast.literal_eval(node.value) for node in syntax.body if isinstance(node, ast.Assign)
                 and any(isinstance(name, ast.Name) and name.id == "REQUIRED_CHECKS" for name in node.targets))
 
@@ -87,7 +99,10 @@ def fixture_preservation(before, after, stage, report):
     })
 
 
-def check_application(installed, manifest):
+def check_application(installed, manifest, expected=None):
+    """`expected` is the pinned check list qualify() resolved before the
+    install; a caller without one reads it now."""
+    expected = expected_checks() if expected is None else expected
     require(installed.get("status") == "complete" and installed["manifest"]["identity"] == manifest["identity"],
             "installer did not commit the expected installed identity")
     require(installed["manifest"]["images"] == manifest["images"] and installed["manifest"]["corpus"] == manifest["corpus"],
@@ -97,8 +112,8 @@ def check_application(installed, manifest):
     checks = report.get("checks", [])
     require(report.get("status") == "passed" and report.get("cleanup_users") == "passed"
             and report.get("case_and_pat_cleanup") == "passed"
-            and len(checks) == len(expected_checks())
-            and {c["name"] for c in checks if c.get("status") == "passed"} == expected_checks(),
+            and len(checks) == len(expected)
+            and {c["name"] for c in checks if c.get("status") == "passed"} == expected,
             "ordinary application verification failed, skipped checks, or left cleanup")
     require(report.get("expected_corpus_fingerprint") == manifest["corpus"]["fingerprint"], "application corpus binding differs")
     require(verdict["public"].get("status") == "passed" and verdict["public"].get("tls_verified") is True
@@ -222,6 +237,10 @@ def connection_route(config):
 
 def qualify(args):
     start = time.monotonic()
+    # The pinned check list before anything else: its Git directory is the one
+    # prerequisite this harness cannot learn from the bundle or the cluster,
+    # so it is refused here, in the first second, never after the install.
+    expected = expected_checks()
     target = args.bundle.resolve()
     descriptor = bundle(target)
     manifest = json.loads((target / "manifest.json").read_bytes())
@@ -384,12 +403,12 @@ def qualify(args):
             install(target, "install")
             namespace_uid = json.loads(k("get", "namespace", namespace, "-o", "json"))["metadata"]["uid"]
             owned_namespaces.append((context, namespace, namespace_uid))
-            check_application(installed(), manifest)
+            check_application(installed(), manifest, expected)
             mark("fresh-full-corpus-install")
             before = capture_state()
             phase("ordinary-repeat")
             install(target, "install")
-            check_application(installed(), manifest)
+            check_application(installed(), manifest, expected)
             require(before == capture_state(), "repeated installer changed credentials, configuration or storage")
             mark("same-bundle-repeat")
         else:
@@ -429,7 +448,7 @@ def qualify(args):
             phase("selected-upgrade")
             upgrade(source, descriptor["version"])
             phase("upgrade-preservation")
-            check_application(installed(), manifest)
+            check_application(installed(), manifest, expected)
             require(before == capture_state(), "upgrade changed credentials, configuration or storage")
             fixture_preservation(before_fixture, fixture("read", run_id), "upgrade", report)
             backup_dir = Path(site["backup"]["directory"])
@@ -444,7 +463,7 @@ def qualify(args):
             mark("source-backup-and-preservation")
             phase("selected-upgrade-repeat")
             upgrade(source, descriptor["version"])
-            check_application(installed(), manifest)
+            check_application(installed(), manifest, expected)
             require(before == capture_state(), "repeated upgrade changed credentials, configuration or storage")
             fixture_preservation(before_fixture, fixture("read", run_id), "repeated-upgrade", report)
             mark("selected-version-repeat-converges")
@@ -483,7 +502,7 @@ def qualify(args):
             require(restored["credentials"] == before["credentials"], "restore changed credential bytes")
             phase("restored-selected-upgrade")
             upgrade(source, descriptor["version"])
-            check_application(installed(), manifest)
+            check_application(installed(), manifest, expected)
             require(restored == capture_state(), "restored source upgrade changed credentials or storage")
             fixture_preservation(before_fixture, fixture("read", run_id), "restored-upgrade", report)
             mark("fresh-restore-to-target-acceptance")
@@ -595,6 +614,11 @@ def main():
             require(len(args.report) == 1, "one report path required")
             args.report = args.report[0]
             qualify(args)
+    except Refused as exc:
+        # This harness's own refusal sentences (release.Refused) are said in
+        # words: they carry no URL, token or file content.
+        print("Installer qualification failed: " + str(exc), file=sys.stderr)
+        raise SystemExit(1)
     except Exception as exc:
         print("Installer qualification failed: " + type(exc).__name__, file=sys.stderr)
         raise SystemExit(1)

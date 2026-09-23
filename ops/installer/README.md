@@ -296,7 +296,15 @@ managed add-on image in the registry, for every declared platform, reads the
 corpus manifest out of the pinned decisions-data image, and writes the
 release manifest before anything is signed; the full application's behavior
 must be established by release qualification, not inferred from a
-syntactically valid digest. Until promotion fills `release` and `images` in
+syntactically valid digest. Only the four product images are pulled, each by
+its native child digest and only when the engine does not already hold it:
+their package lists are read offline and the corpus manifest is copied out
+of the data image. Every other image — the two upstream copies, the base of
+every Dockerfile, the add-on controllers and helpers — is verified from the
+registry alone (its digest, its native manifest and that manifest's config),
+so a run charges Docker Hub one manifest read per image rather than a pull,
+and a rerun after a refusal charges the same again; a `docker login` to
+Docker Hub in the `DOCKER_CONFIG` the run uses raises that budget. Until promotion fills `release` and `images` in
 `web-pin.json`, `build` refuses; a proof build is a hand-assembled manifest
 with `qualification: true`. The pin is held a second time where every
 published build passes: `build.py`'s shared preparation (`build` and `sign`
@@ -409,7 +417,15 @@ no private input.
    and populated upgrade/restore): the populated upgrade acquires the
    candidate from the staged version URL and holds the read-back receipt to
    the staged bytes; the gate (`ci/qualify.py gate`) then requires every
-   report and receipt.
+   report and receipt. The harness reads the verifier's check list from the
+   pinned product commit, so the machine it runs on needs a Git directory
+   that carries that commit — `GSJ_NEXT_WEB_GIT_DIR`, the staged
+   `ops/.build/gsj-next-web.git`, or the `../gsj-next-web` sibling — and
+   refuses in its first second, naming that recipe, when none does. Give
+   every run a fresh site directory: the installer's state lives beside the
+   site file, and a second run over the first run's state (its namespace
+   already deleted by the harness) stops at verification with *"verification
+   ownership ledger is missing after launch"*.
 7. **Publication**: the release assets (below) — `verify-release.sh`, the
    public key, the descriptor, its signature and the installer — after the
    gate has passed for these exact signed bytes.
