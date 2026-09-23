@@ -1896,8 +1896,16 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
     assert len(closing) == 1 and "Complete GSJ installation verified" not in result.stderr
     assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable)" in closing[0]
-    assert "Until the endpoints are set, the agent cannot answer and scanned pages are not read." in closing[0]
-    assert "Einstellungen" in closing[0] and "run install again" in closing[0] and closing[0].endswith("Summary: " + str(work / "summary.json"))
+    assert "Until the endpoints are set, the agent cannot answer and scanned pages are not read. Set the LLM per case under Einstellungen in the web UI, or llm.base_url and llm.model in the site file; ocr.url and ocr.model in the site file, and run install again with the site file" in closing[0]
+    assert closing[0].endswith("Summary: " + str(work / "summary.json"))
+    # only the OCR endpoint missing: the advice names that endpoint alone
+    (work / "verification.json").write_text(json.dumps({"status": "passed", "endpoints": {"llm": "working", "ocr": "refused"}, "ocr_http_status": 400, "checks": [
+        {"name": "operator-login", "status": "passed"}, {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-refused"}, {"name": "agent-turn-note-history", "status": "passed"}]}))
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
+    closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
+    assert len(closing) == 1 and "2 of 3 application checks ran and passed; 1 skipped: scanned-ingest-search (ocr-refused)" in closing[0]
+    assert "Until an OCR endpoint is set, scanned pages are not read. Set ocr.url and ocr.model in the site file, and run install again" in closing[0]
+    assert "Einstellungen" not in closing[0] and "agent cannot answer" not in closing[0]
     # a full verification (an older verifier's report carries no coverage field at all) keeps the closing line it had
     (work / "verification.json").write_text(json.dumps({"status": "passed", "checks": [{"name": "operator-login", "status": "passed"}]}))
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
