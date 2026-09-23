@@ -176,7 +176,12 @@ if a[:2] == ["config", "get-contexts"]: print(a[2])
 elif a[:2] == ["get", "namespace"]:
     if s.get("namespace_read_fails"):
         print("Error from server (Forbidden): namespaces is forbidden", file=sys.stderr); sys.exit(1)
-    print(json.dumps({"metadata":{"uid":s.get("namespace_uid","target-namespace-uid")}}) if "json" in a else "synthetic namespace")
+    if s.get("namespace_absent"):
+        # a removed namespace: nothing printed with --ignore-not-found (exit 0), NotFound without it
+        if "--ignore-not-found" not in a:
+            print("Error from server (NotFound): namespaces \"" + a[2] + "\" not found", file=sys.stderr); sys.exit(1)
+    else:
+        print(json.dumps({"metadata":{"uid":s.get("namespace_uid","target-namespace-uid")}}) if "json" in a else "synthetic namespace")
 elif a[:2] == ["get", "ns"]: print("target-namespace-uid")
 elif a[:2] == ["get", "lease"]:
     if s["lease"] is not None: print(json.dumps(s["lease"]))

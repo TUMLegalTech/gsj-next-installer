@@ -231,3 +231,20 @@ def test_a_namespace_that_could_not_be_read_is_not_taken_for_absent(runtime, tmp
     assert "could not be read" in result.stderr and "nothing was swept" in result.stderr
     assert not _records(work), "no swept record for a target that could not be read"
     assert (transfer / OP / "snapshot.tar.gz").exists(), "the transfer directory is untouched"
+
+
+def test_a_removed_namespace_is_absent_not_unreadable_and_still_sweeps_the_host_residue(runtime, tmp_path):
+    """Audit round 2 (a guard): the fake modelled only the unreadable side of
+    the absent/unreadable split. A removed namespace answers nothing with
+    --ignore-not-found: sweep must take that as absent -- no Lease, release or
+    controller read -- and still clear the host-side residue with a record."""
+    run, state, work = runtime
+    transfer = _dead_target(state, work, tmp_path)
+    value = json.loads(state.read_text()); value["namespace_absent"] = True; state.write_text(json.dumps(value))
+    result = _sweep(run)
+    assert result.returncode == 0, result.stderr
+    assert "could not be read" not in result.stderr and "nothing was swept" not in result.stderr
+    calls = json.loads(state.read_text())["calls"]
+    assert not any(c[:2] == ["get", "lease"] for c in calls), "an absent namespace has no Lease to read"
+    assert not (transfer / OP).exists() and (transfer / "zzz-not-ours").exists()
+    assert _records(work), "the sweep of an absent namespace still writes its record"
