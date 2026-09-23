@@ -499,3 +499,19 @@ def test_the_probe_runs_before_backup_quiesces_a_running_deployment():
         index = source.index(chain)
         function_start = source.rfind("\n}\n", 0, index)
         assert "relocated_images_probe" in source[function_start:index + len(chain)], chain.strip()[:90]
+
+
+def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_path):
+    """The misattribution pass: the refusal listed only site values
+    to check -- digests, prefix, pull secret -- and a repair after changing
+    them. A registry CA the node's runtime does not trust, node DNS or proxy,
+    a full node disk, a rate limit or a registry outage end in the same
+    ImagePullBackOff; an operator who follows the list changes site values
+    that were right."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    _, result = _probe(run, work, tmp_path)
+    assert result.returncode != 0
+    assert "node's side" in result.stderr
+    assert "trust" in result.stderr and "DNS" in result.stderr and "rate limit" in result.stderr
+    assert "resume --operation" in result.stderr

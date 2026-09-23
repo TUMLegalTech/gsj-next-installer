@@ -82,7 +82,10 @@ def test_sweep_refuses_a_live_operation_and_touches_nothing(runtime, tmp_path):
     before = json.loads(state.read_text())["resources"]
     result = _sweep(run)
     assert result.returncode != 0
-    assert "an operation is live" in result.stderr and "stop that tools process" in result.stderr
+    # The misattribution pass, audit round 1: the retained Lease of a DEAD run also reads "live" for 180 s; the
+    # refusal states the age it measured and the wait, never "stop that tools process"
+    assert "is still live" in result.stderr and "was renewed" in result.stderr and "run the same command again" in result.stderr
+    assert "sweep never takes a live operation" in result.stderr and "stop that tools process" not in result.stderr
     assert json.loads(state.read_text())["resources"] == before
     assert not _records(work)
     assert json.loads((work / "operation.json").read_text())["status"] == "initializing"
@@ -211,3 +214,18 @@ def test_sweep_of_a_target_without_a_canonical_record_clears_the_cluster_residue
     assert json.loads(records[0].read_text())["canonical"] == {"operation": None, "status": None, "disposition": "retained, marked swept"}
     assert "Job/synthetic-release-provision" not in json.loads(state.read_text())["resources"]
     assert not (work / "operation.json").exists()
+
+
+def test_a_namespace_that_could_not_be_read_is_not_taken_for_absent(runtime, tmp_path):
+    """The misattribution pass: `if k get namespace …` treated an
+    expired kubeconfig, an RBAC denial or an API outage as "the namespace is
+    gone", skipped the Lease, release and controller checks, deleted the
+    transfer directories and reported a clean target."""
+    run, state, work = runtime
+    transfer = _dead_target(state, work, tmp_path)
+    value = json.loads(state.read_text()); value["namespace_read_fails"] = True; state.write_text(json.dumps(value))
+    result = _sweep(run)
+    assert result.returncode == 1
+    assert "could not be read" in result.stderr and "nothing was swept" in result.stderr
+    assert not _records(work), "no swept record for a target that could not be read"
+    assert (transfer / OP / "snapshot.tar.gz").exists(), "the transfer directory is untouched"

@@ -92,7 +92,7 @@ def test_a_stale_class_record_in_the_state_directory_plays_no_part(tmp_path):
     assert "Do not delete the volume by hand" in result.stderr
 
 
-@pytest.mark.parametrize("logs, expected", [(True, "what it printed is in "), (False, "printed nothing that could be read")])
+@pytest.mark.parametrize("logs, expected", [(True, "what it printed is in "), (False, "what it printed could not be read")])
 def test_the_cleanup_refusal_does_not_hide_a_check_that_failed(tmp_path, logs, expected):
     result, _ = _run(tmp_path, pod_phase="Failed", logs=logs)
     assert result.returncode == 1
@@ -128,7 +128,7 @@ def test_a_named_claim_makes_no_temporary_claim_and_touches_no_volume(tmp_path):
 # The operator would go and look at the disk. The storage backend was never
 # tested; the message must say what the Pod reported instead.
 
-def _run_never_ran(tmp_path, *, status_json):
+def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending"):
     source = (ROOT / "ops/installer/runtime.sh").read_text().split("# ENTRY POINT", 1)[0]
     source = source.replace("@CLIENT_TABLE@", "gsj_client_info() { return 1; }")
     (tmp_path / "functions.sh").write_text(source)
@@ -148,10 +148,11 @@ k() {{
   printf '%s\\n' "$*" >> "$STATE_DIR/calls"
   case "$1 $2" in
     "create -f") cat >/dev/null;;
-    "get pod") case "$*" in *json*) cat "$STATE_DIR/pod-status.json";; *) printf Pending;; esac;;
+    "get pod") case "$*" in *jsonpath*) printf {poll_phase};; *json*) cat "$STATE_DIR/pod-status.json";; esac;;
     "logs "*) return 7;;
-    "get pvc") case "$*" in *metadata.uid*) printf uid-1;; *) printf '';; esac;;
-    "wait --for=delete") return 0;;
+    "get pvc") case "$*" in *metadata.uid*) printf uid-1;; *) printf {"pv-operator-7" if not deleted else "''"};; esac;;
+    "get pv") case "$*" in *jsonpath*) printf Released;; *) printf '{{"spec":{{"claimRef":{{"uid":"uid-1","namespace":"legal"}}}}}}';; esac;;
+    "wait --for=delete") {"return 0" if deleted else "return 1"};;
     *) :;;
   esac
 }}
@@ -171,6 +172,9 @@ UNSCHEDULABLE = {"status": {"phase": "Pending",
 STILL_STARTING = {"status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True"}],
                   "containerStatuses": [{"name": "storage-check", "image": "ghcr.example/team/web@sha256:0",
                                          "state": {"waiting": {"reason": "ContainerCreating"}}}]}}
+STILL_RUNNING = {"status": {"phase": "Running", "conditions": [{"type": "PodScheduled", "status": "True"}],
+                 "containerStatuses": [{"name": "storage-check", "image": "ghcr.example/team/web@sha256:0",
+                                        "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}}}]}}
 
 
 def test_an_image_the_node_cannot_pull_is_not_reported_as_a_storage_failure(tmp_path):
@@ -180,6 +184,9 @@ def test_an_image_the_node_cannot_pull_is_not_reported_as_a_storage_failure(tmp_
     assert "storage WAL/locking/fsync/free-space qualification failed" not in message
     assert "could not pull" in message and "ImagePullBackOff" in message and "registry.pull_secret" in message
     assert "was not tested" in message
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa"), "repair never runs the storage check; resume does"
+    assert "gsj-pull" not in hint or "deleted first" in hint
 
 
 def test_a_pod_the_scheduler_refused_is_not_reported_as_a_storage_failure(tmp_path):
@@ -188,6 +195,9 @@ def test_a_pod_the_scheduler_refused_is_not_reported_as_a_storage_failure(tmp_pa
     message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
     assert "storage WAL/locking/fsync/free-space qualification failed" not in message
     assert "Unschedulable" in message and "storage.node" in message and "was not tested" in message
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa")
+    assert "abandon --operation" in hint and "storage.node" in hint         # a changed node needs a new operation
 
 
 def test_a_check_that_never_finished_names_the_wait_not_the_disk(tmp_path):
@@ -196,3 +206,40 @@ def test_a_check_that_never_finished_names_the_wait_not_the_disk(tmp_path):
     message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
     assert "storage WAL/locking/fsync/free-space qualification failed" not in message
     assert "did not finish" in message and "300 s" in message and "was not tested" in message
+
+
+def test_a_verdict_that_could_not_be_read_is_not_a_storage_failure(tmp_path):
+    """The misattribution pass: the Pod ran to an end but `kubectl logs` failed (pods/log is
+    not in the preflight's permission list): the run ended with the storage
+    verdict although nothing about the disk was established."""
+    result, _ = _run(tmp_path, pod_phase="Succeeded", logs=False, deleted=True)
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "storage WAL/locking/fsync/free-space qualification failed" not in message
+    assert "could not be read" in message and "pods/log" in message and "not judged" in message
+    # and when the cleanup refusal comes first, its note says the same, never "did not pass"
+    (tmp_path / "second").mkdir()
+    result, _ = _run(tmp_path / "second", pod_phase="Succeeded", logs=False)
+    assert "did not pass" not in result.stderr and "verdict could not be read" in result.stderr
+
+
+def test_a_check_still_running_at_the_wait_is_named_for_that_not_for_the_pull(tmp_path):
+    """Audit round 1: a Pod in phase Running when the 300 s ran out was
+    blamed on the image pull or the claim binding, which had both finished."""
+    result, _ = _run_never_ran(tmp_path, status_json=STILL_RUNNING, poll_phase="Running")
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "storage WAL/locking/fsync/free-space qualification failed" not in message
+    assert "still running" in message and "300 s" in message and "was not tested" in message
+    assert "pulling the image" not in message and "binding" not in message
+
+
+def test_a_pod_that_never_ran_leaves_a_cleanup_note_that_never_says_did_not_pass(tmp_path):
+    """Audit round 1: when the cleanup refusal comes first, its note said "the
+    storage check itself did not pass either" for a Pod that never ran."""
+    result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED, deleted=False)
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "cleanup incomplete" in message                                     # the cleanup refusal came first
+    assert "did not pass" not in message
+    assert "never ran" in message and "ImagePullBackOff" in message and "not tested" in message

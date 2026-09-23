@@ -174,6 +174,8 @@ s["calls"].append(a)
 code = 0
 if a[:2] == ["config", "get-contexts"]: print(a[2])
 elif a[:2] == ["get", "namespace"]:
+    if s.get("namespace_read_fails"):
+        print("Error from server (Forbidden): namespaces is forbidden", file=sys.stderr); sys.exit(1)
     print(json.dumps({"metadata":{"uid":s.get("namespace_uid","target-namespace-uid")}}) if "json" in a else "synthetic namespace")
 elif a[:2] == ["get", "ns"]: print("target-namespace-uid")
 elif a[:2] == ["get", "lease"]:
@@ -1897,7 +1899,7 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     assert len(closing) == 1 and "Complete GSJ installation verified" not in result.stderr
     assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable)" in closing[0]
     # per reason: the LLM is configured and did not answer; the OCR endpoint is absent
-    assert "Until the LLM endpoint at llm.base_url answers from inside the cluster, the agent cannot answer: it is configured, but it did not answer the acceptance probe" in closing[0]
+    assert "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the agent cannot answer: it is configured, but no model list came back" in closing[0]
     assert "Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file. Then run install again with the site file" in closing[0]
     assert closing[0].endswith("Summary: " + str(work / "summary.json"))
     # only the OCR endpoint missing: the advice names that endpoint alone
@@ -1906,7 +1908,7 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
     closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
     assert len(closing) == 1 and "2 of 3 application checks ran and passed; 1 skipped: scanned-ingest-search (ocr-refused)" in closing[0]
-    assert "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP 400 to the acceptance probe, so check ocr.model and its credential. Then run install again" in closing[0]
+    assert "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP 400 to the acceptance probe, so check ocr.model and that the endpoint takes an image. Then run install again" in closing[0]
     assert "Einstellungen" not in closing[0] and "agent cannot answer" not in closing[0]
     # a full verification (an older verifier's report carries no coverage field at all) keeps the closing line it had
     (work / "verification.json").write_text(json.dumps({"status": "passed", "checks": [{"name": "operator-login", "status": "passed"}]}))
@@ -1948,17 +1950,36 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-not-vision-capable"},
         {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
         {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}])
-    assert "did not answer the acceptance probe" in line and "reachable from the Pods" in line
-    assert "did not read the test page" in line and "vision-capable" in line
+    assert "with a model list" in line and "reachable from the Pods" in line and "ending in /v1" in line
+    assert "without the text of the test page" in line and "stored as whatever it answers" in line and "vision-capable" in line
     assert "Until the endpoints are set" not in line and "Set ocr.url" not in line and "Einstellungen" not in line
+    # an OCR endpoint the adapter got no recognition result from: unreachable, or an answer that is not a chat completion
+    line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "unreachable"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-unreachable"},
+        {"name": "agent-turn-note-history", "status": "passed"}])
+    assert "with a recognition result" in line and "not a chat completion" in line and "chat-completions route" in line
+    # a refusal whose status the verifier did not record: "HTTP ?", never an invented number
+    line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-refused"},
+        {"name": "agent-turn-note-history", "status": "passed"}])
+    assert "answered HTTP ?" in line and "ocr_http_status" not in summary["verification"]
     # an OCR endpoint that refused the request: the status it answered, never "set it"
     line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
         {"name": "operator-login", "status": "passed"},
         {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-refused"},
         {"name": "agent-turn-note-history", "status": "passed"}], extra={"ocr_http_status": 400})
-    assert "answered HTTP 400" in line and "ocr.model" in line and "credential" in line
+    assert "answered HTTP 400" in line and "ocr.model" in line and "takes an image" in line
+    assert "credential" not in line                                        # a 400 is not a credential verdict
     assert "is set" not in line and "agent cannot answer" not in line
     assert summary["verification"]["ocr_http_status"] == 400
+    # a 401: the credential, and nothing about the model or the image
+    line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-refused"},
+        {"name": "agent-turn-note-history", "status": "passed"}], extra={"ocr_http_status": 401})
+    assert "answered HTTP 401" in line and "credential (ocr.credential)" in line and "takes an image" not in line
     # both absent: setting them IS the established fact
     line, summary = _partial_summary_run(runtime, {"llm": "absent", "ocr": "absent"}, [
         {"name": "operator-login", "status": "passed"},
@@ -1968,6 +1989,24 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
     assert "Until an LLM endpoint is set" in line and "Einstellungen" in line and "llm.base_url and llm.model" in line
     assert "Until an OCR endpoint is set" in line and "ocr.url and ocr.model" in line
     assert "ocr_http_status" not in summary["verification"]
+
+
+def test_the_operator_guide_shows_the_closing_line_the_runtime_prints(runtime):
+    """The guide's example of a PARTIAL closing line is the runtime's own
+    sentence for its reasons (an LLM that did not answer with a model list, an
+    absent OCR endpoint), compared from the counts to the summary path -- an
+    example edited by hand drifts (audit round 1 found one mid-sentence)."""
+    guide = (INSTALLER / "OPERATOR.md").read_text()
+    example = [l for l in guide.splitlines() if "GSJ installation complete, verification PARTIAL" in l and l.startswith("[")][0]
+    names = re.findall(r"`([a-z-]+)`", guide.split("The\nfifteen application checks, in the order they run:", 1)[1])[:15]
+    assert names[0] == "operator-login" and names[-1] == "bot-contract-hook", names
+    skipped = {"scanned-ingest-search": "ocr-absent", "agent-turn-note-history": "llm-unreachable", "generated-document": "llm-unreachable"}
+    checks = [{"name": n, "status": "skipped", "reason": skipped[n]} if n in skipped else {"name": n, "status": "passed"} for n in names]
+    line, _ = _partial_summary_run(runtime, {"llm": "unreachable", "ocr": "absent"}, checks)
+    def body(text):
+        return text.split("12 of 15", 1)[1].rsplit(" Summary:", 1)[0]
+    assert "12 of 15" in line and "12 of 15" in example
+    assert body(line) == body(example)
 
 
 def test_a_refused_site_value_is_a_named_refusal_that_states_the_expected_format(runtime, tmp_path):
@@ -1997,3 +2036,20 @@ def test_a_refused_site_value_is_a_named_refusal_that_states_the_expected_format
     assert "site.operator.login: invalid format" in lines[0]
     assert "expected" in lines[0] and "letters, digits and dashes" in lines[0]
     assert "jq: error" not in result.stderr
+
+
+def test_every_still_live_refusal_states_the_lease_age_and_the_wait():
+    """The misattribution pass: "the prior installer is still live;
+    stop it" fires whenever the Lease was renewed less than 180 s ago -- after
+    any failure that is simply the retained Lease of a dead process, and the
+    operator looks for a process to stop. Every such refusal now states the
+    age it measured and the wait that remains."""
+    import re
+    text = (INSTALLER / "runtime.sh").read_text()
+    sites = [line for line in text.splitlines() if "(( age >= 180 )) ||" in line]
+    assert len(sites) >= 8, sites
+    for line in sites:
+        assert re.search(r"\|\| lease_still_live '", line), line
+    assert not [l for l in text.splitlines() if "still live" in l and "|| fail" in l]
+    helper = re.search(r"^lease_still_live\(\) \{.*?^\}", text, re.S | re.M).group(0)
+    assert "renewed" in helper and "180" in helper and "wait" in helper and "same command again" in helper

@@ -26,14 +26,16 @@
         "namespace": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
-          "default": "gsj"
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
+          "default": "gsj",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter"
         },
         "release": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
-          "default": "gsj"
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
+          "default": "gsj",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter"
         }
       },
       "required": [
@@ -55,7 +57,7 @@
         "login": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
           "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter (an underscore is refused)",
           "default": "operator"
         },
@@ -68,8 +70,9 @@
         "secret": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
-          "default": "gsj-operator"
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
+          "default": "gsj-operator",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter"
         }
       },
       "required": [
@@ -369,14 +372,16 @@
         "class": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
-          "default": "gsj-ingress"
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
+          "default": "gsj-ingress",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter"
         },
         "namespace": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
-          "default": "gsj-ingress"
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
+          "default": "gsj-ingress",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter"
         },
         "service_type": {
           "type": "string",
@@ -429,8 +434,9 @@
         "secret": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^[a-z][a-z0-9-]{0,47}$",
-          "default": "gsj-tls"
+          "pattern": "^[a-z][a-z0-9-]{0,47}$(?![\\s\\S])",
+          "default": "gsj-tls",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter"
         },
         "certificate_file": {
           "type": "string",

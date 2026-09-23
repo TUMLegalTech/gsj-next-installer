@@ -107,7 +107,12 @@ fetch_public() {
 #  jq 1.6       all ~1,050 jq programs in runtime.sh, startup-recovery.sh and
 #               verification-cleanup.sh were compiled under jq 1.6, 1.7, 1.7.1,
 #               1.8.0 and 1.8.2; after the three rewrites this phase made, 1.6
-#               compiles every one of them.
+#               compiles every one of them. Re-checked after the misattribution-pass
+#               changes: 1,089 programs a harness could isolate (of 1,120
+#               invocations; the rest are comments, tool loops and shell-
+#               interpolated programs) compile identically under 1.6, 1.7,
+#               1.7.1 and 1.8.2. Trap: jq 1.7 refuses an object VALUE written
+#               as `{…} + (if … end)` unparenthesized where 1.8 accepts it.
 #
 # Set here so arithmetic on it is never an unbound-variable abort under
 # `set -u` on a path that has not run bootstrap (the tests source this file
@@ -342,7 +347,7 @@ validate_site() {
  # field, the expected shape where the schema states one, and the file to
  # correct -- never jq's framing, never the file's contents.
  local words
- if ! jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE" 2> "$GSJ_WORK/validate.err"; then
+ if ! { jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE"; } 2> "$GSJ_WORK/validate.err"; then
    words=$(sed -n 's/^jq: error (at [^)]*): //p' "$GSJ_WORK/validate.err" | head -1)
    [[ -n $words ]] || words=$(tr '\n' ' ' < "$GSJ_WORK/validate.err" | cut -c1-300)
    fail "the site file was refused: $words. Correct it in $CONFIG; the effective site is that file merged over the release's defaults, and the payload's site.schema.json is the field reference"
@@ -478,7 +483,14 @@ wizard() {
    openssl rand -base64 48 | atomic "$secret_dir/backup-passphrase"; set_site .backup.passphrase_file "$secret_dir/backup-passphrase"
    log 'Generated protected backup passphrase; retain a separate recovery copy.'
  fi
- jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$WIZARD" | atomic "$CONFIG"
+ # Validate to a private file first: a refused answer must never replace the
+ # saved site with an empty one, and the refusal is a named one (the misattribution pass).
+ if ! jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$WIZARD" > "$GSJ_WORK/wizard-validated.json" 2> "$GSJ_WORK/validate.err"; then
+   words=$(sed -n 's/^jq: error (at [^)]*): //p' "$GSJ_WORK/validate.err" | head -1)
+   [[ -n $words ]] || words=$(tr '\n' ' ' < "$GSJ_WORK/validate.err" | cut -c1-300)
+   fail "the answers were refused: $words. The saved site file was left as it was; run the wizard again"
+ fi
+ atomic "$CONFIG" < "$GSJ_WORK/wizard-validated.json"
  log "Reusable site configuration saved at $CONFIG"
 }
 inspect_cluster() {
@@ -1095,6 +1107,14 @@ preflight() {
    [[ $(j .storage.node) != '' ]] || fail 'SQLite local storage requires an explicit placement node'
  fi
 }
+lease_still_live() {
+ # Every "still live" refusal states what it measured: the Lease was renewed
+ # $2 s ago, and 180 s unrenewed is the rule. After a failure that is simply
+ # the retained Lease of a dead process -- a clock, not a fault -- the
+ # operator used to look for a process to stop (the misattribution pass).
+ local who=$1 age=$2 rest=${3:-}
+ fail "$who is still live: its Lease was renewed $age s ago and must go 180 s unrenewed. If no installer process is running against this target, wait $(( 180 - age )) s and run the same command again${rest:+; $rest}"
+}
 lease_read() { k get lease "$RELEASE-operation" -o json --ignore-not-found; }
 proxy_file_check() {
  # The proxy Secret reaches the agent runner's
@@ -1338,7 +1358,7 @@ lease_repair() {
  current=$(lease_read)
  [[ -n $current ]] && jq -e '.spec.holderIdentity=="" and (.metadata.resourceVersion|type=="string")' <<< "$current" >/dev/null || fail 'lease-repair requires an existing empty Lease; an occupied or missing Lease is never replaced'
  age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the previous installer lease is still live'
+ (( age >= 180 )) || lease_still_live 'the previous installer lease' "$age"
  k get deployment "$RELEASE-web" -o json > "$GSJ_WORK/lease-repair-deployment.json"
  jq -e --arg release "$RELEASE" --arg ns "$NAMESPACE" --arg base "$(jq -r '.registry.base // ""' "$STATE_DIR/site.pending.json")" --slurpfile source "$source" "$JQ_IMAGE"'
    ([.spec.template.spec.containers[]|{key:.name,value:.image}]|from_entries) as $containers |
@@ -1523,7 +1543,7 @@ abandon_operation() {
  [[ -n $holder ]] || fail 'the operation Lease is already free; nothing to abandon'
  [[ $holder == "$RESUME_ID" ]] || fail 'abandon identity differs from the persistent operation owner'
  age=$(jq -er 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current") || fail 'operation Lease renewal is invalid'
- (( age >= 180 )) || fail 'the prior installer lease is still live; stop that tools process before abandoning its operation'
+ (( age >= 180 )) || lease_still_live 'the prior installer lease' "$age" 'stop that tools process before abandoning its operation'
  # Measured: a backup/upgrade that stopped after quiescence
  # leaves every controller at replicas=0 and its maintenance Pod holding them
  # there. Releasing the Lease then REMOVES the `resume` that would have restarted
@@ -1614,12 +1634,18 @@ sweep_target() {
  opid=''; status=''
  if [[ -f $canonical && ! -L $canonical ]]; then opid=$(jq -r '.operation // ""' "$canonical"); status=$(jq -r '.status // ""' "$canonical"); fi
  inventory='[]'; current=''
- if k get namespace "$NAMESPACE" >/dev/null 2>&1; then
+ # An absent namespace has nothing live to check; a namespace that could not
+ # be READ (an expired kubeconfig, RBAC, an API outage) is not absent, and a
+ # sweep that took it for absent skipped every check below and still marked
+ # the record swept (the misattribution pass).
+ local present
+ present=$(k get namespace "$NAMESPACE" --ignore-not-found -o name 2>/dev/null) || fail "namespace $NAMESPACE could not be read (kubectl failed); nothing was swept"
+ if [[ -n $present ]]; then
    current=$(lease_read) || fail 'operation Lease identity is unavailable'
    holder=''; [[ -z $current ]] || holder=$(jq -r '.spec.holderIdentity // ""' <<< "$current")
    if [[ -n $holder ]]; then
      age=$(jq -er 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current") || fail 'operation Lease renewal is invalid'
-     (( age >= 180 )) || fail "an operation is live: $holder renewed its Lease ${age}s ago; sweep never takes a live operation - stop that tools process first"
+     (( age >= 180 )) || lease_still_live 'the operation Lease held by another run' "$age" "sweep never takes a live operation (holder $holder)"
      fail "the operation Lease is held by $holder (last renewed ${age}s ago); sweep clears only what abandon cannot: run abandon --operation $holder --reason ... first"
    fi
    history=$(k get secrets,configmaps -l "owner=helm,name=$RELEASE" -o json | jq '[.items[]|select(.kind=="ConfigMap" or .type=="helm.sh/release.v1")]|length')
@@ -2200,6 +2226,7 @@ managed_dependencies() {
    k get secret "$secret" -o json | jq -e '.type=="kubernetes.io/tls" and .data["tls.crt"] and .data["tls.key"]' >/dev/null || fail 'TLS Secret is unavailable or incomplete';;
  files)
    local crt key; crt=$(resolve_file "$(j .tls.certificate_file)"); key=$(resolve_file "$(j .tls.private_key_file)"); private_file "$key"
+   openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "tls.certificate_file is not a readable PEM certificate ($(j .tls.certificate_file)); the host was not checked"
    certificate_names_host "$crt" "$host" || fail 'TLS certificate host mismatch'
    if k get secret "$secret" >/dev/null 2>&1; then secret_file "$secret" tls.crt "$crt"; secret_file "$secret" tls.key "$key";
    else k create secret tls "$secret" --cert="$crt" --key="$key" >/dev/null; fi;;
@@ -2268,13 +2295,16 @@ PY
    # deletes the Pod, and the scheduler's or the runtime's own words are the
    # diagnosis the operator will need. They are not repeated in the refusal.
    k get pod "$name" -o json > "$STATE_DIR/storage-check-pod.json" 2>/dev/null || : > "$STATE_DIR/storage-check-pod.json"
+   phase=$(jq -r '.status.phase // ""' "$STATE_DIR/storage-check-pod.json" 2>/dev/null || true)
    never=$(jq -r '
+     if (.status.phase // "") == "Succeeded" or (.status.phase // "") == "Failed" then "" else
      ([(.status.containerStatuses // [])[] | (.state.waiting.reason // "") | select(test("^(ErrImage|ImagePull|ImageInspect|InvalidImageName|RegistryUnavailable)"))] | first // "") as $pull
      | ([(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | (.reason // "Unschedulable")] | first // "") as $sched
-     | if $pull != "" then "pull " + $pull elif $sched != "" then "sched " + $sched else "wait " + (.status.phase // "unknown") end' "$STATE_DIR/storage-check-pod.json" 2>/dev/null || true)
-   [[ -n $never ]] || never="wait ${phase:-unknown}"
+     | if $pull != "" then "pull " + $pull elif $sched != "" then "sched " + $sched else "wait " + (.status.phase // "unknown") end end' "$STATE_DIR/storage-check-pod.json" 2>/dev/null || true)
+   [[ -n $never || $phase == Succeeded || $phase == Failed ]] || never="wait ${phase:-unknown}"
  fi
- k logs "$name" > "$STATE_DIR/storage-check.json" || result=1
+ local logs_read=true
+ k logs "$name" > "$STATE_DIR/storage-check.json" || { logs_read=false; result=1; }
  [[ $phase == Succeeded ]] || result=1
  uid=$(k get pvc "$probe_claim" -o jsonpath='{.metadata.uid}'); volume=$(k get pvc "$probe_claim" -o jsonpath='{.spec.volumeName}')
  k delete pod "$name" --wait=true >/dev/null
@@ -2296,9 +2326,13 @@ PY
  if $fresh && [[ -n $volume ]] && ! k wait --for=delete "pv/$volume" --timeout=120s; then
    # This refusal comes before the check's own verdict below; do not let it hide one.
    local note='' phase
-   if (( result != 0 )); then
-     if [[ -s $STATE_DIR/storage-check.json ]]; then note=" The storage check itself did not pass either; what it printed is in $STATE_DIR/storage-check.json."
-     else note=" The storage check itself did not pass either, and printed nothing that could be read."; fi
+   # The note claims only what the Pod established about the check itself.
+   if [[ $never == "wait Running" ]]; then note=" The storage check itself was still running when its 300 s wait ran out, so the storage backend was not tested to the end."
+   elif [[ -n $never ]]; then note=" The storage check itself never ran (${never#* }), so the storage backend was not tested; the Pod's last status is in $STATE_DIR/storage-check-pod.json."
+   elif [[ $phase == Failed ]]; then
+     if $logs_read && [[ -s $STATE_DIR/storage-check.json ]]; then note=" The storage check itself did not pass either; what it printed is in $STATE_DIR/storage-check.json."
+     else note=" The storage check itself did not pass either (its Pod ended Failed), and what it printed could not be read (kubectl logs failed)."; fi
+   elif ! $logs_read; then note=" The storage check itself ran to an end, but its verdict could not be read (kubectl logs failed), so the storage backend was tested but not judged."
    fi
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
    if [[ $phase == Failed ]]; then
@@ -2313,15 +2347,22 @@ PY
  # runtime's message is not repeated (it names the registry route).
  case $never in
    "pull "*)
-     RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.config_file, registry.pull_secret or registry.base (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it)"
-     fail "the storage check's Pod could not pull its image $image on node $(j .storage.node) (${never#pull }), so the storage backend was not tested. Check registry.config_file and registry.pull_secret (the credential for that registry), that the node reaches the registry and, with registry.base, that the image was copied there unchanged";;
+     RECOVERY_HINT="resume --operation $OPERATION once the node can pull the image (a corrected credential file needs the pull Secret $(j .registry.pull_secret) in namespace $NAMESPACE deleted first, so resume recreates it from the file; a changed registry.base needs repair --operation $OPERATION --config $CONFIG --non-interactive instead, after 180 s)"
+     fail "the storage check's Pod could not pull its image $image on node $(j .storage.node) (${never#pull }), so the storage backend was not tested. Check registry.config_file and registry.pull_secret (the credential for that registry), that the node reaches the registry and, with registry.base, that the image was copied there unchanged. The storage check runs again on resume (not on repair)";;
    "sched "*)
-     RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting storage.node, freeing room on that node or repairing StorageClass $(j .storage.class) (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it)"
-     fail "the storage check's Pod was not scheduled (${never#sched }), so the storage backend was not tested. Either no node matched storage.node ($(j .storage.node)) with room for the Pod, or its claim on StorageClass $(j .storage.class) could not be bound; the scheduler's own words are in $STATE_DIR/storage-check-pod.json. Correct storage.node, free room on that node, or repair the class, then repair";;
+     RECOVERY_HINT="resume --operation $OPERATION once room is freed on node $(j .storage.node) or StorageClass $(j .storage.class) binds claims again; a changed storage.node needs abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again (upgrade and repair refuse a changed storage block)"
+     fail "the storage check's Pod was not scheduled (${never#sched }), so the storage backend was not tested. Either no node matched storage.node ($(j .storage.node)) with room for the Pod, or its claim on StorageClass $(j .storage.class) could not be bound; the scheduler's own words are in $STATE_DIR/storage-check-pod.json. The storage check runs again on resume";;
+   "wait Running")
+     RECOVERY_HINT="resume --operation $OPERATION once the node's disk is quiet; a check that stays stuck points at the node or StorageClass $(j .storage.class)"
+     fail "the storage check was still running when its 300 s wait ran out, so the storage backend was not tested to the end: the Pod had started and the check itself (locking, WAL, fsync, free space on the claim) had not finished. The Pod's last status is in $STATE_DIR/storage-check-pod.json; look at the node's disk and StorageClass $(j .storage.class), then resume";;
    "wait "*)
      RECOVERY_HINT="resume --operation $OPERATION once the node has pulled the image and bound the claim"
      fail "the storage check did not finish within 300 s (Pod phase ${never#wait }), so the storage backend was not tested: the node was still pulling the image or the claim was still binding when the wait ran out, or the check was stuck. The Pod's last status is in $STATE_DIR/storage-check-pod.json; look at the node's image pulls and StorageClass $(j .storage.class), then resume";;
  esac
+ if [[ $phase == Succeeded ]] && ! $logs_read; then
+   RECOVERY_HINT="resume --operation $OPERATION once this kubeconfig may read pods/log in namespace $NAMESPACE"
+   fail "the storage check ran to an end, but its verdict could not be read: kubectl logs on the check's Pod failed (the kubeconfig may lack pods/log in namespace $NAMESPACE). The storage backend was tested but not judged; nothing about the disk is established"
+ fi
  (( result == 0 )) || fail 'storage WAL/locking/fsync/free-space qualification failed'
  log 'Storage passed WAL, fsync, cross-process locking and actual backend free-space checks'
 }
@@ -2692,7 +2733,7 @@ relocated_images_probe() {
      verdict=${verdict%% SAID *}
      # The cure is a CHANGED site file or a changed registry, and resume refuses a changed site.
      RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it)"
-     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime said, of the first: ${words:0:600}. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host. Helm has applied nothing in this run"
+     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime said, of the first: ${words:0:600}. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host. The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then correct the node and resume --operation $OPERATION instead. Helm has applied nothing in this run"
    fi
    if (( spent >= deadline )); then
      RECOVERY_HINT="resume --operation $OPERATION once the registry answers, or repair --operation $OPERATION --config $CONFIG --non-interactive after raising deadlines.dependencies_seconds"
@@ -3914,12 +3955,12 @@ installation_summary() {
      | ([$r[]|select(startswith("llm-"))]|first // "") as $llm
      | ([$r[]|select(startswith("ocr-"))]|first // "") as $ocr
      | ([ (if $llm == "llm-absent" then "Until an LLM endpoint is set, the agent cannot answer: set the LLM per case under Einstellungen in the web UI, or llm.base_url and llm.model in the site file"
-           elif $llm == "llm-unreachable" then "Until the LLM endpoint at llm.base_url answers from inside the cluster, the agent cannot answer: it is configured, but it did not answer the acceptance probe, so check that it is up and reachable from the Pods and that its credential is right"
+           elif $llm == "llm-unreachable" then "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the agent cannot answer: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1"
            elif $llm != "" then "Until the LLM endpoint answers, the agent cannot answer (" + $llm + ")" else empty end),
           (if $ocr == "ocr-absent" then "Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file"
-           elif $ocr == "ocr-unreachable" then "Until the OCR endpoint at ocr.url answers from inside the cluster, scanned pages are not read: it is configured, but it did not answer the acceptance probe, so check that it is up and reachable from the Pods"
-           elif $ocr == "ocr-refused" then "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP " + ((.verification.ocr_http_status // "?")|tostring) + " to the acceptance probe, so check ocr.model and its credential"
-           elif $ocr == "ocr-not-vision-capable" then "Until ocr.url names an endpoint that reads images, scanned pages are not read: the configured one answered but did not read the test page, so replace ocr.url and ocr.model with a vision-capable endpoint"
+           elif $ocr == "ocr-unreachable" then "Until the OCR endpoint at ocr.url answers the acceptance probe with a recognition result, scanned pages are not read: it is configured, but the probe got no answer, or one that is not a chat completion, so check that it is up and reachable from the Pods and that ocr.url is the complete chat-completions route"
+           elif $ocr == "ocr-refused" then ((.verification.ocr_http_status // 0) as $h | "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP " + (if $h == 0 then "?" else ($h|tostring) end) + " to the acceptance probe" + (if $h == 401 or $h == 403 then ", so check its credential (ocr.credential)" elif $h == 404 then ", so check that ocr.url is the complete chat-completions route" elif $h == 400 or $h == 422 or $h == 415 then ", so check ocr.model and that the endpoint takes an image" elif $h >= 500 then ", so check the endpoint itself: it is up but failing" elif $h == 429 then ", so it is rate-limited: try again later" else ", so check ocr.url, ocr.model and its credential" end))
+           elif $ocr == "ocr-not-vision-capable" then "Until ocr.url names an endpoint that reads images, scanned pages are not read: the configured one answered the acceptance probe without the text of the test page, so scanned pages would be stored as whatever it answers; replace ocr.url and ocr.model with a vision-capable endpoint"
            elif $ocr != "" then "Until the OCR endpoint reads images, scanned pages are not read (" + $ocr + ")" else empty end) ]
         | join(". ")) + ". Then run install again with the site file: the acceptance then exercises what answers."' "$summary") Summary: $summary"
  else
@@ -3969,7 +4010,7 @@ resume_operation() {
  current=$(lease_read); holder=$(jq -r '.spec.holderIdentity // ""' <<< "$current")
  [[ $holder == "$RESUME_ID" ]] || fail 'resume identity differs from the persistent operation owner'
  age=$(jq -r 'now - (.spec.renewTime | sub("\\.[0-9]+Z$";"Z") | fromdateiso8601) | floor' <<< "$current")
- (( age >= 180 )) || fail 'the prior installer lease is still live; stop that tools process before reconnecting'
+ (( age >= 180 )) || lease_still_live 'the prior installer lease' "$age" 'stop that tools process before reconnecting'
  if [[ ! -f $record || $(jq -r .operation "$record") != "$RESUME_ID" ]]; then
    recover_operation_intent "$RESUME_ID" validate
    record="$GSJ_WORK/recovered-operation.json"; recovering_intent=true
@@ -4180,7 +4221,7 @@ repair_operation() {
  current=$(lease_read); holder=$(jq -r '.spec.holderIdentity // ""' <<< "$current")
  [[ $holder == "$RESUME_ID" ]] || fail 'repair does not own the named failed operation'
  age=$(jq -r 'now - (.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the prior installer is still live; stop it before repair'
+ (( age >= 180 )) || lease_still_live 'the prior installer' "$age" 'stop it before repair'
  [[ -f $STATE_DIR/operation.json && $(jq -r .operation "$STATE_DIR/operation.json") == "$RESUME_ID" ]] || fail 'repair requires the exact saved operation metadata'
  # Repair, and repair alone, permits one new bounded account-cleanup round
  # for a run whose three durable attempts are spent. A named resume re-enters
@@ -4583,7 +4624,7 @@ restore_resume_owner() {
  current=$(lease_read)
  [[ $(jq -r .spec.holderIdentity <<< "$current") == "$RESUME_ID" ]] || fail 'restore-repair does not own the named operation'
  age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the previous restore installer is still live'
+ (( age >= 180 )) || lease_still_live 'the previous restore installer' "$age"
  OPERATION=$RESUME_ID
  restore_program_validate "$current"
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
@@ -4990,7 +5031,7 @@ restore_archive() {
      lease=$(lease_read)
      [[ $(jq -r .spec.holderIdentity <<< "$lease") == "$RESUME_ID" ]] || fail 'restore intent owner changed'
      age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$lease")
-     (( age >= 180 )) || fail 'the previous restore installer is still live'
+     (( age >= 180 )) || lease_still_live 'the previous restore installer' "$age"
      OPERATION=$RESUME_ID
      jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$lease" | k replace -f - >/dev/null
      LEASE_ACQUIRED=true; LEASE_RESOURCE_VERSION=$(lease_read | jq -er .metadata.resourceVersion)
@@ -5069,7 +5110,7 @@ tls_repair() {
  current=$(lease_read)
  [[ $(jq -r .spec.holderIdentity <<< "$current") == "$RESUME_ID" ]] || fail 'TLS repair does not own the failed operation'
  age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the previous installer is still live'
+ (( age >= 180 )) || lease_still_live 'the previous installer' "$age"
  OPERATION=$RESUME_ID; LEASE_ACQUIRED=true
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
  start_renewal
@@ -5094,7 +5135,7 @@ credential_repair() {
  current=$(lease_read)
  [[ $(jq -r .spec.holderIdentity <<< "$current") == "$RESUME_ID" ]] || fail 'credential repair does not own the failed operation'
  age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the previous installer is still live'
+ (( age >= 180 )) || lease_still_live 'the previous installer' "$age"
  k get jobs -l "app.kubernetes.io/instance=$RELEASE" -o json | jq -e 'all(.items[];(.status.active//0)==0)' >/dev/null || fail 'provisioning is still active'
  OPERATION=$RESUME_ID; LEASE_ACQUIRED=true
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
@@ -5135,7 +5176,7 @@ backup_repair_operation() {
  [[ $(jq -r .spec.holderIdentity <<< "$current") == "$RESUME_ID" ]] || fail 'backup-repair does not own the recorded failed operation'
  renewed=$(jq -r .spec.renewTime <<< "$current")
  age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the previous installer is still live'
+ (( age >= 180 )) || lease_still_live 'the previous installer' "$age"
  OPERATION=$RESUME_ID
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
  LEASE_ACQUIRED=true; rm -f "$STATE_DIR/lease-lost"; start_renewal
@@ -5169,7 +5210,7 @@ addon_repair_operation() {
  [[ $(jq -r '.spec.holderIdentity//""' <<< "$current") == "$RESUME_ID" ]] || fail 'addon-repair does not own the recorded failed operation'
  renewed=$(jq -r .spec.renewTime <<< "$current")
  age=$(jq -r 'now-(.spec.renewTime|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601)|floor' <<< "$current")
- (( age >= 180 )) || fail 'the previous installer is still live; stop it before named addon recovery'
+ (( age >= 180 )) || lease_still_live 'the previous installer' "$age" 'stop it before named addon recovery'
  OPERATION=$RESUME_ID
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
  LEASE_ACQUIRED=true; rm -f "$STATE_DIR/lease-lost"; start_renewal

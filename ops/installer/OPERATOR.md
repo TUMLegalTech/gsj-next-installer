@@ -1109,19 +1109,23 @@ its reason (`llm-absent`, `llm-unreachable`, `ocr-absent`, `ocr-unreachable`,
 `ocr-refused`, `ocr-not-vision-capable`), `endpoints` records the state the
 acceptance probe found each endpoint in, and the closing line begins **GSJ
 installation complete, verification PARTIAL** instead of *Complete GSJ
-installation verified*, names the skipped checks with their reasons, and says
-what the product cannot do until the endpoints are set:
+installation verified*, names the skipped checks with their reasons, and says,
+per recorded reason, what the product cannot do and what to correct — "set it"
+only for an endpoint that is absent; an endpoint that is configured but did
+not answer, refused the request (with the HTTP status it answered) or answered
+without reading the test page is named for that, never told to be "set":
 
 ```
-[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable). Until the endpoints are set, the agent cannot answer and scanned pages are not read. Set the LLM per case under Einstellungen in the web UI, or set llm.base_url/llm.model and ocr.url/ocr.model in the site file and run install again: the acceptance then exercises them. Summary: …/summary.json
+[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable). Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the agent cannot answer: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1. Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file. Then run install again with the site file: the acceptance then exercises what answers. Summary: …/summary.json
 ```
 
 The install is complete either way — `backup` and `upgrade` work on it — but
 a partial verification has not exercised the agent or the scanned-page path.
-To close it: set the endpoints (the LLM per case under Einstellungen, or both
-in the site file) and run `install` again from the same site file; the run
-converges on what exists and re-runs the acceptance, this time exercising
-them. Either way the two fields beside the counts, `public_https` and
+To close it: do what the closing line names for each reason — set an absent
+endpoint (the LLM per case under Einstellungen, or both in the site file),
+make a configured one answer, accept the request or read images — and run
+`install` again from the same site file; the run converges on what exists and
+re-runs the acceptance, this time exercising them. Either way the two fields beside the counts, `public_https` and
 `networkpolicy`, must both read `passed`. Those two are not among the fifteen; they are the
 installer's own route and policy probes, reported in the same object. The
 fifteen application checks, in the order they run: `operator-login`,
