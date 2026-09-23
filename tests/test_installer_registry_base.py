@@ -546,15 +546,15 @@ def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resu
     assert result.returncode != 0
     hint = result.stderr.rsplit("HINT=", 1)[1]
     assert "repair --operation" in hint and "resume --operation" in hint
-    assert "first install" not in hint and "install again" not in hint
+    assert "first install" not in hint and "a repair would complete" not in hint
     if status == "owned":
         # resume's owned phase follows an interrupted backup too, where abandon refuses: the hint
         # names the route without claiming nothing is quiesced
         # the verb is named: in resume's owned phase "the same command" would read as resume, which abandon has made unusable
-        assert "run install (or upgrade --to VERSION) again" in hint and "run the same command again" not in hint
+        assert "run install again" in hint and "upgrade --to VERSION once" in hint and "run the same command again" not in hint
         assert "nothing is quiesced" not in hint and "abandon refuses while" in hint
     else:
-        assert "abandon" not in hint
+        assert "abandon" not in hint and "install again" not in hint
 
 
 @pytest.mark.parametrize("status, verb, absent", [

@@ -335,6 +335,17 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert "cleanup incomplete" in message and "did not pass either" in message and "correct the backend" in message
     assert hint.endswith("; correct the backend first")
+    # the other cleanup refusal (a slow deleter, the volume still present) says the same after the backup
+    (tmp_path / "j").mkdir()
+    result, _ = _run(tmp_path / "j", pod_phase="Failed", pv_phase="Released", status="backup-verified")
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert "still present" in message and "did not pass either" in message and "correct the backend" in message
+    assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa (") and hint.endswith("; correct the backend first")
+    # the negative side: a Pod that never ran is not a failed backend, after the backup too
+    (tmp_path / "k").mkdir()
+    result, _ = _run_never_ran(tmp_path / "k", status_json=PULL_FAILED, deleted=False, status="backup-verified")
+    assert "cleanup incomplete" in result.stderr and "correct the backend" not in result.stderr
     # the cleanup refusal after the backup: no "name a claim of your own" (a changed storage block is refused), no abandon
     (tmp_path / "h").mkdir()
     result, _ = _run(tmp_path / "h", status="backup-verified")
