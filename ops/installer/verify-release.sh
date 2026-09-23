@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify before executing the installer. The public key must come from a trusted channel.
+# Verify before executing the installer: the descriptor's signature under the release key published beside it, and the installer's exact bytes against the descriptor.
 set -euo pipefail
 [[ $# == 4 ]] || { echo 'Usage: verify-release.sh INSTALLER DESCRIPTOR.json SIGNATURE.sig TRUSTED-PUBLIC.pem' >&2; exit 2; }
 installer=$1 descriptor=$2 signature=$3 public=$4

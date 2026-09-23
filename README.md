@@ -67,8 +67,8 @@ install and when you would find out.
   checks is reported as **partial**, in the record and on screen.
 - **A read-only GHCR token issued by TUM Legal Tech.** The product images are
   private packages on `ghcr.io`; the installer creates the pull Secret from a
-  registry auth file you point it at. Ask TUM Legal Tech for the token through
-  the channel they name; it never travels through this repository.
+  registry auth file you point it at. TUM Legal Tech hands the token over
+  directly, with the release; it never travels through this repository.
 - About 3.5 GB free on the machine you install from (the corpus vectors and
   their envelope), and the volume sizes in the guide on the cluster.
 
@@ -87,7 +87,7 @@ Each release attaches:
 |---|---|
 | `gsj-install.sh` | the installer: a Bash runtime followed by a base64 payload (chart, schemas, defaults, jq programs, add-on charts, helpers, the public trust key) |
 | `installer-descriptor.json`, `installer-descriptor.sig` | the signed detached descriptor: release identity, qualification status, manifest hash, the installer's exact size and SHA-256 |
-| `release.pem` | the public trust key — **obtain it through a trusted channel too**; a key that only ever arrived with the installer proves nothing |
+| `release.pem` | the public trust key the descriptor is verified under, published beside the installer |
 | `verify-release.sh` | the verifier: Bash and OpenSSL, no Python, no jq |
 | `manifest.json` | the public release manifest (`gsj.release/1`): the six images by digest, the client pins, the corpus identity, the core library commit |
 | `gsj-<version>.tgz` | an audit copy of the chart the installer embeds; installing it directly is not supported |
@@ -102,10 +102,17 @@ bash verify-release.sh gsj-install.sh installer-descriptor.json installer-descri
 It checks the descriptor's signature under the key you supply, the key's
 fingerprint against the descriptor, and the installer's exact bytes against
 the descriptor. It does not run the installer. Signing uses RSA (3072 bits or
-more) with SHA-256; the private key never enters this repository, any release
-asset, or any CI system — releases are signed by hand on a maintainer's
-machine, and `build.py sign` refuses a key that sits inside a Git repository
-or is readable by anyone but its owner.
+more) with SHA-256; the private key stays on the maintainer's machine and
+never enters this repository, any release asset, or any CI system — releases
+are signed by hand there, and `build.py sign` refuses a key that sits inside a
+Git repository or is readable by anyone but its owner.
+
+**The handover is direct.** TUM Legal Tech hands the customer the release —
+this repository's release page, or the files from it — and their GHCR token
+themselves. The key travels with the release, and the verification proves
+that the installer the customer holds is the one that was signed: a download
+that was cut short, altered or swapped is refused. There is no separate key
+channel, no fingerprint delivered out of band, and no key ceremony.
 
 **Releases are hand-run.** This repository's GitHub Actions run its tests on
 GitHub-hosted runners and hold no secret — and cannot run the whole suite,

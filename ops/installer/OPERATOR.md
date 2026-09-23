@@ -520,8 +520,10 @@ application's own outbound calls are two separate proxies, met in steps 4 and 7.
 
 ### Step 2 — verify the release you were given
 
-You were handed four files: the executable, `installer-descriptor.json`, its
-`.sig`, and — separately — the release key plus `verify-release.sh`.
+You were handed a release — its page, or the five files from it: the
+executable, `installer-descriptor.json`, its `.sig`, the release key
+`release.pem` and `verify-release.sh` — and your registry token, directly from
+TUM Legal Tech.
 
 ```sh
 umask 077
@@ -542,7 +544,7 @@ and never executes the installer either way. Do not work around a failure;
 ask for the release again. **`$INSTALLER` is the name this guide writes as
 `gsj-install.sh`** — substitute it everywhere.
 
-Keep all four files. Step 3 reads the executable and later recoveries read it
+Keep all five files. Step 3 reads the executable and later recoveries read it
 again.
 
 → [Obtain and verify a release](#obtain-and-verify-a-release).
@@ -617,7 +619,7 @@ write to will do; the probe proves the node, not the namespace, and the
 install namespace need not exist yet.
 
 Whether the repositories a release names answer an anonymous pull is a property
-of the registry that published it; nothing in the four files you were given
+of the registry that published it; nothing in the release files you were given
 says, and none of them carries a registry credential. This probe is what tells
 you. If it is refused for want of one, ask whoever gave you the release — the
 credential then goes in `registry.config_file`, and the next block probes with
@@ -1199,11 +1201,14 @@ Everything below is reference. The steps above send you here.
 Everything below assumes six things are true. Establish them first; each one
 costs minutes now and hours later.
 
-**1. You were handed four files, not a URL.** A release is the executable, its
-`installer-descriptor.json`, that descriptor's `.sig`, and — through a separate,
-trusted channel — the release public key plus the `verify-release.sh` utility.
-There is no public GSJ release directory today. Put them somewhere private and
-verify before you run anything:
+**1. You were handed a release and a token, directly.** A release is five
+files on its release page: the executable, its `installer-descriptor.json`,
+that descriptor's `.sig`, the release public key `release.pem` and the
+`verify-release.sh` utility; TUM Legal Tech hands you the page, or the files,
+and your registry token themselves. The verification below proves that the
+installer you hold is the one that was signed — a download that was cut short,
+altered or swapped is refused. Put the files somewhere private and verify
+before you run anything:
 
 ```sh
 umask 077
@@ -1346,11 +1351,11 @@ already be available to `curl`.
 
 ## Obtain and verify a release
 
-Obtain the release public key through an independently trusted channel.
-The key downloaded beside an executable does not establish its authenticity.
-Retain the exact installer, descriptor, signature and trusted key for recovery.
-Use a release's documented immutable directory; no public GSJ artifact URL or
-image digest is asserted by the examples below.
+The release public key is published beside the installer, on the release
+page, and the release and your registry token are handed to you directly by
+TUM Legal Tech. Retain the exact installer, descriptor, signature and key for
+recovery. Use a release's immutable directory — for this line,
+`https://github.com/TUMLegalTech/gsj-next-installer/releases/download/<version>`.
 
 **Read this section even if you already verified your release.** Two parts of it
 are prerequisites for every install: the image inventory and, if your nodes do
@@ -1358,13 +1363,12 @@ not pull from the registry the release names, **[Make your nodes able to pull
 the images](#make-your-nodes-able-to-pull-the-images)** below. That one is the
 most common way an install fails, and it fails hours in.
 
-What you may skip is the next block only. It fetches a release from an HTTPS
-release directory, and **no such directory exists for GSJ today** — it is
-written for the day one does, and for operators who host their own. If you were
-handed four files, "Before you start" already covered you; go to the image
-inventory below.
+What you may skip is the next block only. It fetches a release from its HTTPS
+release directory into a directory of its own and verifies it. If you already
+downloaded and verified the five files by hand, "Before you start" covered
+you; go to the image inventory below.
 
-For a public, credential-free HTTPS release directory:
+For the public, credential-free HTTPS release directory:
 
 ```sh
 umask 077
@@ -1376,12 +1380,12 @@ if [ -z "${GSJ_RELEASE_NAME:-}" ] || [ -z "${GSJ_RELEASE_URL:-}" ]; then
 elif [[ $GSJ_RELEASE_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
   mkdir -m 700 "$HOME/gsj-operator/releases/$GSJ_RELEASE_NAME" &&
   cd "$HOME/gsj-operator/releases/$GSJ_RELEASE_NAME" &&
-  for asset in gsj-install.sh installer-descriptor.json installer-descriptor.sig; do
+  for asset in gsj-install.sh installer-descriptor.json installer-descriptor.sig release.pem verify-release.sh; do
     curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
       "$GSJ_RELEASE_URL/$asset" --output "$asset" || break
   done &&
-  bash "$HOME/gsj-operator/trust/verify-release.sh" gsj-install.sh installer-descriptor.json \
-    installer-descriptor.sig "$HOME/gsj-operator/trust/gsj-release.pem" &&
+  bash verify-release.sh gsj-install.sh installer-descriptor.json \
+    installer-descriptor.sig release.pem &&
   chmod 500 gsj-install.sh &&
   ./gsj-install.sh --help
 else
@@ -1393,13 +1397,12 @@ The exclusive directory creation refuses to overwrite a previously saved
 release. Retain each predecessor directory for named recovery.
 
 The verification command checks the signature and exact executable hash without
-executing the installer. Keep your trusted verification utility with your trust
-key; the first acquisition of that utility also needs a trusted channel.
+executing the installer.
 
-**What you are given, and what it is called.** A release is four things: the
-executable, its `installer-descriptor.json`, that descriptor's `.sig`, and —
-through a separate, independently trusted channel — the release public key and
-the `verify-release.sh` utility that checks them. The executable's own filename
+**What you are given, and what it is called.** A release is five things, all
+on its release page: the executable, its `installer-descriptor.json`, that
+descriptor's `.sig`, the release public key `release.pem` and the
+`verify-release.sh` utility that checks them. The executable's own filename
 is whatever the release publisher chose and the signed descriptor records; read
 it before you run anything, because the examples in this guide all write
 `./gsj-install.sh` and yours may not be called that:
@@ -1413,20 +1416,19 @@ about the command lines changes. (A qualification build is commonly named for
 its engineering line rather than the product; the descriptor is the authority,
 and `verify-release.sh` compares the bytes, not the name.)
 
-Today there is **no public GSJ release directory**. Release engineering hands
-you the four files directly, by whatever channel your agreement names, and the
-examples above are written for the day one exists. Two consequences follow
-immediately and neither is an error:
-
-- the `release_base_url` embedded in such a build is empty, so **every `--to`
-  option is unavailable** — `upgrade --to`, `repair --to`, and the corrected-release
-  recoveries the reason-code table names. The installer says so, in those words,
-  in about six seconds. To move to another version you run THAT version's own
-  signed installer directly. The plain `repair --operation ID --config <your site.json>`
-  reapplies the release you already have and needs no endpoint at all;
-- the release's six images are pinned by digest at whatever registry the build
-  recorded. **Your Kubernetes nodes must be able to pull those exact digests.**
-  Read the inventory out of the executable before you plan for it:
+A published release names its own release directory (`release_base_url` in the
+payload's `release.json`: this repository's release page), and that is where
+`upgrade --to` fetches a successor from. A qualification build — one a
+maintainer hands you outside a release — may carry none, and then **every
+`--to` option is unavailable** — `upgrade --to`, `repair --to`, and the
+corrected-release recoveries the reason-code table names. The installer says
+so, in those words, in about six seconds. To move to another version you run
+THAT version's own signed installer directly. The plain `repair --operation ID
+--config <your site.json>` reapplies the release you already have and needs no
+endpoint at all. Whatever the build, the release's six images are pinned by
+digest at whatever registry the build recorded. **Your Kubernetes nodes must be
+able to pull those exact digests.** Read the inventory out of the executable
+before you plan for it:
 
 ```sh
 INSTALLER=$(jq -r .installer.name installer-descriptor.json)   # NOT "gsj-install.sh"

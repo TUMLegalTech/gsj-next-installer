@@ -332,7 +332,7 @@ def prepare(manifest_path: Path) -> tuple[dict, bytes, dict[str, tuple[bytes, in
         fail("published corpus requires its release owner and authoritative source provenance")
     trust_path = resolve(manifest.get("trust_key_file") or build.get("trust_key_file", ""), manifest_path)
     if not trust_path.is_file():
-        fail("trust_key_file must identify the out-of-band trusted public key")
+        fail("trust_key_file must identify the release public key")
     trust = public_key(trust_path)
     core_git = resolve(build["core_git_dir"], manifest_path) if "core_git_dir" in build else ROOT / "ops/.build/gsj-next.git"
     schema_asset = subprocess.run(["git", "--git-dir=" + str(core_git), "show", manifest["core"]["commit"] + ":" + manifest["schema_asset"]["path"]], check=True, capture_output=True).stdout
