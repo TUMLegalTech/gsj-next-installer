@@ -548,7 +548,9 @@ def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resu
     assert "repair --operation" in hint and "resume --operation" in hint
     assert "first install" not in hint and "install again" not in hint
     if status == "owned":
-        assert "run the same command again" in hint, "before the backup nothing is quiesced: abandon and the same command again is open too"
+        # resume's owned phase follows an interrupted backup too, where abandon refuses: the hint
+        # names the route without claiming nothing is quiesced
+        assert "run the same command again" in hint and "nothing is quiesced" not in hint and "abandon refuses while" in hint
     else:
         assert "abandon" not in hint
 
@@ -596,6 +598,10 @@ def test_a_restore_continued_under_a_corrected_program_names_that_installer(runt
     result = run(PROBE_PRELUDE.format(payload=payload) + 'STATE_DIR="$TEST_WORK"; RESTORE_PROGRAM_ACTIVE=true; relocated_images_probe')
     assert result.returncode != 0
     hint = result.stderr.rsplit("HINT=", 1)[1]
-    assert hint.startswith("restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb with this corrected installer"), hint
+    # the phase decides the verb under the corrected program too: applying is the repair path's
+    verb = "repair" if status == "applying" else "restore-repair"
+    assert hint.startswith(verb + " --operation aaaaaaaaaaaabbbbbbbbbbbb with this corrected installer"), hint
+    if status == "applying":
+        assert "restore-repair" not in hint
     assert "resume --operation" not in hint and "exact saved target" not in hint and "exact source installer" not in hint
     assert "after correcting registry.base" not in hint

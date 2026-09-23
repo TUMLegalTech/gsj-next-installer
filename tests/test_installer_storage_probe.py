@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(shutil.which("jq") is None, reason="jq unavailable")
 
 
-def _run(tmp_path, *, claim="", deleted=False, pv_phase="Failed", pod_phase="Succeeded", logs=True):
+def _run(tmp_path, *, claim="", deleted=False, pv_phase="Failed", pod_phase="Succeeded", logs=True, status="owned"):
     # logs: True = a verdict is printed; "empty" = kubectl logs succeeds with nothing; False = kubectl logs fails
     source = (ROOT / "ops/installer/runtime.sh").read_text().split("# ENTRY POINT", 1)[0]
     source = source.replace("@CLIENT_TABLE@", "gsj_client_info() { return 1; }")
@@ -33,6 +33,7 @@ def _run(tmp_path, *, claim="", deleted=False, pv_phase="Failed", pod_phase="Suc
                         "data": {"existing_claim": claim}}}
     (work / "site.json").write_text(json.dumps(site))
     (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": []}}))
+    (state / "operation.json").write_text(json.dumps({"operation": "a" * 24, "kind": "install", "status": status}))
     # a record of ANOTHER class, left by an earlier run in this state directory: it must play no part
     (state / "storage-class.json").write_text(json.dumps({"metadata": {"name": "some-other-class"},
                                                            "provisioner": "kubernetes.io/no-provisioner"}))
@@ -313,9 +314,22 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
     which refuses after the backup."""
     result, _ = _run_never_ran(tmp_path, status_json=STILL_RUNNING, poll_phase="Running", status="backup-verified")
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
-    assert "without repeating this check" in hint and "abandon" not in hint
+    assert "without repeating this check" in hint and "abandon" not in hint and "stays stuck" not in hint
+    assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa ("), "cleanup_exit prints `Use <hint>.`: the hint must read as a command"
+    # the failed verdict: a first install is told resume repeats the check; after the backup it is not
     (tmp_path / "f").mkdir()
-    result, _ = _run(tmp_path / "f", pod_phase="Failed", deleted=True)
+    result, _ = _run(tmp_path / "f", pod_phase="Failed", deleted=True, status="owned")
     assert result.returncode == 1 and "qualification failed" in result.stderr
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
-    assert "resume --operation" in hint and "repeats this check" in hint, "a first install (no operation record here): resume repeats the check"
+    assert "resume --operation" in hint and "repeats this check" in hint
+    (tmp_path / "g").mkdir()
+    result, _ = _run(tmp_path / "g", pod_phase="Failed", deleted=True, status="backup-verified")
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert "without repeating this check" in hint and "repeats this check" not in hint
+    # the cleanup refusal after the backup: no "name a claim of your own" (a changed storage block is refused), no abandon
+    (tmp_path / "h").mkdir()
+    result, _ = _run(tmp_path / "h", status="backup-verified")
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert "cleanup incomplete" in message and "Name a claim of your own" not in message and "refused for an installed release" in message
+    assert "abandon" not in hint and hint.startswith("HINT: resume --operation")
