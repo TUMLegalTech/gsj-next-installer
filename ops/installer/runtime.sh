@@ -989,6 +989,62 @@ initializer_memory_check() {
  (( balloc >= declared )) || fail "node $bname has $(( balloc / 1048576 ))Mi of allocatable memory in total, less than the $(j '.resources.initializer.limits.memory') resources.initializer.limits.memory gives the corpus initializer. The Pod would still be scheduled -- the scheduler reads requests, not limits -- and would then be capped by the machine rather than by that limit"
  (( headroom >= pod_request )) || fail "no node has room for this deployment: the most any candidate node ($bname) has left is $(( headroom / 1048576 ))Mi and this deployment's own resources block requests $(( pod_request / 1048576 ))Mi -- $(( (pod_request - $(quantity_bytes "$(j '.resources.chroma.requests.memory')") - $(quantity_bytes "$(j '.resources.forgejo.requests.memory')")) / 1048576 ))Mi for the application Pod, which is the larger of its init container and the sum of its containers, plus chroma and forgejo. Free requests on a node or give storage.node one that has room. This is the SCHEDULER's arithmetic over what other Pods have RESERVED, not free memory: a node can be mostly idle and still refuse to place these Pods"
 }
+# The two model endpoints, probed from THIS host in the install's first minute:
+# advisory, never a refusal. What decides whether their acceptance checks run
+# is the probe the verifier makes from inside the cluster at acceptance
+# (gsj_deploy/verify.py probe_endpoints); this one tells the operator now what
+# that one will most likely find, and records it (endpoint-preflight.json).
+# An endpoint left out of the site file is reported as absent without a
+# request; a configured one gets the request the application makes -- the
+# models route for the LLM, and for OCR the application's own recognition
+# request on a small image of the words AKTE 58203, whose answer must contain
+# 58203 (the guide's step-0 block, verbatim in its logic). A credential file
+# rides as a header read from a private file, never on a command line.
+GSJ_OCR_PROBE_PNG=iVBORw0KGgoAAAANSUhEUgAAATcAAABDAQAAAADRnX/8AAACLklEQVR42u2VMW7cMBBFHykhUpVVuu2sI+wBnJhHyRFSuooHCBDkGDkKj6Aj0F1KGXDBNbicFJS00tqFU6XZ6QR8/uH8+V80yntKLe+rK+6K+1fcsUVrHnfGmM/GGDgZw1OHWnh0HNsNX+g2BMMzL+r4PfDnBaiBmAD8tpE/EQkqDUEBVHWsNFfKF+AWUE2g8BDYJSoVHjRbgAwobhMIIBAhI/hyv7FgZQElyJX3Hgrzeo5kjIr6RqcA1j3cJxrFhFBwQYG4VvJGaTvkJ3Ev2G7m88BYv9LWAJDrc1+B0PIm0P2QGecB/ErmyHyaHu5nnOkB6V/RfZ+koJ/7etjI98nZOM6SMEx8AuhKPhgGUpgPqnMFZ7uzzEdjAZ7Nyck0KghYUAiXV8uI2Yx9VnfllxFwFlILkLXwUbcjF5yKP0HsFgpb3HJRN6ggkyrVvF8ADuMK14tU3hOKpvsRLCSIi3yNZtg7l+tDwLvLHMGveKZrBFpQKVrVy7wJQ9rcMNGSq/O+7bR1+9pWY6rfyvlq7Kdph8Vq3RmXwa4enGFq19EFTnHCjSvzrnfTjT3ghdQWvruSnbNhejzEeUMplpz7OyVXKncqmhpV1bAjNeONUMWGbMKu5NytqI7GCN0TpKEv32jfLfMKuLURjD05BGows+99WdoqHy12CYJlyZtMCV5wNbURBLDUuPn/UqqLK/FbnFHASEs/+Vk2PQGM/8bhIwBfD+w/AOb67l9x/xH3F0Tp4vsISHl9AAAAAElFTkSuQmCC
+endpoint_probe_header() {
+ # Authorization: Bearer <the credential file's contents>, in a 0600 file
+ # curl reads with --header @FILE; empty when the endpoint has no credential.
+ local role=$1 file; file=$(j ".$role.credential.file"); [[ -n $file ]] || return 0
+ file=$(resolve_file "$file"); private_file "$file"
+ { printf 'Authorization: Bearer '; tr -d '\r\n' < "$file"; printf '\n'; } | atomic "$GSJ_WORK/endpoint-$role.header"
+ printf '%s' "$GSJ_WORK/endpoint-$role.header"
+}
+endpoint_preflight() {
+ local base url model header rc code state llm ocr said answer
+ llm=absent; ocr=absent
+ base=$(j .llm.base_url)
+ if [[ -n $base ]]; then
+   header=$(endpoint_probe_header llm); rc=0
+   code=$(curl -sS --connect-timeout 10 --max-time 20 -o "$GSJ_WORK/endpoint-llm.json" -w '%{http_code}' ${header:+--header "@$header"} "${base%/}/models" 2>"$GSJ_WORK/endpoint-llm.err") || rc=$?
+   if (( rc != 0 )); then llm=unreachable; elif [[ $code != 200 ]]; then llm="refused (HTTP $code)"; elif ! jq -e --arg m "$(j .llm.model)" '(.data|type)=="array" and any(.data[]; .id==$m)' "$GSJ_WORK/endpoint-llm.json" >/dev/null 2>&1; then llm="answers, but does not list llm.model"; else llm=working; fi
+ fi
+ url=$(j .ocr.url); model=$(j .ocr.model)
+ if [[ -n $url ]]; then
+   header=$(endpoint_probe_header ocr); rc=0
+   jq -n --arg model "$model" --arg png "$GSJ_OCR_PROBE_PNG" '{model:$model,max_tokens:2048,messages:[{role:"user",content:[{type:"image_url",image_url:{url:("data:image/png;base64,"+$png)}},{type:"text",text:"Text Recognition:"}]}]}' > "$GSJ_WORK/endpoint-ocr-request.json"
+   code=$(curl -sS --connect-timeout 10 --max-time 90 -o "$GSJ_WORK/endpoint-ocr.json" -w '%{http_code}' -H 'Content-Type: application/json' ${header:+--header "@$header"} -d "@$GSJ_WORK/endpoint-ocr-request.json" "$url" 2>"$GSJ_WORK/endpoint-ocr.err") || rc=$?
+   if (( rc == 28 )); then ocr="no answer within 90 s"; elif (( rc != 0 )); then ocr=unreachable; elif [[ $code != 200 ]]; then ocr="refused (HTTP $code)";
+   else
+     answer=$(jq -r '(.choices[0].message.content // null) | if type=="array" then map(strings // (.text? | strings) // "") | join("") elif . == null then "" else tostring end' "$GSJ_WORK/endpoint-ocr.json" 2>/dev/null) || answer=''
+     if ! jq -e '.choices[0].message | type=="object" and has("content")' "$GSJ_WORK/endpoint-ocr.json" >/dev/null 2>&1; then ocr="answers, but not as a chat-completions route"
+     elif [[ $(printf '%s' "$answer" | tr -d ' \t\r\n') == *58203* ]]; then ocr=working
+     else ocr="not vision-capable (answered, but did not read the image)"; fi
+   fi
+ fi
+ rm -f "$GSJ_WORK/endpoint-llm.header" "$GSJ_WORK/endpoint-ocr.header"
+ jq -n --arg llm "$llm" --arg ocr "$ocr" --arg host "$(hostname 2>/dev/null || printf unknown)" '{format:"gsj.endpoint-preflight/1",probed_from:$host,llm:$llm,ocr:$ocr}' | atomic "$STATE_DIR/endpoint-preflight.json"
+ case $llm in
+   absent) log 'LLM endpoint: none in the site file. The install will complete; acceptance skips agent-turn-note-history and generated-document, and the agent cannot answer until an endpoint is set (per case under Einstellungen, or llm.base_url/llm.model here and install again)';;
+   working) log "LLM endpoint $base: answers from this host and lists $(j .llm.model)";;
+   *) log "LLM endpoint $base: $llm from this host. If it does not answer from inside the cluster either, acceptance skips agent-turn-note-history and generated-document and the agent cannot answer until it does; the install completes either way";;
+ esac
+ case $ocr in
+   absent) log 'OCR endpoint: none in the site file. The install will complete; acceptance skips scanned-ingest-search, and scanned pages are not read until ocr.url names a vision-capable endpoint and install runs again';;
+   working) log "OCR endpoint $url: read the test image from this host";;
+   "not vision"*) log "OCR endpoint $url: answered HTTP 200 from this host but did not read the test image. Acceptance will skip scanned-ingest-search, and the application would store whatever this endpoint answers as the text of a scanned page: replace it before anyone uploads scanned files";;
+   *) log "OCR endpoint $url: $ocr from this host. If it does not read the verifier's page from inside the cluster either, acceptance skips scanned-ingest-search and scanned pages are not read until it does; the install completes either way";;
+ esac
+}
 preflight() {
  k cluster-info >/dev/null
  local platform nodes pull server
@@ -3785,12 +3841,22 @@ installation_summary() {
     release:{identity:$r.identity,version:$r.version},
     fingerprints:{chart_sha256:$chart,core:$r.core,model:$r.model,corpus:$r.corpus.fingerprint,corpus_manifest_sha256:$r.corpus.manifest_sha256},
     corpus:{rows:$r.corpus.rows,vectors:$r.corpus.chunks,status:(if any($v.checks[]?;.name=="mcp-tools-corpus-schema" and .status=="passed") then "verified" else "unverified" end)},
-    verification:{status:$v.status,checks_passed:([$v.checks[]?|select(.status=="passed")]|length),checks:($v.checks//[]|length),public_https:$public[0].status,networkpolicy:$network[0].status},
+    verification:{status:$v.status,coverage:(if ([$v.checks[]?|select(.status=="skipped")]|length)>0 then "partial" else "full" end),
+                  checks_passed:([$v.checks[]?|select(.status=="passed")]|length),checks_skipped:([$v.checks[]?|select(.status=="skipped")]|length),checks:($v.checks//[]|length),
+                  skipped:[$v.checks[]?|select(.status=="skipped")|{name,reason}],endpoints:($v.endpoints//{}),
+                  public_https:$public[0].status,networkpolicy:$network[0].status},
     settings:(reduce (["operator","password_file"],["llm","credential","file"],["ocr","credential","file"],["registry","config_file"],["tls","private_key_file"],["trust","proxy_file"],["backup","passphrase_file"],["backup","auth_header_file"],["delivery","auth_header_file"]) as $p
       ($s; if (getpath($p)//"")!="" then setpath($p;"(protected file)") else . end)),
     installed_record:$record,verification_report:$report}' | atomic "$summary"
  cat "$summary"
- log "Complete GSJ installation verified: $VERSION at $(j .public_url). Summary: $summary"
+ if [[ $(jq -r .verification.coverage "$summary") == partial ]]; then
+   # A partial verification must be unmistakable, on screen as in the record:
+   # the word, the counts, every skipped check with its reason, and what the
+   # product cannot do until the endpoints are set.
+   log "GSJ installation complete, verification PARTIAL: $VERSION at $(j .public_url). $(jq -r '"\(.verification.checks_passed) of \(.verification.checks) application checks ran and passed; \(.verification.checks_skipped) skipped: " + ([.verification.skipped[]|"\(.name) (\(.reason))"]|join(", "))' "$summary"). $(jq -r '[(if (.verification.skipped|map(.reason)|any(startswith("llm-"))) then "the agent cannot answer" else empty end), (if (.verification.skipped|map(.reason)|any(startswith("ocr-"))) then "scanned pages are not read" else empty end)] | "Until the endpoints are set, " + join(" and ") + "."' "$summary") Set the LLM per case under Einstellungen in the web UI, or set llm.base_url/llm.model and ocr.url/ocr.model in the site file and run install again: the acceptance then exercises them. Summary: $summary"
+ else
+   log "Complete GSJ installation verified: $VERSION at $(j .public_url). Summary: $summary"
+ fi
 }
 verify_target() {
  local descriptor=$1 signature=$2 installer=$3 requested=$4
@@ -5120,6 +5186,7 @@ main() {
  if [[ $COMMAND == backup-repair ]]; then backup_repair_operation; return; fi
  if [[ $COMMAND == restore || $COMMAND == restore-repair ]]; then restore_archive; return; fi
  [[ $COMMAND == install || $COMMAND == upgrade ]] || fail 'unsupported operation'
+ endpoint_preflight
  read_installed
  if [[ $COMMAND == upgrade ]]; then [[ -s $GSJ_WORK/installed.json ]] && jq -e '.status=="complete"' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade requires a completed installed-release record'; fi
  compatibility; acquire

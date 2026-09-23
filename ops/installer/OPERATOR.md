@@ -50,7 +50,8 @@ timeout, is long enough. What differs is *when*:
 | Storage provisioner | a preflight refusal | step 8, first seconds |
 | Model endpoint shape | schema validation | step 8, first seconds |
 | A registry that mandates a path prefix | nothing relocates the managed add-ons' images; with `registry.base` set, a preflight notice names the ones your profiles select | step 8: the notice in its first seconds, then an add-on whose Pods cannot pull |
-| An OCR endpoint that can read an image — **required; no setting turns it off** | acceptance check `scanned-ingest-search` | step 9, hours in, after the corpus import |
+| An OCR endpoint that can read an image — **needed for scanned pages; the install completes without one** | the installer's own probe in its first minute (advisory), then acceptance, which **skips** `scanned-ingest-search` and says so when the endpoint is absent or does not read the test page from inside the cluster | step 8, first minute; step 9, hours in, for the verdict |
+| An LLM endpoint — **needed for the agent; the install completes without one** | the same probe, then acceptance, which skips `agent-turn-note-history` and `generated-document` when the endpoint is absent or does not answer the runner | step 8, first minute; step 9 |
 | NetworkPolicy | acceptance check `networkpolicy` | step 9, hours in |
 | Ingress controller | acceptance, for two of the three behaviours it needs — a near-cap upload and an event-stream cadence check assert them across it; a green install does not show that its **timeout** is long enough (measured, below) | step 9, hours in, for a body cap or a buffering proxy; for the timeout, an upload or a turn that dies at your proxy's limit, after the install has passed |
 
@@ -58,10 +59,15 @@ The last row is the reason step 0 exists at all: the installer will happily
 build you a deployment behind a controller that cuts long uploads — that is
 what we ran, and all fifteen checks passed — and never mention it.
 
-**[if]** you have no model that can read an image, stop now: no install of this
-release reports *Complete* without one. **Your OCR endpoint must be able to read
-an image**, further down this step, has the probe and the reasons. It need not
-be a second server: nothing in the site file ties `ocr.*` to `llm.*`, so if the
+**[if]** you have no model that can read an image, or no LLM endpoint yet, the
+install still completes: the checks that need the missing endpoint are skipped,
+the closing line says **PARTIAL** and names them with the reason, and the product
+runs without that capability — scanned pages are not read, or the agent cannot
+answer — until you set the endpoint and run `install` again (the LLM can also be
+set per case, in the lawyer's Einstellungen). Skipping is never quiet and never
+a setting: an endpoint that is configured and answers is always exercised, and
+must pass. **Your OCR endpoint must be able to read an image**, further down
+this step, has the probe and the reasons. It need not be a second server: nothing in the site file ties `ocr.*` to `llm.*`, so if the
 model you already serve can read images, `ocr.url` may be that same server's
 complete chat-completions route and `ocr.model` that same model.
 
@@ -285,16 +291,25 @@ Azure OpenAI's classic shape breaks all three: a query string (refused), no
 Put an OpenAI-compatible gateway in front of it, or use an endpoint that
 already speaks this shape. Settle it now rather than at step 7.
 
-**Your OCR endpoint must be able to read an image. This is a hard
-prerequisite.** `ocr.url` is a required site value, and step 9's
-`scanned-ingest-search` check uploads a scanned page with recognition *forced*
-and requires the recognised sentence to come back in search. An endpoint that
-cannot read an image cannot pass it, the verifier stops at the first check that
-fails, and the installer never reports *Complete* — hours in, after the corpus
-import. No setting skips that check. (The application itself runs without OCR,
-and the bare chart treats it as optional; this installer does not certify a
-deployment that cannot read a scanned Akte, which is most of what a court file
-is.) If you have no vision-capable model, stop here and get one.
+**Your OCR endpoint must be able to read an image, if you name one.**
+`ocr.url` may be left empty: the install then completes with
+`scanned-ingest-search` skipped and recorded as `ocr-absent`, and no scanned
+page is read until you set it and run `install` again. A named endpoint is
+probed twice — from your machine in the install's first minute (advisory; the
+same request as the block below, and the verdict is logged and recorded in the
+state directory as `endpoint-preflight.json`) and from inside the cluster at
+acceptance, where the verifier renders the scanned test page, sends it as the
+application would, and requires the recognised sentence back. An endpoint that
+gives no HTTP answer there skips the check as `ocr-unreachable`; one that
+answers with a status other than 200 skips it as `ocr-refused` (the status is
+recorded); one that answers HTTP 200 **without** the sentence skips it as
+`ocr-not-vision-capable` — and that is the dangerous one, because the
+application stores whatever a 200 says as the text of a scanned page: replace
+it before anyone uploads scanned files. Only an endpoint that reads the page
+runs the check, and then the check must pass. (The application itself runs
+without OCR, and the bare chart treats it as optional; a partial verification
+says in its record and on screen that the scanned-page path was not
+exercised.)
 
 Settle it now, from any machine that can reach the endpoint. It needs no
 cluster, only `bash`, `jq` and `curl` — `curl` 7.55 or newer, because an older
@@ -1083,9 +1098,29 @@ else
 fi
 ```
 
-`verification.checks_passed` must equal `verification.checks` — fifteen of
-fifteen — and the two fields beside them, `public_https` and `networkpolicy`,
-must both read `passed`. Those two are not among the fifteen; they are the
+On a full verification `verification.coverage` is `full` and
+`verification.checks_passed` equals `verification.checks` — fifteen of fifteen.
+On a **partial** one — an endpoint left out of the site file, or one that did
+not answer from inside the cluster — `coverage` is `partial`, `checks_passed`
+plus `checks_skipped` make fifteen, `skipped` lists every skipped check with
+its reason (`llm-absent`, `llm-unreachable`, `ocr-absent`, `ocr-unreachable`,
+`ocr-refused`, `ocr-not-vision-capable`), `endpoints` records the state the
+acceptance probe found each endpoint in, and the closing line begins **GSJ
+installation complete, verification PARTIAL** instead of *Complete GSJ
+installation verified*, names the skipped checks with their reasons, and says
+what the product cannot do until the endpoints are set:
+
+```
+[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable). Until the endpoints are set, the agent cannot answer and scanned pages are not read. Set the LLM per case under Einstellungen in the web UI, or set llm.base_url/llm.model and ocr.url/ocr.model in the site file and run install again: the acceptance then exercises them. Summary: …/summary.json
+```
+
+The install is complete either way — `backup` and `upgrade` work on it — but
+a partial verification has not exercised the agent or the scanned-page path.
+To close it: set the endpoints (the LLM per case under Einstellungen, or both
+in the site file) and run `install` again from the same site file; the run
+converges on what exists and re-runs the acceptance, this time exercising
+them. Either way the two fields beside the counts, `public_https` and
+`networkpolicy`, must both read `passed`. Those two are not among the fifteen; they are the
 installer's own route and policy probes, reported in the same object. The
 fifteen application checks, in the order they run: `operator-login`,
 `temporary-users`, `digital-ingest-search`, `scanned-ingest-search`,
@@ -2025,21 +2060,26 @@ out for a publicly trusted certificate.
 ### The five values only you can supply
 
 Nothing discovers these and no default is right for them. They describe systems
-GSJ talks to but does not run, and an install cannot start without them.
+GSJ talks to but does not run. An install can start — and complete — without
+the model endpoints: leave `llm.base_url` and `llm.model` both empty, or
+`ocr.url` empty, and the acceptance checks that need them are skipped and named
+(step 9), and the product lacks that capability until they are set.
 
 | field | what it is | where you get it |
 |---|---|---|
-| `llm.base_url` | the OpenAI-compatible **base** URL of the chat model the agent uses — the part ending `/v1`, with no route after it | your own model deployment (vLLM, an inference gateway, a hosted endpoint). GSJ ships no model and no endpoint |
+| `llm.base_url` | the OpenAI-compatible **base** URL of the chat model the agent uses — the part ending `/v1`, with no route after it — or empty, together with `llm.model`: the install completes with the two agent checks skipped (`llm-absent`) and the agent cannot answer until an endpoint is set, per case under Einstellungen or here and `install` again | your own model deployment (vLLM, an inference gateway, a hosted endpoint). GSJ ships no model and no endpoint |
 | `llm.model` | the model id that endpoint serves | `curl "$LLM_BASE_URL/models"` — note `llm.base_url` ALREADY ends in `/v1`, so the models route is `$LLM_BASE_URL/models`, never `$LLM_BASE_URL/v1/models` |
 | `llm.context_window` | that model's usable context in tokens; drives the lawyer-facing KONTEXT meter and compaction | the same answer's `max_model_len`, or the model card. `0` is a defined setting, not a gap: the agent runtime then asks the endpoint's `/models` route itself, with your key, and falls back to its SDK defaults where that gives nothing — which is not proof the endpoint advertises a usable limit. A number you write is taken as given and never checked against the endpoint. The installer itself never contacts `llm.base_url`: nothing is probed at install time |
-| `ocr.url` | the **complete** chat-completions URL of a vision model for scanned pages — note this one is the full route, not a base | your OCR deployment. **There is no OCR-less configuration**: the field is required, an empty value is refused, and step 0 made a model that can read an image a hard prerequisite — its probe is there, and the reasons are below |
+| `ocr.url` | the **complete** chat-completions URL of a vision model for scanned pages — note this one is the full route, not a base — or empty: the install completes with the scanned-page check skipped (`ocr-absent`) and scanned pages are not read until it is set and `install` runs again | your OCR deployment; step 0's probe and the reasons are there |
 | `ocr.model` | the model id that endpoint serves | as above |
 
 `http://` is accepted as well as `https://` for both, which is what a
 same-network model host usually is. Both endpoints must be reachable **from
 inside the cluster**, not merely from the installer shell: the agent runner and
-the web container dial them. A quick check before you install, from any pod on
-the target cluster:
+the web container dial them, and that is where acceptance decides whether an
+endpoint works (the installer's own first-minute probe runs from your machine
+and only forecasts). A quick check before you install, from any pod on the
+target cluster — skip the line of an endpoint you left empty:
 
 ```sh
 # Use an image your NODES can already pull -- on a private-registry cluster
@@ -2116,50 +2156,42 @@ an endpoint that needs no authentication, omit the `credential` object
 entirely: unknown properties are rejected, so there is no empty or "none"
 value to write.
 
-**Why step 0 made a model that can read an image a hard prerequisite.** OCR is
-used for one thing — pages of an uploaded PDF that carry no extractable text,
-which is most scanned Akten. Step 9's `scanned-ingest-search` check uploads such
-a page with recognition *forced* and requires the recognised sentence to come
-back searchable, and the verifier stops at the first check that fails: the
-installer does not report *Complete*. What it leaves running is usable for
-digital PDFs, but it has no completed-install record, which `upgrade` and the
-ordinary `backup` both require. No setting skips the check.
+**Why a model that can read an image matters, and what the install does
+without one.** OCR is used for one thing — pages of an uploaded PDF that carry
+no extractable text, which is most scanned Akten. Step 9's
+`scanned-ingest-search` check uploads such a page with recognition *forced* and
+requires the recognised sentence to come back searchable. Before it runs, the
+verifier probes the endpoint you named with that same page, from inside the
+cluster: an endpoint that reads it runs the check, and the check must pass; one
+that is absent, gives no answer, refuses, or answers without reading the page
+**skips** the check, recorded as `ocr-absent`, `ocr-unreachable`,
+`ocr-refused` (with the HTTP status) or `ocr-not-vision-capable`, and the
+install completes with *verification PARTIAL* — a completed-install record,
+which `upgrade` and the ordinary `backup` require, and a closing line that
+says the scanned-page path was not exercised. Until you set a working
+endpoint and run `install` again, scanned pages are stored with no text
+(`ocr_fallback`) and the agent is told so.
 
-Measured, with `ocr.url` naming a text-only model on vLLM: checks one to three
-passed, `scanned-ingest-search` failed with `failure_code` `stream-terminal`
-and `terminal` `error`, and the installer ended with *"required verification
-was interrupted or failed; owned resources are clean. Use named resume for a
-fresh bounded attempt"* — a line that mentions neither OCR nor your endpoint.
-The cause is in the application's log, in the OCR client's own words, with the
-URL and the HTTP status:
+Measured on an earlier build of this release line, with `ocr.url` naming a
+text-only model on vLLM, before acceptance learned to skip: checks one to
+three passed, `scanned-ingest-search` failed with `failure_code`
+`stream-terminal` and `terminal` `error`, the installer ended with *"required
+verification was interrupted or failed…"*, and the way out was `repair` after
+the Lease had lapsed — 46 minutes with a backup in it. That road still exists
+for a check that genuinely fails; an endpoint that merely does not answer no
+longer sends you down it. The endpoint's own words, when you need them, are
+in the application's log:
 
 ```sh
 kubectl -n "$(jq -r .target.namespace "$HOME/gsj-operator/site.json")" logs \
   "deploy/$(jq -r .target.release "$HOME/gsj-operator/site.json")-web" -c gsj-web | grep 'OCR'
 ```
 
-`resume` is not the way out, because another attempt meets the same endpoint.
-Correct `ocr.url` and `ocr.model` in the site file, wait until the operation's
-Lease has gone 180 seconds unrenewed — three minutes after the installer printed
-its closing line, with nothing left running — and run the `repair` of
-[Upgrade and recover](#upgrade-and-recover-a-named-operation) with the operation
-ID that closing line named:
-`./gsj-install.sh repair --operation "$GSJ_OPERATION_ID" --config "$HOME/gsj-operator/site.json" --non-interactive`.
-Run sooner, it refuses with *the prior installer is still live; stop it before
-repair* — that is the clock, not a fault. If you tried `resume` first and it
-answered *resume configuration changed*, it renewed the Lease before it compared
-the file, and the 180 seconds run again from that refusal. Because the stopped run had already
-brought the deployment up, `repair` first takes a consistent backup with the
-application stopped, then applies the change, stages the released vectors again
-for a new corpus generation and runs all fifteen checks. Measured on the
-released corpus, with those two values corrected and nothing else touched: 46
-minutes end to end — 23 of them the backup, the application away for 39 — ending
-*Complete*, fifteen of fifteen, and the one change to the site file was
-`corpus.repair_generation`.
-
-**Do not get past the schema by pointing `ocr.url` at a text-only endpoint.**
-What happens to a scanned page then depends on how that endpoint answers a
-request that carries an image. We measured it with the application's own OCR
+**Do not point `ocr.url` at a text-only endpoint to "have one".** The probe
+tells the two apart most of the time — a refusal skips the check as
+`ocr-refused` — but what happens to a scanned page in production depends on how
+that endpoint answers a request that carries an image, and a lenient gateway can
+turn a refusal into a 200 the application stores. We measured it with the application's own OCR
 client and ingest code — the first answer against three real text-only servers,
 the third against a relay we built:
 
@@ -3602,9 +3634,19 @@ is not provably gone.
 | `bot-check-exhausted` | the bot's forbidden push was not refused by the hook in any bounded attempt | terminal; this is exit `79` above |
 | `origin-unreachable`, `origin-tls-failed` | the Pod could not reach, or could not verify, `public_url` | the same two conditions as exits `73` and `74`, met during the run rather than before it; same remedies |
 
-`pipeline-index-freshness` records no code of its own: it names evidence the two
+`pipeline-index-freshness` records no code of its own: it names evidence the
 ingest checks already measured, so an index problem shows up on
 `digital-ingest-search` or `scanned-ingest-search`.
+
+A **skipped** check records no code either: its entry is `{"name", "status":
+"skipped", "reason"}` with one of six reasons — `llm-absent`,
+`llm-unreachable`, `ocr-absent`, `ocr-unreachable`, `ocr-refused`,
+`ocr-not-vision-capable` — the state the acceptance probe found the endpoint
+in (the run's `endpoints` field repeats it; `ocr_http_status` accompanies
+`ocr-refused`). Only `scanned-ingest-search` (OCR), `agent-turn-note-history`
+and `generated-document` (LLM) can be skipped, and only for those reasons; a
+run with any skipped check is `coverage: partial` and its closing line says
+so (step 9).
 
 ### 4. `gsj-corpus:<code>` and `gsj-copy:<code>`
 

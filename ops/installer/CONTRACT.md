@@ -58,7 +58,7 @@ exactly these values. Every leaf below is a value the chart declares in
 | `operator.login`, `operator.existingSecret` | `operator.login`, `operator.secret` (the installer creates that Secret before Helm) |
 | `operator.password`, `operator.autogenPassword` | `""`, `false` |
 | `agent.turnTimeout` | `limits.turn_seconds` |
-| `llm.model` | `openai@<llm.base_url>#<llm.model>` |
+| `llm.model`, `llm.absent` | `openai@<llm.base_url>#<llm.model>`, and no `absent` key; with `llm.base_url` and `llm.model` both empty (an install with no LLM endpoint yet), `""` and `absent: true` |
 | `llm.contextWindow`, `llm.outputTokens`, `llm.modelFlags`, `llm.keyedOrigins` | `llm.context_window`, `llm.output_tokens`, `llm.flags` joined by `,`, `llm.allowed_origins` joined by `,` |
 | `ocr.url`, `ocr.model` | `ocr.url`, `ocr.model` |
 | `ocr.existingSecret` | `<release>-ocr-key` when `ocr.credential.file` is set (the installer creates it), else `ocr.credential.secret` |
@@ -70,8 +70,8 @@ exactly these values. Every leaf below is a value the chart declares in
 | `retention.keepClaims` | `true` |
 
 Render-time refusals the chart makes that the installer relies on:
-`llm.model` is required; an operator password or `operator.existingSecret`
-is required; `corpus.manifestSha256` is required when `corpus.enabled`; and
+`llm.model` is required unless `llm.absent` is `true` (and refused beside it);
+an operator password or `operator.existingSecret` is required; `corpus.manifestSha256` is required when `corpus.enabled`; and
 `startup.progressDeadlineSeconds` must exceed
 `startup.dependencyDeadlineSeconds + corpus.deadlineSeconds` plus the startup
 window (`modelFailureThreshold × 5 s`), or the render fails with

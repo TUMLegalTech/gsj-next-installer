@@ -20,7 +20,8 @@ def image($key): $r.images[$key]
  networkPolicy:{enabled:true,ingressControllerNamespace:$s.ingress.namespace},
  operator:{login:$s.operator.login,existingSecret:$s.operator.secret,password:"",autogenPassword:false},
  agent:{turnTimeout:$s.limits.turn_seconds},
- llm:{model:("openai@"+$s.llm.base_url+"#"+$s.llm.model),contextWindow:$s.llm.context_window,outputTokens:$s.llm.output_tokens,modelFlags:($s.llm.flags|join(",")),keyedOrigins:($s.llm.allowed_origins|join(","))},
+ llm:({model:(if $s.llm.base_url == "" then "" else "openai@"+$s.llm.base_url+"#"+$s.llm.model end),contextWindow:$s.llm.context_window,outputTokens:$s.llm.output_tokens,modelFlags:($s.llm.flags|join(",")),keyedOrigins:($s.llm.allowed_origins|join(","))}
+      + (if $s.llm.base_url == "" then {absent:true} else {} end)),
  ocr:{url:$s.ocr.url,model:$s.ocr.model,existingSecret:(if $s.ocr.credential.file != "" then $s.target.release+"-ocr-key" else $s.ocr.credential.secret end)},
  selfhostedKey:{value:"",existingSecret:(if $s.llm.credential.file != "" then $s.target.release+"-llm-key" else $s.llm.credential.secret end)},
  placement:{nodeSelector:(if $s.storage.node != "" then {"kubernetes.io/hostname":$s.storage.node} else {} end)},

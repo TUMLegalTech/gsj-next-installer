@@ -1612,8 +1612,8 @@ def test_success_summary_reports_identity_status_and_redacted_settings(runtime):
     assert summary["fingerprints"]["model"]["revision"] == "d" * 40
     assert summary["fingerprints"]["corpus"] == "f" * 64
     assert summary["corpus"] == {"rows": 33979, "vectors": 1141170, "status": "verified"}
-    assert summary["verification"] == {"status": "passed", "checks_passed": 2, "checks": 2,
-                                       "public_https": "passed", "networkpolicy": "passed"}
+    assert summary["verification"] == {"status": "passed", "coverage": "full", "checks_passed": 2, "checks_skipped": 0, "checks": 2,
+                                       "skipped": [], "endpoints": {}, "public_https": "passed", "networkpolicy": "passed"}
     assert summary["settings"]["operator"]["password_file"] == "(protected file)"
     assert summary["settings"]["llm"]["credential"] == {"file": "(protected file)", "secret": ""}
     assert summary["settings"]["llm"]["base_url"] == "https://llm.example/v1"
@@ -1750,3 +1750,157 @@ def test_every_pipeline_that_applies_stages_the_declared_sidecar_before_it_waits
     assert re.search(r"helm_application_validate; stage_vectors; wait_application;;", text)
     # and the refusal code reaches the operator by name in every list that reads it
     assert text.count("released-vectors-missing") >= 3
+
+
+# ---- an install without a model endpoint (the degraded install) ----
+
+def _compile(site, tmp_path):
+    path = tmp_path / "release.json"; path.write_text(json.dumps(_release()))
+    result = subprocess.run(["jq", "--slurpfile", "release", str(path), "-f", str(INSTALLER / "compile.jq")],
+                            input=json.dumps(site), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_an_empty_llm_and_an_empty_ocr_validate_and_compile_to_a_declared_absence(tmp_path):
+    """The operator may leave both endpoints out: the site validates, the
+    chart gets an EMPTY model ref declared absent (`llm.absent`), and an
+    empty `ocr.url` passes through. What the product cannot do until they are
+    set is the guide's business; the installer completes the install."""
+    site = _site()
+    site["llm"].update(base_url="", model="")
+    site["ocr"]["url"] = ""
+    checked = _validate(site)
+    assert checked.returncode == 0, checked.stderr
+    compiled = _compile(json.loads(checked.stdout), tmp_path)
+    assert compiled["llm"]["model"] == "" and compiled["llm"]["absent"] is True
+    assert compiled["ocr"]["url"] == "" and compiled["ocr"]["model"] == "glm-ocr"
+    # a configured LLM is what it was, and is not declared absent
+    compiled = _compile(json.loads(_validate(_site()).stdout), tmp_path)
+    assert compiled["llm"]["model"] == "openai@https://llm.example/v1#synthetic-model" and "absent" not in compiled["llm"]   # the key exists only to declare an absence
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda s: s["llm"].update(base_url=""), "llm: base_url and model are set together"),
+    (lambda s: s["llm"].update(model=""), "llm: base_url and model are set together"),
+    (lambda s: (s["llm"].update(base_url="", model=""), s["llm"]["credential"].update(file="credentials/llm-key")), "llm: a credential or allowed origins without base_url"),
+    (lambda s: (s["llm"].update(base_url="", model=""), s["llm"].update(allowed_origins=["https://llm.example"])), "llm: a credential or allowed origins without base_url"),
+    (lambda s: (s["ocr"].update(url=""), s["ocr"]["credential"].update(file="credentials/ocr-key")), "ocr: a credential without url"),
+    (lambda s: s["ocr"].update(url="https://ocr.example"), "ocr.url: invalid format"),          # a bare host is still not a route
+    (lambda s: s["llm"].update(base_url="ftp://llm.example/v1"), "llm.base_url: invalid format"),
+])
+def test_half_an_endpoint_or_a_credential_without_an_address_is_refused(change, message):
+    site = _site()
+    change(site)
+    checked = _validate(site)
+    assert checked.returncode != 0 and message in checked.stderr, checked.stderr
+
+
+# ---- the endpoint preflight: advisory, from this host, in the first minute ----
+
+FAKE_ENDPOINT_CURL = '''#!/usr/bin/env python3
+"""A curl that answers the endpoint preflight per URL and records every argv."""
+import json, os, pathlib, sys
+a = sys.argv[1:]
+log = pathlib.Path(os.environ["TEST_CURL_LOG"]); log.write_text(log.read_text() + json.dumps(a) + "\\n" if log.exists() else json.dumps(a) + "\\n")
+url = next(v for v in a if v.startswith("http"))
+out = a[a.index("-o") + 1]
+answers = json.loads(os.environ["TEST_CURL_ANSWERS"])
+answer = answers[url]
+if isinstance(answer, int):            # a curl exit code: nothing answered
+    sys.exit(answer)
+code, body = answer
+pathlib.Path(out).write_text(body)
+sys.stdout.write(str(code))
+'''
+
+
+def _preflight(runtime, site, answers):
+    run, _, work = runtime
+    (work / "site.json").write_text(json.dumps(site))
+    bindir = work.parent / "bin"
+    (bindir / "curl").write_text(FAKE_ENDPOINT_CURL); (bindir / "curl").chmod(0o755)
+    log = work / "curl-log"
+    result = run("endpoint_preflight\n", TEST_CURL_LOG=str(log), TEST_CURL_ANSWERS=json.dumps(answers))
+    calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    record = json.loads((work / "endpoint-preflight.json").read_text())
+    return result, calls, record
+
+
+def test_endpoint_preflight_reports_absent_endpoints_without_a_request_and_never_refuses(runtime):
+    site = _site(); site["llm"].update(base_url="", model=""); site["ocr"]["url"] = ""
+    result, calls, record = _preflight(runtime, site, {})
+    assert result.returncode == 0 and calls == []
+    assert record == {"format": "gsj.endpoint-preflight/1", "probed_from": record["probed_from"], "llm": "absent", "ocr": "absent"}
+    assert "LLM endpoint: none in the site file" in result.stderr and "skips agent-turn-note-history and generated-document" in result.stderr
+    assert "OCR endpoint: none in the site file" in result.stderr and "skips scanned-ingest-search" in result.stderr
+    assert "the agent cannot answer until an endpoint is set" in result.stderr and "scanned pages are not read" in result.stderr
+
+
+@pytest.mark.parametrize("llm_answer,llm_state,ocr_answer,ocr_state", [
+    ([200, json.dumps({"data": [{"id": "synthetic-model"}]})], "working",
+     [200, json.dumps({"choices": [{"message": {"content": "AKTE  58203"}}]})], "working"),
+    (7, "unreachable", 7, "unreachable"),
+    ([401, "{}"], "refused (HTTP 401)", [400, json.dumps({"error": "not a multimodal model"})], "refused (HTTP 400)"),
+    ([200, json.dumps({"data": [{"id": "another-model"}]})], "answers, but does not list llm.model",
+     [200, json.dumps({"choices": [{"message": {"content": "An essay about text recognition."}}]})], "not vision-capable (answered, but did not read the image)"),
+    ([200, json.dumps({"data": [{"id": "synthetic-model"}]})], "working", 28, "no answer within 90 s"),
+    ([200, json.dumps({"data": [{"id": "synthetic-model"}]})], "working", [200, json.dumps({"detail": "sign in"})], "answers, but not as a chat-completions route"),
+])
+def test_endpoint_preflight_probes_a_configured_endpoint_as_the_application_would_and_records_the_verdict(runtime, tmp_path, llm_answer, llm_state, ocr_answer, ocr_state):
+    site = _site()
+    key = tmp_path / "llm-key"; key.write_text("SYNTHETIC-LLM-KEY-NEVER-ON-A-COMMAND-LINE\n"); key.chmod(0o600)
+    site["llm"]["credential"]["file"] = str(key)
+    result, calls, record = _preflight(runtime, site, {"https://llm.example/v1/models": llm_answer,
+                                                         "https://ocr.example/v1/chat/completions": ocr_answer})
+    assert result.returncode == 0, result.stderr                                        # advisory: never a refusal
+    assert record["llm"] == llm_state and record["ocr"] == ocr_state
+    llm_call, ocr_call = calls
+    assert "https://llm.example/v1/models" in llm_call and "--max-time" in llm_call
+    header = llm_call[llm_call.index("--header") + 1]
+    assert header.startswith("@") and "SYNTHETIC-LLM-KEY" not in json.dumps(calls)     # the key rides in a file, never in argv
+    assert "--header" not in ocr_call                                                   # the OCR endpoint has no credential here
+    request = json.loads(Path(ocr_call[ocr_call.index("-d") + 1][1:]).read_text())
+    assert request["model"] == "glm-ocr" and request["max_tokens"] == 2048
+    assert request["messages"][0]["content"][0]["type"] == "image_url" and request["messages"][0]["content"][1] == {"type": "text", "text": "Text Recognition:"}
+    assert not (tmp_path / "work/endpoint-llm.header").exists()                          # the header file is removed
+    if llm_state == "working": assert "answers from this host and lists synthetic-model" in result.stderr
+    else: assert "skips agent-turn-note-history and generated-document" in result.stderr
+    if ocr_state == "working": assert "read the test image from this host" in result.stderr
+    elif ocr_state.startswith("not vision"): assert "would store whatever this endpoint answers as the text of a scanned page" in result.stderr
+    else: assert "skips scanned-ingest-search" in result.stderr
+
+
+def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
+    run, _, work = runtime
+    payload = work / "payload"; payload.mkdir()
+    release = _release()
+    release.update(core={"tag": "v4.9.2-deployment", "commit": "c" * 40}, model={"model": "m", "revision": "d" * 40, "manifest_sha256": "e" * 64, "dimensions": 768, "distance": "cosine", "encoding": "x"})
+    release["corpus"].update(fingerprint="f" * 64, rows=33979, chunks=1141170)
+    (payload / "release.json").write_text(json.dumps(release)); (payload / "chart.tgz").write_bytes(b"synthetic chart")
+    (work / "verification.json").write_text(json.dumps({"status": "passed", "coverage": "partial", "endpoints": {"llm": "unreachable", "ocr": "absent"}, "checks": [
+        {"name": "operator-login", "status": "passed"}, {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-absent"},
+        {"name": "mcp-tools-corpus-schema", "status": "passed"}, {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
+        {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}]}))
+    (work / "public-check.json").write_text(json.dumps({"name": "public-https", "status": "passed"}))
+    (work / "network-check.json").write_text(json.dumps({"name": "networkpolicy-deny-allow", "status": "passed"}))
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((work / "summary.json").read_text())
+    assert summary["status"] == "complete"                                               # the INSTALL is complete; the verification is what is partial
+    assert summary["verification"] == {"status": "passed", "coverage": "partial", "checks_passed": 2, "checks_skipped": 3, "checks": 5,
+                                       "skipped": [{"name": "scanned-ingest-search", "reason": "ocr-absent"},
+                                                   {"name": "agent-turn-note-history", "reason": "llm-unreachable"},
+                                                   {"name": "generated-document", "reason": "llm-unreachable"}],
+                                       "endpoints": {"llm": "unreachable", "ocr": "absent"}, "public_https": "passed", "networkpolicy": "passed"}
+    closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
+    assert len(closing) == 1 and "Complete GSJ installation verified" not in result.stderr
+    assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable)" in closing[0]
+    assert "Until the endpoints are set, the agent cannot answer and scanned pages are not read." in closing[0]
+    assert "Einstellungen" in closing[0] and "run install again" in closing[0] and closing[0].endswith("Summary: " + str(work / "summary.json"))
+    # a full verification (an older verifier's report carries no coverage field at all) keeps the closing line it had
+    (work / "verification.json").write_text(json.dumps({"status": "passed", "checks": [{"name": "operator-login", "status": "passed"}]}))
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
+    summary = json.loads((work / "summary.json").read_text())
+    assert summary["verification"]["coverage"] == "full" and summary["verification"]["skipped"] == [] and summary["verification"]["endpoints"] == {}
+    assert "Complete GSJ installation verified: v1.2.3 at https://legal.example" in result.stderr and "PARTIAL" not in result.stderr

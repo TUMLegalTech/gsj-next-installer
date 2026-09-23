@@ -27,6 +27,9 @@ if any(.resources[]; (.requests.memory|memory_bytes)>(.limits.memory|memory_byte
   (.limits.cpu!=null and (.requests.cpu|cpu_millis)>(.limits.cpu|cpu_millis)))
 then error("resources: request exceeds container limit") else . end |
 if .llm.context_window > 0 and .llm.output_tokens > .llm.context_window then error("llm: output exceeds context") else . end |
+if (.llm.base_url == "") != (.llm.model == "") then error("llm: base_url and model are set together -- or both left empty for an install with no LLM endpoint yet (the agent cannot answer until one is set)") else . end |
+if .llm.base_url == "" and (.llm.credential.file != "" or .llm.credential.secret != "" or (.llm.allowed_origins | length) > 0) then error("llm: a credential or allowed origins without base_url and model") else . end |
+if .ocr.url == "" and (.ocr.credential.file != "" or .ocr.credential.secret != "") then error("ocr: a credential without url") else . end |
 if any([.llm.credential,.ocr.credential][]; .file != "" and .secret != "") then error("credential: choose one file or Secret") else . end |
 if .registry.config_file != "" and .registry.pull_secret == "" then error("registry.pull_secret required with config_file") else . end |
 if ((.registry.base // "") != "") and ((.registry.base | split("/")[0]) as $host | ($host | test("[.:]") | not) and $host != "localhost")

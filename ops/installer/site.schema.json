@@ -110,15 +110,16 @@
         "base_url": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^https?://[^/@?#:\\s][^/@?#\\s]*(/[^?#\\s]*)?$(?![\\s\\S])",
-          "default": ""
+          "pattern": "^(https?://[^/@?#:\\s][^/@?#\\s]*(/[^?#\\s]*)?)?$(?![\\s\\S])",
+          "default": "",
+          "description": "The OpenAI-compatible base URL of the agent's model, or empty: an install with no LLM endpoint yet completes, its agent checks skipped, and the agent cannot answer until one is set (per case in the lawyer's Einstellungen, or here and `install` again)."
         },
         "model": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "minLength": 1,
-          "pattern": "^[^#\\s]+$(?![\\s\\S])",
-          "default": ""
+          "pattern": "^([^#\\s]+)?$(?![\\s\\S])",
+          "default": "",
+          "description": "The model id that endpoint serves; set together with base_url, or both empty."
         },
         "context_window": {
           "type": "integer",
@@ -196,8 +197,9 @@
         "url": {
           "type": "string",
           "x-ownership": "site-supplied",
-          "pattern": "^https?://[^/@?#:\\s][^/@?#\\s]*/[^?#\\s]+$(?![\\s\\S])",
-          "default": ""
+          "pattern": "^(https?://[^/@?#:\\s][^/@?#\\s]*/[^?#\\s]+)?$(?![\\s\\S])",
+          "default": "",
+          "description": "The complete chat-completions URL of a vision model for scanned pages, or empty: an install with no OCR endpoint completes, its scanned-page check skipped, and scanned pages are not read until one is set here and `install` runs again."
         },
         "model": {
           "type": "string",

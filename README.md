@@ -52,13 +52,19 @@ install and when you would find out.
   and what was found; an `openssl` absent from the PATH altogether is refused
   by name alone, as a required utility. `--fetch-tools` downloads its own
   pinned clients instead (it does not supply OpenSSL).
-- **A vision-capable OCR endpoint**: an OpenAI-compatible chat-completions
-  route whose model can read an image. This is a hard prerequisite; no install
-  reports *Complete* without one, and step 0 of the guide has a probe you can
-  run with `curl` and `jq` before you start. It may be the same server as the
-  LLM if that model reads images.
-- **An LLM endpoint** (OpenAI-compatible), with its API key in a file the
-  installer reads, or in a Kubernetes Secret you name.
+- **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible
+  chat-completions route whose model can read an image. Step 0 of the guide
+  has a probe you can run with `curl` and `jq` before you start, and the
+  installer probes it again in its first minute. It may be the same server as
+  the LLM if that model reads images. Without one the install still completes,
+  with the scanned-page acceptance check skipped and named as such, and no
+  scanned page is read until you set the endpoint and run `install` again.
+- **An LLM endpoint** (OpenAI-compatible), for the agent, with its API key in
+  a file the installer reads, or in a Kubernetes Secret you name. Without one
+  the install still completes, with the two agent checks skipped and named,
+  and the agent cannot answer until an endpoint is set — per case in the web
+  UI, or in the site file and `install` again. A verification with skipped
+  checks is reported as **partial**, in the record and on screen.
 - **A read-only GHCR token issued by TUM Legal Tech.** The product images are
   private packages on `ghcr.io`; the installer creates the pull Secret from a
   registry auth file you point it at. Ask TUM Legal Tech for the token through
