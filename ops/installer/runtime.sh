@@ -3877,7 +3877,8 @@ installation_summary() {
     verification:{status:$v.status,coverage:(if ([$v.checks[]?|select(.status=="skipped")]|length)>0 then "partial" else "full" end),
                   checks_passed:([$v.checks[]?|select(.status=="passed")]|length),checks_skipped:([$v.checks[]?|select(.status=="skipped")]|length),checks:($v.checks//[]|length),
                   skipped:[$v.checks[]?|select(.status=="skipped")|{name,reason}],endpoints:($v.endpoints//{}),
-                  public_https:$public[0].status,networkpolicy:$network[0].status},
+                  public_https:$public[0].status,networkpolicy:$network[0].status}
+                 + (if $v.ocr_http_status != null then {ocr_http_status:$v.ocr_http_status} else {} end),
     settings:(reduce (["operator","password_file"],["llm","credential","file"],["ocr","credential","file"],["registry","config_file"],["tls","private_key_file"],["trust","proxy_file"],["backup","passphrase_file"],["backup","auth_header_file"],["delivery","auth_header_file"]) as $p
       ($s; if (getpath($p)//"")!="" then setpath($p;"(protected file)") else . end)),
     installed_record:$record,verification_report:$report}' | atomic "$summary"
@@ -3885,8 +3886,22 @@ installation_summary() {
  if [[ $(jq -r .verification.coverage "$summary") == partial ]]; then
    # A partial verification must be unmistakable, on screen as in the record:
    # the word, the counts, every skipped check with its reason, and what the
-   # product cannot do until the endpoints are set.
-   log "GSJ installation complete, verification PARTIAL: $VERSION at $(j .public_url). $(jq -r '"\(.verification.checks_passed) of \(.verification.checks) application checks ran and passed; \(.verification.checks_skipped) skipped: " + ([.verification.skipped[]|"\(.name) (\(.reason))"]|join(", "))' "$summary"). $(jq -r '(.verification.skipped|map(.reason)) as $r | ($r|any(startswith("llm-"))) as $llm | ($r|any(startswith("ocr-"))) as $ocr | "Until " + (if $llm and $ocr then "the endpoints are" elif $llm then "an LLM endpoint is" else "an OCR endpoint is" end) + " set, " + ([(if $llm then "the agent cannot answer" else empty end), (if $ocr then "scanned pages are not read" else empty end)]|join(" and ")) + ". Set " + ([(if $llm then "the LLM per case under Einstellungen in the web UI, or llm.base_url and llm.model in the site file" else empty end), (if $ocr then "ocr.url and ocr.model in the site file" else empty end)]|join("; ")) + ", and run install again with the site file: the acceptance then exercises what is set."' "$summary") Summary: $summary"
+   # product cannot do -- said per REASON the probe recorded. An endpoint that
+   # is configured but did not answer, refused the request or could not read
+   # the test page must not be met with "set it": the operator would edit a
+   # site value that was right (the misattribution pass).
+   log "GSJ installation complete, verification PARTIAL: $VERSION at $(j .public_url). $(jq -r '"\(.verification.checks_passed) of \(.verification.checks) application checks ran and passed; \(.verification.checks_skipped) skipped: " + ([.verification.skipped[]|"\(.name) (\(.reason))"]|join(", "))' "$summary"). $(jq -r '(.verification.skipped|map(.reason)|unique) as $r
+     | ([$r[]|select(startswith("llm-"))]|first // "") as $llm
+     | ([$r[]|select(startswith("ocr-"))]|first // "") as $ocr
+     | ([ (if $llm == "llm-absent" then "Until an LLM endpoint is set, the agent cannot answer: set the LLM per case under Einstellungen in the web UI, or llm.base_url and llm.model in the site file"
+           elif $llm == "llm-unreachable" then "Until the LLM endpoint at llm.base_url answers from inside the cluster, the agent cannot answer: it is configured, but it did not answer the acceptance probe, so check that it is up and reachable from the Pods and that its credential is right"
+           elif $llm != "" then "Until the LLM endpoint answers, the agent cannot answer (" + $llm + ")" else empty end),
+          (if $ocr == "ocr-absent" then "Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file"
+           elif $ocr == "ocr-unreachable" then "Until the OCR endpoint at ocr.url answers from inside the cluster, scanned pages are not read: it is configured, but it did not answer the acceptance probe, so check that it is up and reachable from the Pods"
+           elif $ocr == "ocr-refused" then "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP " + ((.verification.ocr_http_status // "?")|tostring) + " to the acceptance probe, so check ocr.model and its credential"
+           elif $ocr == "ocr-not-vision-capable" then "Until ocr.url names an endpoint that reads images, scanned pages are not read: the configured one answered but did not read the test page, so replace ocr.url and ocr.model with a vision-capable endpoint"
+           elif $ocr != "" then "Until the OCR endpoint reads images, scanned pages are not read (" + $ocr + ")" else empty end) ]
+        | join(". ")) + ". Then run install again with the site file: the acceptance then exercises what answers."' "$summary") Summary: $summary"
  else
    log "Complete GSJ installation verified: $VERSION at $(j .public_url). Summary: $summary"
  fi

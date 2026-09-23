@@ -1896,7 +1896,9 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
     assert len(closing) == 1 and "Complete GSJ installation verified" not in result.stderr
     assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable)" in closing[0]
-    assert "Until the endpoints are set, the agent cannot answer and scanned pages are not read. Set the LLM per case under Einstellungen in the web UI, or llm.base_url and llm.model in the site file; ocr.url and ocr.model in the site file, and run install again with the site file" in closing[0]
+    # per reason: the LLM is configured and did not answer; the OCR endpoint is absent
+    assert "Until the LLM endpoint at llm.base_url answers from inside the cluster, the agent cannot answer: it is configured, but it did not answer the acceptance probe" in closing[0]
+    assert "Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file. Then run install again with the site file" in closing[0]
     assert closing[0].endswith("Summary: " + str(work / "summary.json"))
     # only the OCR endpoint missing: the advice names that endpoint alone
     (work / "verification.json").write_text(json.dumps({"status": "passed", "endpoints": {"llm": "working", "ocr": "refused"}, "ocr_http_status": 400, "checks": [
@@ -1904,7 +1906,7 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
     closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
     assert len(closing) == 1 and "2 of 3 application checks ran and passed; 1 skipped: scanned-ingest-search (ocr-refused)" in closing[0]
-    assert "Until an OCR endpoint is set, scanned pages are not read. Set ocr.url and ocr.model in the site file, and run install again" in closing[0]
+    assert "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP 400 to the acceptance probe, so check ocr.model and its credential. Then run install again" in closing[0]
     assert "Einstellungen" not in closing[0] and "agent cannot answer" not in closing[0]
     # a full verification (an older verifier's report carries no coverage field at all) keeps the closing line it had
     (work / "verification.json").write_text(json.dumps({"status": "passed", "checks": [{"name": "operator-login", "status": "passed"}]}))
@@ -1912,3 +1914,57 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     summary = json.loads((work / "summary.json").read_text())
     assert summary["verification"]["coverage"] == "full" and summary["verification"]["skipped"] == [] and summary["verification"]["endpoints"] == {}
     assert "Complete GSJ installation verified: v1.2.3 at https://legal.example" in result.stderr and "PARTIAL" not in result.stderr
+
+
+def _partial_summary_run(runtime, endpoints, checks, extra=None):
+    run, _, work = runtime
+    payload = work / "payload"; payload.mkdir(exist_ok=True)
+    release = _release()
+    release.update(core={"tag": "v4.9.2-deployment", "commit": "c" * 40}, model={"model": "m", "revision": "d" * 40, "manifest_sha256": "e" * 64, "dimensions": 768, "distance": "cosine", "encoding": "x"})
+    release["corpus"].update(fingerprint="f" * 64, rows=33979, chunks=1141170)
+    (payload / "release.json").write_text(json.dumps(release)); (payload / "chart.tgz").write_bytes(b"synthetic chart")
+    report = {"status": "passed", "coverage": "partial", "endpoints": endpoints, "checks": checks}
+    report.update(extra or {})
+    (work / "verification.json").write_text(json.dumps(report))
+    (work / "public-check.json").write_text(json.dumps({"name": "public-https", "status": "passed"}))
+    (work / "network-check.json").write_text(json.dumps({"name": "networkpolicy-deny-allow", "status": "passed"}))
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
+    assert result.returncode == 0, result.stderr
+    closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
+    assert len(closing) == 1
+    return closing[0], json.loads((work / "summary.json").read_text())
+
+
+def test_the_partial_closing_line_states_what_the_probe_established_per_reason(runtime):
+    """The misattribution pass (instance 4 carried further): the
+    closing line used to end every partial verification with `Until … is set …
+    Set llm.base_url … ocr.url …` — advice to SET an endpoint that IS set and
+    merely did not answer, refused the request, or could not read an image.
+    The operator would edit a site value that was right. Each reason word the
+    probe recorded has its own established fact; the line says that one."""
+    # an LLM that is set but did not answer, and an OCR endpoint that answered without reading the page
+    line, summary = _partial_summary_run(runtime, {"llm": "unreachable", "ocr": "not-vision-capable"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-not-vision-capable"},
+        {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
+        {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}])
+    assert "did not answer the acceptance probe" in line and "reachable from the Pods" in line
+    assert "did not read the test page" in line and "vision-capable" in line
+    assert "Until the endpoints are set" not in line and "Set ocr.url" not in line and "Einstellungen" not in line
+    # an OCR endpoint that refused the request: the status it answered, never "set it"
+    line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-refused"},
+        {"name": "agent-turn-note-history", "status": "passed"}], extra={"ocr_http_status": 400})
+    assert "answered HTTP 400" in line and "ocr.model" in line and "credential" in line
+    assert "is set" not in line and "agent cannot answer" not in line
+    assert summary["verification"]["ocr_http_status"] == 400
+    # both absent: setting them IS the established fact
+    line, summary = _partial_summary_run(runtime, {"llm": "absent", "ocr": "absent"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-absent"},
+        {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-absent"},
+        {"name": "generated-document", "status": "skipped", "reason": "llm-absent"}])
+    assert "Until an LLM endpoint is set" in line and "Einstellungen" in line and "llm.base_url and llm.model" in line
+    assert "Until an OCR endpoint is set" in line and "ocr.url and ocr.model" in line
+    assert "ocr_http_status" not in summary["verification"]
