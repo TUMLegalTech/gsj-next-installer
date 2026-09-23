@@ -372,6 +372,7 @@ def test_failed_delivery_preflight_prevents_source_install_or_cluster_mutation(m
 def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp_path, monkeypatch, failure):
     import base64
     module = modules[1]
+    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the harness environment's concern, tested on its own
     target = tmp_path / "candidate"
     target.mkdir()
     (target / "manifest.json").write_text(json.dumps({"identity": "target", "supported_sources": ["source"],
@@ -434,6 +435,7 @@ def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp
 @pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM])
 def test_cancellation_signal_saves_interruption_before_owned_cleanup(modules, tmp_path, monkeypatch, number):
     module = modules[1]
+    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the harness environment's concern, tested on its own
     target = tmp_path / "candidate"
     target.mkdir()
     (target / "manifest.json").write_text(json.dumps({"identity": "target",
@@ -491,6 +493,7 @@ def test_populated_hard_restart_kills_web_runner_and_mcp_with_proven_sigkill(mod
     import httpx
     import hardfault
     module = modules[1]
+    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the harness environment's concern, tested on its own
     images = {role: {"repository": "example.test/" + role, "digest": "sha256:" + "a" * 64}
               for role in ("web", "runner", "mcp", "forgejo", "chroma", "decisionsData")}
     target = tmp_path / "candidate"
