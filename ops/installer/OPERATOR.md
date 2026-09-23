@@ -300,9 +300,10 @@ same request as the block below, and the verdict is logged and recorded in the
 state directory as `endpoint-preflight.json`) and from inside the cluster at
 acceptance, where the verifier renders the scanned test page, sends it as the
 application would, and requires the recognised sentence back. An endpoint that
-gives no HTTP answer there skips the check as `ocr-unreachable`; one that
-answers with a status other than 200 skips it as `ocr-refused` (the status is
-recorded); one that answers HTTP 200 **without** the sentence skips it as
+gives no HTTP answer there, or a 200 that is not a chat completion, skips the
+check as `ocr-unreachable`; one that answers with an HTTP status other than
+200 skips it as `ocr-refused` (the status is recorded, and the closing line
+advises by it); one that answers HTTP 200 **without** the sentence skips it as
 `ocr-not-vision-capable` — and that is the dangerous one, because the
 application stores whatever a 200 says as the text of a scanned page: replace
 it before anyone uploads scanned files. Only an endpoint that reads the page
@@ -1102,30 +1103,37 @@ fi
 
 On a full verification `verification.coverage` is `full` and
 `verification.checks_passed` equals `verification.checks` — fifteen of fifteen.
-On a **partial** one — an endpoint left out of the site file, or one that did
-not answer from inside the cluster — `coverage` is `partial`, `checks_passed`
+On a **partial** one — an endpoint left out of the site file, or one the
+acceptance probe found unreachable, refusing, or not reading images —
+`coverage` is `partial`, `checks_passed`
 plus `checks_skipped` make fifteen, `skipped` lists every skipped check with
 its reason (`llm-absent`, `llm-unreachable`, `ocr-absent`, `ocr-unreachable`,
 `ocr-refused`, `ocr-not-vision-capable`), `endpoints` records the state the
 acceptance probe found each endpoint in, and the closing line begins **GSJ
 installation complete, verification PARTIAL** instead of *Complete GSJ
 installation verified*, names the skipped checks with their reasons, and says,
-per recorded reason, what the product cannot do and what to correct — "set it"
-only for an endpoint that is absent; an endpoint that is configured but did
-not answer, refused the request (with the HTTP status it answered) or answered
-without reading the test page is named for that, never told to be "set":
+per recorded reason, which checks stayed skipped and what to correct — "set it"
+only for an endpoint that is absent; an endpoint that is configured but gave
+no model list or no recognition result, refused the request (for OCR, with the
+HTTP status it answered and advice by that status) or answered without reading
+the test page is named for that, never told to be "set". The line never claims
+that the agent cannot answer: a gateway without a models route answers turns,
+and an LLM chosen per case may serve — what is established is which checks
+stayed skipped:
 
 ```
-[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable). Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the agent cannot answer: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1. Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file. Then run install again with the site file: the acceptance then exercises what answers. Summary: …/summary.json
+[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable). Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1. Until an OCR endpoint is set, the scanned-page check stays skipped and scanned pages cannot be read: set ocr.url and ocr.model in the site file. Then run install again with the site file: the acceptance then exercises what answers. Summary: …/summary.json
 ```
 
 The install is complete either way — `backup` and `upgrade` work on it — but
-a partial verification has not exercised the agent or the scanned-page path.
-To close it: do what the closing line names for each reason — set an absent
-endpoint (the LLM per case under Einstellungen, or both in the site file),
-make a configured one answer, accept the request or read images — and run
-`install` again from the same site file; the run converges on what exists and
-re-runs the acceptance, this time exercising them. Either way the two fields beside the counts, `public_https` and
+a partial verification has not exercised the agent, the scanned-page path, or
+both — whichever the skipped checks name. To close it: do what the closing
+line names for each reason — set an absent endpoint in the site file (an LLM
+chosen per case under Einstellungen serves that case, but the acceptance
+probes only the site's endpoint), make a configured one answer, make it accept
+the request, or replace one that does not read images — and run `install`
+again from the same site file; the run converges on what exists and re-runs
+the acceptance, this time exercising them. Either way the two fields beside the counts, `public_https` and
 `networkpolicy`, must both read `passed`. Those two are not among the fifteen; they are the
 installer's own route and policy probes, reported in the same object. The
 fifteen application checks, in the order they run: `operator-login`,
@@ -2073,10 +2081,10 @@ the model endpoints: leave `llm.base_url` and `llm.model` both empty, or
 
 | field | what it is | where you get it |
 |---|---|---|
-| `llm.base_url` | the OpenAI-compatible **base** URL of the chat model the agent uses — the part ending `/v1`, with no route after it — or empty, together with `llm.model`: the install completes with the two agent checks skipped (`llm-absent`) and the agent cannot answer until an endpoint is set, per case under Einstellungen or here and `install` again | your own model deployment (vLLM, an inference gateway, a hosted endpoint). GSJ ships no model and no endpoint |
+| `llm.base_url` | the OpenAI-compatible **base** URL of the chat model the agent uses — the part ending `/v1`, with no route after it — or empty, together with `llm.model`: the install completes with the two agent checks skipped (`llm-absent`) and the agent has no endpoint until one is set — per case under Einstellungen (which serves that case) or here, where `install` again closes the acceptance | your own model deployment (vLLM, an inference gateway, a hosted endpoint). GSJ ships no model and no endpoint |
 | `llm.model` | the model id that endpoint serves | `curl "$LLM_BASE_URL/models"` — note `llm.base_url` ALREADY ends in `/v1`, so the models route is `$LLM_BASE_URL/models`, never `$LLM_BASE_URL/v1/models` |
 | `llm.context_window` | that model's usable context in tokens; drives the lawyer-facing KONTEXT meter and compaction | the same answer's `max_model_len`, or the model card. `0` is a defined setting, not a gap: the agent runtime then asks the endpoint's `/models` route itself, with your key, and falls back to its SDK defaults where that gives nothing — which is not proof the endpoint advertises a usable limit. A number you write is taken as given and never checked against the endpoint. The installer itself never contacts `llm.base_url`: nothing is probed at install time |
-| `ocr.url` | the **complete** chat-completions URL of a vision model for scanned pages — note this one is the full route, not a base — or empty: the install completes with the scanned-page check skipped (`ocr-absent`) and scanned pages are not read until it is set and `install` runs again | your OCR deployment; step 0's probe and the reasons are there |
+| `ocr.url` | the **complete** chat-completions URL of a vision model for scanned pages — note this one is the full route, not a base — or empty: the install completes with the scanned-page check skipped (`ocr-absent`) and scanned pages cannot be read until it is set and `install` runs again | your OCR deployment; step 0's probe and the reasons are there |
 | `ocr.model` | the model id that endpoint serves | as above |
 
 `http://` is accepted as well as `https://` for both, which is what a
@@ -2175,8 +2183,11 @@ that is absent, gives no answer, refuses, or answers without reading the page
 install completes with *verification PARTIAL* — a completed-install record,
 which `upgrade` and the ordinary `backup` require, and a closing line that
 says the scanned-page path was not exercised. Until you set a working
-endpoint and run `install` again, scanned pages are stored with no text
-(`ocr_fallback`) and the agent is told so.
+endpoint and run `install` again, an absent, unreachable or refusing endpoint
+leaves scanned pages stored with no text (`ocr_fallback`) and the agent is
+told so — while an endpoint that answers without reading the page
+(`ocr-not-vision-capable`) has its answer stored as the page's text: replace
+it before anyone uploads scanned files.
 
 Measured on an earlier build of this release line, with `ocr.url` naming a
 text-only model on vLLM, before acceptance learned to skip: checks one to

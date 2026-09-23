@@ -515,3 +515,25 @@ def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_pa
     assert "node's side" in result.stderr
     assert "trust" in result.stderr and "DNS" in result.stderr and "rate limit" in result.stderr
     assert "resume --operation" in result.stderr
+    # audit round 2: the closing hint (what cleanup_exit prints) named repair alone -- a site change --
+    # for a failure the probe cannot tell from a node-side one; it now names both routes
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert "repair --operation" in hint and "resume --operation" in hint and "node" in hint
+    assert "correct the node" not in hint
+
+
+def test_a_sustained_pull_failure_during_a_restore_names_restore_repair(runtime, tmp_path):
+    """Audit round 2: resume refuses a restore stopped in restoring-resources
+    ("use restore-repair"); the node-side sentence sent the operator to resume."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": "restoring-resources"}))
+    release = _public_release()
+    payload = _payload(tmp_path, release)
+    site = _site(); site["registry"].update(base=BASE, pull_secret="corp-pull")
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    result = run(PROBE_PRELUDE.format(payload=payload) + 'STATE_DIR="$TEST_WORK"; relocated_images_probe')
+    assert result.returncode != 0
+    assert "restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb" in result.stderr
+    assert "resume --operation" not in result.stderr

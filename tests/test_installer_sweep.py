@@ -84,8 +84,10 @@ def test_sweep_refuses_a_live_operation_and_touches_nothing(runtime, tmp_path):
     assert result.returncode != 0
     # The misattribution pass, audit round 1: the retained Lease of a DEAD run also reads "live" for 180 s; the
     # refusal states the age it measured and the wait, never "stop that tools process"
-    assert "is still live" in result.stderr and "was renewed" in result.stderr and "run the same command again" in result.stderr
-    assert "sweep never takes a live operation" in result.stderr and "stop that tools process" not in result.stderr
+    # audit round 2: a rerun of sweep would refuse again (a held Lease is abandon's to release), so the
+    # refusal names abandon, the age it measured and the wait abandon needs -- never "run the same command again"
+    assert "run abandon --operation" in result.stderr and "renewed" in result.stderr and "180 s" in result.stderr and "wait" in result.stderr
+    assert "run the same command again" not in result.stderr and "stop that tools process" not in result.stderr
     assert json.loads(state.read_text())["resources"] == before
     assert not _records(work)
     assert json.loads((work / "operation.json").read_text())["status"] == "initializing"

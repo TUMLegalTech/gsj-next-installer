@@ -1899,8 +1899,8 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     assert len(closing) == 1 and "Complete GSJ installation verified" not in result.stderr
     assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable)" in closing[0]
     # per reason: the LLM is configured and did not answer; the OCR endpoint is absent
-    assert "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the agent cannot answer: it is configured, but no model list came back" in closing[0]
-    assert "Until an OCR endpoint is set, scanned pages are not read: set ocr.url and ocr.model in the site file. Then run install again with the site file" in closing[0]
+    assert "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back" in closing[0]
+    assert "Until an OCR endpoint is set, the scanned-page check stays skipped and scanned pages cannot be read: set ocr.url and ocr.model in the site file. Then run install again with the site file" in closing[0]
     assert closing[0].endswith("Summary: " + str(work / "summary.json"))
     # only the OCR endpoint missing: the advice names that endpoint alone
     (work / "verification.json").write_text(json.dumps({"status": "passed", "endpoints": {"llm": "working", "ocr": "refused"}, "ocr_http_status": 400, "checks": [
@@ -1908,7 +1908,7 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
     closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
     assert len(closing) == 1 and "2 of 3 application checks ran and passed; 1 skipped: scanned-ingest-search (ocr-refused)" in closing[0]
-    assert "Until the OCR endpoint at ocr.url accepts the recognition request, scanned pages are not read: it answered HTTP 400 to the acceptance probe, so check ocr.model and that the endpoint takes an image. Then run install again" in closing[0]
+    assert "Until the OCR endpoint at ocr.url accepts the recognition request, the scanned-page check stays skipped: it answered HTTP 400 to the acceptance probe, so check ocr.model and that the endpoint takes an image. Then run install again" in closing[0]
     assert "Einstellungen" not in closing[0] and "agent cannot answer" not in closing[0]
     # a full verification (an older verifier's report carries no coverage field at all) keeps the closing line it had
     (work / "verification.json").write_text(json.dumps({"status": "passed", "checks": [{"name": "operator-login", "status": "passed"}]}))
@@ -1951,8 +1951,23 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
         {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}])
     assert "with a model list" in line and "reachable from the Pods" in line and "ending in /v1" in line
-    assert "without the text of the test page" in line and "stored as whatever it answers" in line and "vision-capable" in line
+    # audit round 2: "the agent cannot answer" is not established (a gateway without /models answers turns; a per-case LLM may serve)
+    assert "the agent cannot answer" not in line and "the two agent checks stay skipped" in line
+    assert "the configured one answered the acceptance probe without the text of the test page, so scanned pages would be stored as whatever it answers" in line
+    assert "vision-capable endpoint" in line and "scanned pages are not read" not in line
     assert "Until the endpoints are set" not in line and "Set ocr.url" not in line and "Einstellungen" not in line
+    # the OCR refusal's advice by status: 404 names the model too; 500 names a text-only model; 5xx gateways say nothing answered; 429 is a rate limit
+    for status, words, absent in ((404, ("chat-completions route", "names a model the endpoint serves"), ("credential",)),
+                                  (500, ("text-only model", "vision-capable"), ("busy",)),
+                                  (503, ("busy or starting", "try again"), ("text-only",)),
+                                  (429, ("rate-limited",), ("credential",))):
+        line, _ = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
+            {"name": "operator-login", "status": "passed"},
+            {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-refused"},
+            {"name": "agent-turn-note-history", "status": "passed"}], extra={"ocr_http_status": status})
+        assert f"answered HTTP {status}" in line, line
+        for w in words: assert w in line, (status, w, line)
+        for w in absent: assert w not in line, (status, w, line)
     # an OCR endpoint the adapter got no recognition result from: unreachable, or an answer that is not a chat completion
     line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "unreachable"}, [
         {"name": "operator-login", "status": "passed"},
@@ -1986,8 +2001,11 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-absent"},
         {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-absent"},
         {"name": "generated-document", "status": "skipped", "reason": "llm-absent"}])
-    assert "Until an LLM endpoint is set" in line and "Einstellungen" in line and "llm.base_url and llm.model" in line
-    assert "Until an OCR endpoint is set" in line and "ocr.url and ocr.model" in line
+    assert "Until an LLM endpoint is set, the two agent checks stay skipped" in line and "llm.base_url and llm.model" in line
+    # audit round 2: an LLM chosen per case under Einstellungen serves that case but never closes the acceptance, which probes the site's endpoint
+    assert "an LLM chosen per case under Einstellungen serves that case" in line and "the acceptance probes only the site" in line
+    assert "Until an OCR endpoint is set, the scanned-page check stays skipped" in line and "ocr.url and ocr.model" in line
+    assert "the agent cannot answer" not in line
     assert "ocr_http_status" not in summary["verification"]
 
 
@@ -2053,3 +2071,79 @@ def test_every_still_live_refusal_states_the_lease_age_and_the_wait():
     assert not [l for l in text.splitlines() if "still live" in l and "|| fail" in l]
     helper = re.search(r"^lease_still_live\(\) \{.*?^\}", text, re.S | re.M).group(0)
     assert "renewed" in helper and "180" in helper and "wait" in helper and "same command again" in helper
+
+
+def test_a_site_file_that_is_not_json_is_refused_as_that_with_its_own_line_numbers(runtime, tmp_path):
+    """Audit round 2: the merge stage's failure surfaced through the capture as
+    "the site file was refused: parse error … at line N" where N counted from
+    the release's defaults, which precede the operator's file in the merged
+    stream. The site file is now parsed alone first, so jq's line numbers are
+    the file's own."""
+    run, _, _ = runtime
+    payload = tmp_path / "load-payload"; payload.mkdir()
+    for name in ("defaults.json", "site.schema.json", "validate.jq", "compile.jq"):
+        shutil.copyfile(INSTALLER / name, payload / name)
+    (payload / "release.json").write_text(json.dumps(_release()))
+    config = tmp_path / "site.json"
+    config.write_text('{\n  "operator": {\n    "login": "gsj-admin",\n')
+    result = run(f'GSJ_PAYLOAD="{payload}"; CONFIG="{config}"; CONTEXT_ARG=""; load_site\n')
+    assert result.returncode == 1
+    lines = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")]
+    assert len(lines) == 1, result.stderr
+    assert "is not valid JSON" in lines[0] and str(config) in lines[0]
+    assert "jq: error" not in result.stderr and "the site file was refused" not in result.stderr
+
+
+@pytest.mark.parametrize("path", ["target.namespace", "target.release", "operator.login", "operator.secret",
+                                  "ingress.class", "ingress.namespace", "tls.secret"])
+def test_the_seven_name_fields_refuse_a_trailing_newline_and_state_the_format(path):
+    """Audit round 1 found operator.login's pattern admitted "gsj-admin\\n" (`$`
+    matches before a final newline in Oniguruma); the lookahead closes that
+    for every name-shaped field, and each states the format it expects."""
+    site = _site()
+    head, leaf = path.split(".")
+    site[head][leaf] = "gsj-x\n"
+    result = _validate(site)
+    assert result.returncode != 0
+    assert "invalid format" in result.stderr and "expected" in result.stderr and "letters, digits and dashes" in result.stderr
+    site[head][leaf] = "gsj-x"
+    assert _validate(site).returncode == 0, _validate(site).stderr
+
+
+def test_lease_still_live_states_the_measured_age_and_the_remaining_wait(runtime):
+    run, _, _ = runtime
+    result = run('lease_still_live "the previous installer" 42 "abandon takes the Lease only after that"\n')
+    assert result.returncode == 1
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "renewed 42 s ago" in line and "wait 138 s" in line and "run the same command again" in line
+    assert "if one is running, stop it first" in line and "abandon takes the Lease only after that" in line
+    assert "stop that tools process" not in line
+    # audit round 2: a renewal time ahead of this host's clock (skew) is not a negative age and not a 220 s wait
+    result = run('lease_still_live "the previous installer" -40\n')
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "-40" not in line and "ahead of this clock" in line and "wait 180 s" in line
+
+
+def test_no_still_live_site_appends_a_stop_it_clause(runtime):
+    text = (INSTALLER / "runtime.sh").read_text()
+    sites = [line for line in text.splitlines() if "|| lease_still_live '" in line]
+    assert len(sites) >= 8
+    for line in sites:
+        assert "stop that tools process" not in line and "stop it before" not in line, line
+
+
+def test_a_certificate_file_that_is_not_pem_is_refused_as_that(runtime, tmp_path):
+    """Audit round 1: the files TLS profile fed a non-PEM certificate to the
+    host check, which reported a host mismatch for a file it could not read."""
+    run, _, work = runtime
+    crt = tmp_path / "not-a-certificate.pem"; crt.write_text("synthetic, not PEM\n")
+    key = tmp_path / "tls.key"; key.write_text("synthetic key\n"); key.chmod(0o600)
+    site = _site()
+    site["storage"]["profile"] = "existing"; site["ingress"]["profile"] = "existing"
+    site["tls"].update(profile="files", secret="synthetic-release-tls", certificate_file=str(crt), private_key_file=str(key))
+    (work / "site.json").write_text(json.dumps(site))
+    result = run(f'SITE="$TEST_WORK/site.json"; SITE_DIR="{tmp_path}"; COMMAND=install; assert_owner() {{ :; }}; managed_dependencies\n')
+    assert result.returncode == 1, result.stderr
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "tls.certificate_file is not a readable PEM certificate" in line and "the host was not checked" in line
+    assert "host mismatch" not in result.stderr
