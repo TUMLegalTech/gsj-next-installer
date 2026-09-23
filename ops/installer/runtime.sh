@@ -3894,11 +3894,11 @@ installation_summary() {
     release:{identity:$r.identity,version:$r.version},
     fingerprints:{chart_sha256:$chart,core:$r.core,model:$r.model,corpus:$r.corpus.fingerprint,corpus_manifest_sha256:$r.corpus.manifest_sha256},
     corpus:{rows:$r.corpus.rows,vectors:$r.corpus.chunks,status:(if any($v.checks[]?;.name=="mcp-tools-corpus-schema" and .status=="passed") then "verified" else "unverified" end)},
-    verification:{status:$v.status,coverage:(if ([$v.checks[]?|select(.status=="skipped")]|length)>0 then "partial" else "full" end),
+    verification:({status:$v.status,coverage:(if ([$v.checks[]?|select(.status=="skipped")]|length)>0 then "partial" else "full" end),
                   checks_passed:([$v.checks[]?|select(.status=="passed")]|length),checks_skipped:([$v.checks[]?|select(.status=="skipped")]|length),checks:($v.checks//[]|length),
                   skipped:[$v.checks[]?|select(.status=="skipped")|{name,reason}],endpoints:($v.endpoints//{}),
                   public_https:$public[0].status,networkpolicy:$network[0].status}
-                 + (if $v.ocr_http_status != null then {ocr_http_status:$v.ocr_http_status} else {} end),
+                 + (if $v.ocr_http_status != null then {ocr_http_status:$v.ocr_http_status} else {} end)),
     settings:(reduce (["operator","password_file"],["llm","credential","file"],["ocr","credential","file"],["registry","config_file"],["tls","private_key_file"],["trust","proxy_file"],["backup","passphrase_file"],["backup","auth_header_file"],["delivery","auth_header_file"]) as $p
       ($s; if (getpath($p)//"")!="" then setpath($p;"(protected file)") else . end)),
     installed_record:$record,verification_report:$report}' | atomic "$summary"
