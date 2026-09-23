@@ -2381,9 +2381,13 @@ PY
    if [[ $phase == Failed ]]; then
      # resume compares the site byte for byte and would refuse the edit this asks for.
      if $first; then RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive once this operation's Lease has gone 180 s unrenewed, then install again with storage.data.existing_claim naming a claim of your own"
+     elif (( result != 0 )) && [[ -z $never ]]; then RECOVERY_HINT="$continue_hint; a claim of your own in storage.data.existing_claim is a changed storage block, which is refused for an installed release; correct the backend first"
      else RECOVERY_HINT="$continue_hint; a claim of your own in storage.data.existing_claim is a changed storage block, which is refused for an installed release"; fi
-     local own_claim="Name a claim of your own in storage.data.existing_claim, so that no temporary claim is made."
-     $first || own_claim="A claim of your own in storage.data.existing_claim would be a changed storage block, which is refused for an installed release; resume continues without this check."
+     # (no command substitution here: as the last command of an || list its
+     # status would be the assignment's, and errexit would end the run silently)
+     local own_claim="Name a claim of your own in storage.data.existing_claim, so that no temporary claim is made." backend_note=''
+     if ! $first && (( result != 0 )) && [[ -z $never ]]; then backend_note=", so correct the backend first"; fi
+     if ! $first; then own_claim="A claim of your own in storage.data.existing_claim would be a changed storage block, which is refused for an installed release; resume continues without this check$backend_note."; fi
      fail "temporary storage backend cleanup incomplete: PersistentVolume $volume was bound by this check's own temporary claim and marked Delete, and it is now Failed: nothing on this cluster deletes a volume of StorageClass $(j .storage.class). $own_claim $volume accepts no claim until that PersistentVolume object is deleted and created again; anything this check left in its directory is named .gsj-storage-check-*.$note"
    fi
    fail "temporary storage backend cleanup incomplete: PersistentVolume $volume, which this check's own temporary claim had bound, was still present (phase ${phase:-unknown}) 120 s after that claim was deleted. Whatever removes volumes of StorageClass $(j .storage.class) is slow or stuck. Do not delete the volume by hand: look at that provisioner or deleter, then continue with the command the closing line names.$note"
@@ -2806,11 +2810,12 @@ relocated_images_probe() {
      # sent to repair (it would complete without the storage check); past the
      # backup the deployment is quiesced, abandon refuses, and a changed site
      # value is repair's. Every caller writes that status before this probe.
+     # After a restore-program transition only the corrected installer
+     # continues the restore: restore-repair before the application starts,
+     # repair at applying.
      # In main and resume's owned phase this probe runs BEFORE the backup, so
      # the status is "owned" for an upgrade too: a first install is "owned"
-     # WITHOUT an installed record (read before the probe on both paths). After
-     # a restore-program transition only restore-repair with the corrected
-     # installer continues the restore (RESTORE_PROGRAM_ACTIVE).
+     # WITHOUT an installed record (read before the probe on both paths).
      local kind status; kind=$(jq -r '.kind // ""' "$STATE_DIR/operation.json" 2>/dev/null || true); status=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
      local nodeside="once the node can pull (a registry CA the node does not trust, node DNS or a proxy, a full node disk, a rate limit or an outage)"
      if [[ $kind == restore ]]; then
@@ -2822,7 +2827,7 @@ relocated_images_probe() {
      elif [[ ( $status == owned || -z $status ) && ! -s $GSJ_WORK/installed.json ]]; then
        RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file after correcting registry.base, the registry's contents or registry.pull_secret (a repair would complete this first install without the storage check), or resume --operation $OPERATION $nodeside"
      elif [[ $status == owned || -z $status ]]; then
-       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and run the same command again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $nodeside"
+       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and run install (or upgrade --to VERSION) again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $nodeside"
      else
        RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
      fi

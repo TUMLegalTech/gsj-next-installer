@@ -324,8 +324,17 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
     assert "resume --operation" in hint and "repeats this check" in hint
     (tmp_path / "g").mkdir()
     result, _ = _run(tmp_path / "g", pod_phase="Failed", deleted=True, status="backup-verified")
+    assert result.returncode == 1 and "qualification failed" in result.stderr
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
-    assert "without repeating this check" in hint and "repeats this check" not in hint
+    assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa (") and hint.endswith("; correct the backend first")
+    assert "repeats this check" not in hint
+    # a cleanup refusal that hides a FAILED check after the backup says the same: correct the backend first
+    (tmp_path / "i").mkdir()
+    result, _ = _run(tmp_path / "i", pod_phase="Failed", status="backup-verified")
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert "cleanup incomplete" in message and "did not pass either" in message and "correct the backend" in message
+    assert hint.endswith("; correct the backend first")
     # the cleanup refusal after the backup: no "name a claim of your own" (a changed storage block is refused), no abandon
     (tmp_path / "h").mkdir()
     result, _ = _run(tmp_path / "h", status="backup-verified")

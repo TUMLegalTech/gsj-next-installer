@@ -550,7 +550,9 @@ def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resu
     if status == "owned":
         # resume's owned phase follows an interrupted backup too, where abandon refuses: the hint
         # names the route without claiming nothing is quiesced
-        assert "run the same command again" in hint and "nothing is quiesced" not in hint and "abandon refuses while" in hint
+        # the verb is named: in resume's owned phase "the same command" would read as resume, which abandon has made unusable
+        assert "run install (or upgrade --to VERSION) again" in hint and "run the same command again" not in hint
+        assert "nothing is quiesced" not in hint and "abandon refuses while" in hint
     else:
         assert "abandon" not in hint
 
@@ -586,8 +588,9 @@ def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_acce
 @pytest.mark.parametrize("status", ["restore-files-verified", "applying"])
 def test_a_restore_continued_under_a_corrected_program_names_that_installer(runtime, tmp_path, status):
     """After a restore-program transition neither resume nor the source
-    installer continues the restore: only restore-repair with the corrected
-    installer does, in every phase the probe runs in."""
+    installer continues the restore: only the corrected installer does --
+    restore-repair before the application starts (restore-files-verified),
+    repair at applying -- in every phase the probe runs in."""
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
     (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": status}))
