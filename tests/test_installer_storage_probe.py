@@ -116,3 +116,83 @@ def test_a_named_claim_makes_no_temporary_claim_and_touches_no_volume(tmp_path):
     assert result.returncode == 0, result.stderr
     assert not any(c.startswith(("patch pv", "delete pvc", "wait --for=delete")) for c in calls)
     assert sum(c.startswith("create -f") for c in calls) == 1      # the check's Pod only, no claim
+
+
+# ---- the check's Pod never ran: an image pull, a scheduling refusal, or a wait that ran out ----
+#
+# The misattribution pass: with no registry.base the pull probe does not run, so a pull Secret
+# that is wrong, a token that has expired or a node that cannot reach the
+# registry is first met HERE, by the storage check's own Pod -- which then never
+# leaves Pending, and the refusal read `storage WAL/locking/fsync/free-space
+# qualification failed`: an image-pull failure reported as a storage failure.
+# The operator would go and look at the disk. The storage backend was never
+# tested; the message must say what the Pod reported instead.
+
+def _run_never_ran(tmp_path, *, status_json):
+    source = (ROOT / "ops/installer/runtime.sh").read_text().split("# ENTRY POINT", 1)[0]
+    source = source.replace("@CLIENT_TABLE@", "gsj_client_info() { return 1; }")
+    (tmp_path / "functions.sh").write_text(source)
+    work = tmp_path / "work"; state = tmp_path / "state"; work.mkdir(); state.mkdir()
+    site = {"storage": {"class": "local-path", "node": "worker-1", "minimum_free_bytes": 1,
+                        "data": {"existing_claim": ""}}}
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["gsj-pull"]}}))
+    (state / "pod-status.json").write_text(json.dumps(status_json))
+    script = f'''source {shlex.quote(str(tmp_path / "functions.sh"))}
+GSJ_WORK={shlex.quote(str(work))}; STATE_DIR={shlex.quote(str(state))}; SITE="$GSJ_WORK/site.json"; CONFIG=/operator/site.json
+NAMESPACE=legal; RELEASE=gsj; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa
+assert_owner() {{ :; }}; payload_image() {{ echo ghcr.example/team/web@sha256:0; }}
+sleep() {{ SECONDS=$((SECONDS + 150)); }}
+fail() {{ printf 'GSJ: %s\\n' "$*" >&2; printf 'HINT: %s\\n' "${{RECOVERY_HINT:-resume --operation $OPERATION}}" >&2; exit 1; }}
+k() {{
+  printf '%s\\n' "$*" >> "$STATE_DIR/calls"
+  case "$1 $2" in
+    "create -f") cat >/dev/null;;
+    "get pod") case "$*" in *json*) cat "$STATE_DIR/pod-status.json";; *) printf Pending;; esac;;
+    "logs "*) return 7;;
+    "get pvc") case "$*" in *metadata.uid*) printf uid-1;; *) printf '';; esac;;
+    "wait --for=delete") return 0;;
+    *) :;;
+  esac
+}}
+storage_probe
+'''
+    result = subprocess.run(["bash", "-c", script], text=True, capture_output=True, timeout=60)
+    return result, (state / "calls").read_text().splitlines()
+
+
+PULL_FAILED = {"status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True"}],
+               "containerStatuses": [{"name": "storage-check", "image": "ghcr.example/team/web@sha256:0",
+                                      "state": {"waiting": {"reason": "ImagePullBackOff",
+                                                            "message": "Back-off pulling image \"ghcr.example/team/web@sha256:0\""}}}]}}
+UNSCHEDULABLE = {"status": {"phase": "Pending",
+                 "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                                 "message": "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."}]}}
+STILL_STARTING = {"status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True"}],
+                  "containerStatuses": [{"name": "storage-check", "image": "ghcr.example/team/web@sha256:0",
+                                         "state": {"waiting": {"reason": "ContainerCreating"}}}]}}
+
+
+def test_an_image_the_node_cannot_pull_is_not_reported_as_a_storage_failure(tmp_path):
+    result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED)
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "storage WAL/locking/fsync/free-space qualification failed" not in message
+    assert "could not pull" in message and "ImagePullBackOff" in message and "registry.pull_secret" in message
+    assert "was not tested" in message
+
+
+def test_a_pod_the_scheduler_refused_is_not_reported_as_a_storage_failure(tmp_path):
+    result, _ = _run_never_ran(tmp_path, status_json=UNSCHEDULABLE)
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "storage WAL/locking/fsync/free-space qualification failed" not in message
+    assert "Unschedulable" in message and "storage.node" in message and "was not tested" in message
+
+
+def test_a_check_that_never_finished_names_the_wait_not_the_disk(tmp_path):
+    result, _ = _run_never_ran(tmp_path, status_json=STILL_STARTING)
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "storage WAL/locking/fsync/free-space qualification failed" not in message
+    assert "did not finish" in message and "300 s" in message and "was not tested" in message

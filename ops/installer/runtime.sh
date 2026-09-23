@@ -2241,6 +2241,25 @@ PY
  jq -n --arg name "$name" --arg image "$image" --arg node "$(j .storage.node)" --arg claim "$probe_claim" --arg minimum "$(j .storage.minimum_free_bytes)" --rawfile script "$GSJ_WORK/storage-check.py" --argjson pulls "$(jq '.image.pullSecrets|map({name:.})' "$GSJ_WORK/values.pending.json")" '{apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"gsj.io/verification":$name}},spec:{restartPolicy:"Never",automountServiceAccountToken:false,nodeSelector:{"kubernetes.io/hostname":$node},imagePullSecrets:$pulls,containers:[{name:"storage-check",image:$image,command:["python","-c",$script,$minimum],resources:{requests:{cpu:"100m",memory:"128Mi"},limits:{memory:"256Mi"}},volumeMounts:[{name:"probe",mountPath:"/probe"}]}],volumes:[{name:"probe",persistentVolumeClaim:{claimName:$claim}}]}}' | k create -f - >/dev/null
  local end=$((SECONDS+300)) phase=''
  while (( SECONDS < end )); do phase=$(k get pod "$name" -o jsonpath='{.status.phase}'); [[ $phase == Succeeded || $phase == Failed ]] && break; sleep 3; done
+ # The check's Pod never ran to an end: the disk was never tested, and the
+ # verdict at the bottom must not call it a storage failure. Read what the
+ # Pod reported while it still exists. Measured: with no registry.base the
+ # pull probe does not run, so a pull Secret that is wrong, an expired token
+ # or a node that cannot reach the registry is first met HERE -- the Pod sat
+ # in ImagePullBackOff for 300 s and the run ended `storage WAL/locking/
+ # fsync/free-space qualification failed`, sending the operator to the disk.
+ local never=''
+ if [[ $phase != Succeeded && $phase != Failed ]]; then
+   # The Pod's status is kept in the state directory: the cleanup below
+   # deletes the Pod, and the scheduler's or the runtime's own words are the
+   # diagnosis the operator will need. They are not repeated in the refusal.
+   k get pod "$name" -o json > "$STATE_DIR/storage-check-pod.json" 2>/dev/null || : > "$STATE_DIR/storage-check-pod.json"
+   never=$(jq -r '
+     ([(.status.containerStatuses // [])[] | (.state.waiting.reason // "") | select(test("^(ErrImage|ImagePull|ImageInspect|InvalidImageName|RegistryUnavailable)"))] | first // "") as $pull
+     | ([(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | (.reason // "Unschedulable")] | first // "") as $sched
+     | if $pull != "" then "pull " + $pull elif $sched != "" then "sched " + $sched else "wait " + (.status.phase // "unknown") end' "$STATE_DIR/storage-check-pod.json" 2>/dev/null || true)
+   [[ -n $never ]] || never="wait ${phase:-unknown}"
+ fi
  k logs "$name" > "$STATE_DIR/storage-check.json" || result=1
  [[ $phase == Succeeded ]] || result=1
  uid=$(k get pvc "$probe_claim" -o jsonpath='{.metadata.uid}'); volume=$(k get pvc "$probe_claim" -o jsonpath='{.spec.volumeName}')
@@ -2275,6 +2294,20 @@ PY
    fi
    fail "temporary storage backend cleanup incomplete: PersistentVolume $volume, which this check's own temporary claim had bound, was still present (phase ${phase:-unknown}) 120 s after that claim was deleted. Whatever removes volumes of StorageClass $(j .storage.class) is slow or stuck. Do not delete the volume by hand: look at that provisioner or deleter, then continue with the command the closing line names.$note"
  fi
+ # A Pod that never ran is named for what the node reported, never for the
+ # disk it did not test. The image is the release's own reference; the
+ # runtime's message is not repeated (it names the registry route).
+ case $never in
+   "pull "*)
+     RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.config_file, registry.pull_secret or registry.base (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it)"
+     fail "the storage check's Pod could not pull its image $image on node $(j .storage.node) (${never#pull }), so the storage backend was not tested. Check registry.config_file and registry.pull_secret (the credential for that registry), that the node reaches the registry and, with registry.base, that the image was copied there unchanged";;
+   "sched "*)
+     RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting storage.node, freeing room on that node or repairing StorageClass $(j .storage.class) (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it)"
+     fail "the storage check's Pod was not scheduled (${never#sched }), so the storage backend was not tested. Either no node matched storage.node ($(j .storage.node)) with room for the Pod, or its claim on StorageClass $(j .storage.class) could not be bound; the scheduler's own words are in $STATE_DIR/storage-check-pod.json. Correct storage.node, free room on that node, or repair the class, then repair";;
+   "wait "*)
+     RECOVERY_HINT="resume --operation $OPERATION once the node has pulled the image and bound the claim"
+     fail "the storage check did not finish within 300 s (Pod phase ${never#wait }), so the storage backend was not tested: the node was still pulling the image or the claim was still binding when the wait ran out, or the check was stuck. The Pod's last status is in $STATE_DIR/storage-check-pod.json; look at the node's image pulls and StorageClass $(j .storage.class), then resume";;
+ esac
  (( result == 0 )) || fail 'storage WAL/locking/fsync/free-space qualification failed'
  log 'Storage passed WAL, fsync, cross-process locking and actual backend free-space checks'
 }
