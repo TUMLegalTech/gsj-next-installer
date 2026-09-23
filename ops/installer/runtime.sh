@@ -1036,13 +1036,13 @@ endpoint_preflight() {
  case $llm in
    absent) log 'LLM endpoint: none in the site file. The install will complete; acceptance skips agent-turn-note-history and generated-document, and the agent cannot answer until an endpoint is set (per case under Einstellungen, or llm.base_url/llm.model here and install again)';;
    working) log "LLM endpoint $base: answers from this host and lists $(j .llm.model)";;
-   *) log "LLM endpoint $base: $llm from this host. If it does not answer from inside the cluster either, acceptance skips agent-turn-note-history and generated-document and the agent cannot answer until it does; the install completes either way";;
+   *) log "LLM endpoint $base: $llm from this host$(if [[ -n $(j .llm.credential.secret) ]]; then printf ' (its credential is a Secret in the cluster, which this host did not send)'; fi). If it does not answer from inside the cluster either, acceptance skips agent-turn-note-history and generated-document and the agent cannot answer until it does; the install completes either way";;
  esac
  case $ocr in
    absent) log 'OCR endpoint: none in the site file. The install will complete; acceptance skips scanned-ingest-search, and scanned pages are not read until ocr.url names a vision-capable endpoint and install runs again';;
    working) log "OCR endpoint $url: read the test image from this host";;
    "not vision"*) log "OCR endpoint $url: answered HTTP 200 from this host but did not read the test image. Acceptance will skip scanned-ingest-search, and the application would store whatever this endpoint answers as the text of a scanned page: replace it before anyone uploads scanned files";;
-   *) log "OCR endpoint $url: $ocr from this host. If it does not read the verifier's page from inside the cluster either, acceptance skips scanned-ingest-search and scanned pages are not read until it does; the install completes either way";;
+   *) log "OCR endpoint $url: $ocr from this host$(if [[ -n $(j .ocr.credential.secret) ]]; then printf ' (its credential is a Secret in the cluster, which this host did not send)'; fi). If it does not read the verifier's page from inside the cluster either, acceptance skips scanned-ingest-search and scanned pages are not read until it does; the install completes either way";;
  esac
 }
 preflight() {

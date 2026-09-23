@@ -3648,7 +3648,17 @@ in (the run's `endpoints` field repeats it; `ocr_http_status` accompanies
 `ocr-refused`). Only `scanned-ingest-search` (OCR), `agent-turn-note-history`
 and `generated-document` (LLM) can be skipped, and only for those reasons; a
 run with any skipped check is `coverage: partial` and its closing line says
-so (step 9).
+so (step 9). Two edges of the probe, so a partial verification is read
+right: `llm-unreachable` is the Verbindungstest's verdict — the runner asked
+the endpoint's `/models` route and got no usable answer — so a gateway that
+serves chat completions but not `/models` is skipped as unreachable rather
+than exercised (name an endpoint that serves both, or test the agent by hand
+after the install); and `ocr-not-vision-capable` means the recognised text
+did not contain the test page's sentence, which a model that reads the page
+but paraphrases it also earns — the check would have failed on the same
+sentence. A probe that could not run at all (the relay route failing, the
+renderer missing) fails the run under the name `endpoint-probe` with an
+ordinary `failure_code`; it is never read as an endpoint state.
 
 ### 4. `gsj-corpus:<code>` and `gsj-copy:<code>`
 
