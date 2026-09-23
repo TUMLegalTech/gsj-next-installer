@@ -463,10 +463,10 @@ bash verify-release.sh gsj-install.sh installer-descriptor.json \
 ```
 
 Publish `verify-release.sh`, the public key, descriptor, signature and
-installer as release assets. The public key must be obtained through a
-trusted channel; accepting a key supplied by an untrusted installer
-would not establish authenticity. Verification does not execute the
-installer.
+installer as release assets, and hand the customer the release and their
+registry token directly: the key travels with the release, and the
+verification proves that the installer they hold is the one that was signed.
+Verification does not execute the installer.
 
 The upgrade downloader expects each immutable version directory below
 `release_base_url` to contain `gsj-install.sh`,
