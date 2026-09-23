@@ -1943,7 +1943,7 @@ def _partial_summary_run(runtime, endpoints, checks, extra=None):
 
 
 def test_the_partial_closing_line_states_what_the_probe_established_per_reason(runtime):
-    """Instance 4, carried further: the
+    """The
     closing line used to end every partial verification with `Until … is set …
     Set llm.base_url … ocr.url …` — advice to SET an endpoint that IS set and
     merely did not answer, refused the request, or could not read an image.
@@ -2198,6 +2198,6 @@ def test_the_public_tree_carries_no_internal_review_labels():
     hits = []
     for path in sorted(list((INSTALLER).glob("*.sh")) + list((INSTALLER).glob("*.md")) + list((INSTALLER.parent.parent / "tests").glob("*.py"))):
         for n, l in enumerate(path.read_text(errors="replace").splitlines(), 1):
-            if re.search("audit" + " rounds?|FIX" + "-PASS|misattribution" + " pass", l, re.I):   # spelled apart: this line must not match itself
+            if re.search("audit" + " rounds?|FIX" + "-PASS|misattribution" + "[- ]pass", l, re.I):   # spelled apart: this line must not match itself
                 hits.append(f"{path.name}:{n}")
     assert not hits, hits

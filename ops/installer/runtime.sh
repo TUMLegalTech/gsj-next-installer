@@ -107,7 +107,7 @@ fetch_public() {
 #  jq 1.6       all ~1,050 jq programs in runtime.sh, startup-recovery.sh and
 #               verification-cleanup.sh were compiled under jq 1.6, 1.7, 1.7.1,
 #               1.8.0 and 1.8.2; after the three rewrites this phase made, 1.6
-#               compiles every one of them. Re-checked after the misattribution-pass
+#               compiles every one of them. Re-checked after this branch's
 #               changes: 1,092 programs a harness could isolate (of 1,123
 #               invocations; the rest are comments, tool loops and shell-
 #               interpolated programs) compile identically under 1.6, 1.7,
@@ -2313,15 +2313,16 @@ PY
  # or a node that cannot reach the registry is first met HERE -- the Pod sat
  # in ImagePullBackOff for 300 s and the run ended `storage WAL/locking/
  # fsync/free-space qualification failed`, sending the operator to the disk.
- # The operation's recorded status decides the hints: "owned" is a first
- # install (nothing applied, nothing quiesced: resume repeats this check, and
- # abandon then install again takes a changed site value); after the backup
- # (backup-verified) the deployment is quiesced, abandon refuses, resume
- # continues from the backup WITHOUT this check, and a changed site value is
- # repair's. Every caller writes that status before this check runs.
+ # The operation's recorded status decides every hint of this check: "owned"
+ # is a first install (nothing applied, nothing quiesced: resume repeats this
+ # check, and abandon then install again takes a changed site value); after
+ # the backup (backup-verified) the deployment is quiesced, abandon refuses,
+ # resume continues from the backup WITHOUT this check, and a changed site
+ # value is repair's. Every caller writes that status before this check runs.
  local status; status=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
  local first=true; [[ $status == owned || -z $status ]] || first=false
- local rerun="The storage check runs again on resume"; $first || rerun="resume continues from the verified backup, where this check is not repeated (the claims of an installed release were qualified at its install)"
+ local rerun="The storage check runs again on resume"; $first || rerun="resume continues from the verified backup and does not repeat this check"
+ local continue_hint="resume --operation $OPERATION continues from the verified backup without repeating this check"
  local never='' status_note="The Pod's last status is in $STATE_DIR/storage-check-pod.json."
  if [[ $phase != Succeeded && $phase != Failed ]]; then
    # The Pod's status is kept in the state directory: the cleanup below
@@ -2379,7 +2380,8 @@ PY
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
    if [[ $phase == Failed ]]; then
      # resume compares the site byte for byte and would refuse the edit this asks for.
-     RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive once this operation's Lease has gone 180 s unrenewed, then install again with storage.data.existing_claim naming a claim of your own"
+     if $first; then RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive once this operation's Lease has gone 180 s unrenewed, then install again with storage.data.existing_claim naming a claim of your own"
+     else RECOVERY_HINT="$continue_hint; a claim of your own in storage.data.existing_claim is a changed storage block, which is refused for an installed release"; fi
      fail "temporary storage backend cleanup incomplete: PersistentVolume $volume was bound by this check's own temporary claim and marked Delete, and it is now Failed: nothing on this cluster deletes a volume of StorageClass $(j .storage.class). Name a claim of your own in storage.data.existing_claim, so that no temporary claim is made. $volume accepts no claim until that PersistentVolume object is deleted and created again; anything this check left in its directory is named .gsj-storage-check-*.$note"
    fi
    fail "temporary storage backend cleanup incomplete: PersistentVolume $volume, which this check's own temporary claim had bound, was still present (phase ${phase:-unknown}) 120 s after that claim was deleted. Whatever removes volumes of StorageClass $(j .storage.class) is slow or stuck. Do not delete the volume by hand: look at that provisioner or deleter, then continue with the command the closing line names.$note"
@@ -2406,13 +2408,19 @@ PY
      fi
      fail "the storage check's Pod was not scheduled (${never#sched }), so the storage backend was not tested. Either no node matched storage.node ($(j .storage.node)) with room for the Pod, or its claim on StorageClass $(j .storage.class) could not be bound. $status_note $rerun";;
    "wait Running")
-     RECOVERY_HINT="resume --operation $OPERATION once the check can finish; if it stays stuck, its node $(j .storage.node) and StorageClass $(j .storage.class) are where to look"
+     if $first; then RECOVERY_HINT="resume --operation $OPERATION once the check can finish; if it stays stuck, its node $(j .storage.node) and StorageClass $(j .storage.class) are where to look"
+     else RECOVERY_HINT="$continue_hint; if the check stays stuck, its node $(j .storage.node) and StorageClass $(j .storage.class) are where to look"; fi
      fail "the storage check was still running when its 300 s wait ran out, so the storage backend was not tested to the end: the Pod had started and the check itself (locking, WAL, fsync, free space on the claim) had not finished. $status_note Look at its node $(j .storage.node) and StorageClass $(j .storage.class), then resume";;
    "wait "*)
-     RECOVERY_HINT="resume --operation $OPERATION once the node has pulled the image and bound the claim"
+     if $first; then RECOVERY_HINT="resume --operation $OPERATION once the node has pulled the image and bound the claim"
+     else RECOVERY_HINT="$continue_hint"; fi
      fail "the storage check did not finish within 300 s (Pod phase ${never#wait }), so the storage backend was not tested: the node was still pulling the image or the claim was still binding when the wait ran out, or the check was stuck. $status_note Look at the node's image pulls and StorageClass $(j .storage.class), then resume";;
  esac
- (( result == 0 )) || fail 'storage WAL/locking/fsync/free-space qualification failed'
+ if (( result != 0 )); then
+   if $first; then RECOVERY_HINT="resume --operation $OPERATION once the backend is corrected (resume repeats this check)"
+   else RECOVERY_HINT="$continue_hint: correct the backend first"; fi
+   fail 'storage WAL/locking/fsync/free-space qualification failed'
+ fi
  if $logs_read; then log 'Storage passed WAL, fsync, cross-process locking and actual backend free-space checks'
  else log "Storage passed WAL, fsync, cross-process locking and free-space checks (the check's Pod ended Succeeded); its measurements could not be read: kubectl logs on the check's Pod failed (the kubeconfig may lack pods/log in namespace $NAMESPACE)"; fi
 }
@@ -2796,14 +2804,22 @@ relocated_images_probe() {
      # sent to repair (it would complete without the storage check); past the
      # backup the deployment is quiesced, abandon refuses, and a changed site
      # value is repair's. Every caller writes that status before this probe.
+     # In main and resume's owned phase this probe runs BEFORE the backup, so
+     # the status is "owned" for an upgrade too: a first install is "owned"
+     # WITHOUT an installed record (read before the probe on both paths). After
+     # a restore-program transition only restore-repair with the corrected
+     # installer continues the restore (RESTORE_PROGRAM_ACTIVE).
      local kind status; kind=$(jq -r '.kind // ""' "$STATE_DIR/operation.json" 2>/dev/null || true); status=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
      local nodeside="once the node can pull (a registry CA the node does not trust, node DNS or a proxy, a full node disk, a rate limit or an outage)"
      if [[ $kind == restore ]]; then
        local verb
-       case $status in restoring-resources|restoring-files) verb="restore-repair --operation $OPERATION with the exact saved target";; applying) verb="repair --operation $OPERATION with the exact saved target";; *) verb="resume --operation $OPERATION (a restore continued under a corrected program uses restore-repair --operation $OPERATION with the exact saved target instead)";; esac
+       if [[ ${RESTORE_PROGRAM_ACTIVE:-false} == true ]]; then verb="restore-repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)"
+       else case $status in restoring-resources|restoring-files) verb="restore-repair --operation $OPERATION with the exact saved target";; applying) verb="repair --operation $OPERATION with the exact saved target";; *) verb="resume --operation $OPERATION with the exact source installer";; esac; fi
        RECOVERY_HINT="$verb $nodeside, or after correcting the registry's contents (wait 180 s first: this operation's Lease must go unrenewed that long); a changed registry.base or registry.pull_secret cannot continue this restore, whose site is retained byte for byte"
-     elif [[ $status == owned || -z $status ]]; then
+     elif [[ ( $status == owned || -z $status ) && ! -s $GSJ_WORK/installed.json ]]; then
        RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file after correcting registry.base, the registry's contents or registry.pull_secret (a repair would complete this first install without the storage check), or resume --operation $OPERATION $nodeside"
+     elif [[ $status == owned || -z $status ]]; then
+       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and run the same command again from the corrected file (nothing is quiesced before the backup), or resume --operation $OPERATION $nodeside"
      else
        RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
      fi
@@ -3277,11 +3293,11 @@ backup_resources() {
  done
  while IFS=$'\t' read -r claim uid volume; do
    object=$(k get pvc "$claim" -o json) || return 1
-   jq -e --arg uid "$uid" --arg volume "$volume" '.metadata.uid==$uid and .spec.volumeName==$volume' <<< "$object" >/dev/null || fail 'PVC identity changed during backup'
-   jq -c . <<< "$object" >> "$parts" || return 1
+   printf '%s\n' "$object" | jq -e --arg uid "$uid" --arg volume "$volume" '.metadata.uid==$uid and .spec.volumeName==$volume' >/dev/null || fail 'PVC identity changed during backup'
+   printf '%s\n' "$object" | jq -c . >> "$parts" || return 1
    object=$(k get pv "$volume" -o json) || return 1
-   jq -e --arg ns "$NAMESPACE" --arg uid "$uid" '.spec.claimRef.namespace==$ns and .spec.claimRef.uid==$uid' <<< "$object" >/dev/null || fail 'PV binding changed during backup'
-   jq -c . <<< "$object" >> "$pvparts" || return 1
+   printf '%s\n' "$object" | jq -e --arg ns "$NAMESPACE" --arg uid "$uid" '.spec.claimRef.namespace==$ns and .spec.claimRef.uid==$uid' >/dev/null || fail 'PV binding changed during backup'
+   printf '%s\n' "$object" | jq -c . >> "$pvparts" || return 1
  done < <(jq -r '.storage[]|[.name,.uid,.volume]|@tsv' "$GSJ_WORK/installed.json")
  jq -s '{apiVersion:"v1",kind:"List",items:unique_by(.kind+"/"+.metadata.name)}' "$parts" > "$GSJ_WORK/cluster-private.json" || return 1
  if [[ $(jq -r .site.tls.profile "$GSJ_WORK/installed.json") == managed-acme ]]; then

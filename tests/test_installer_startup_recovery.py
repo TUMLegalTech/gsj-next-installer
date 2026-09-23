@@ -617,4 +617,7 @@ out=''; out=$(backup_credential_fingerprint) || echo "OR:FAILED:${out:-empty}"; 
     result = shell["run"](body.replace("FAILING", failing))
     assert result.returncode == 0, result.stderr
     assert "DIGEST" not in result.stdout, result.stdout
+    # the failure is the read's own: three calls, three refusals, never an identity verdict on an empty object
+    assert result.stderr.count("The connection to the server was refused") == 3, result.stderr
+    assert "identity changed" not in result.stderr and "binding changed" not in result.stderr, result.stderr
     assert "IF:FAILED:empty" in result.stdout and "OR:FAILED:empty" in result.stdout and "PLAIN:rc=1:empty" in result.stdout, result.stdout

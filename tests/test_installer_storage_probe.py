@@ -228,7 +228,8 @@ def test_the_hints_after_a_backup_never_say_install_again_or_a_repeated_check(tm
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert hint.startswith("HINT: resume --operation") and "install again" not in hint and "abandon" not in hint
     assert "repair --operation" in hint, "after the backup a changed registry value goes through repair"
-    assert "not repeated" in hint and "runs again on resume" not in message and "not repeated" in message
+    assert "not repeated" in hint and "runs again on resume" not in message and "does not repeat this check" in message
+    assert "qualified at its install" not in message and "qualified at its install" not in hint
     (tmp_path / "s").mkdir()
     result, _ = _run_never_ran(tmp_path / "s", status_json=UNSCHEDULABLE, status="backup-verified")
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
@@ -303,3 +304,18 @@ def test_a_pod_that_never_ran_leaves_a_cleanup_note_that_never_says_did_not_pass
     assert "cleanup incomplete" in message                                     # the cleanup refusal came first
     assert "did not pass" not in message
     assert "never ran" in message and "ImagePullBackOff" in message and "not tested" in message
+
+
+def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_check(tmp_path):
+    """The recorded status decides every hint of this check, not two of them:
+    a check still running, a check that failed, and the cleanup refusal all
+    used to name resume as if it would run the check again, or abandon,
+    which refuses after the backup."""
+    result, _ = _run_never_ran(tmp_path, status_json=STILL_RUNNING, poll_phase="Running", status="backup-verified")
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert "without repeating this check" in hint and "abandon" not in hint
+    (tmp_path / "f").mkdir()
+    result, _ = _run(tmp_path / "f", pod_phase="Failed", deleted=True)
+    assert result.returncode == 1 and "qualification failed" in result.stderr
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert "resume --operation" in hint and "repeats this check" in hint, "a first install (no operation record here): resume repeats the check"

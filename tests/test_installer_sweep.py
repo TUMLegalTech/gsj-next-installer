@@ -87,7 +87,8 @@ def test_sweep_refuses_a_live_operation_and_touches_nothing(runtime, tmp_path):
     # a rerun of sweep would refuse again (a held Lease is abandon's to release), so the
     # refusal names abandon, the age it measured and the wait abandon needs -- never "run the same command again"
     assert "run abandon --operation" in result.stderr and "180 s" in result.stderr
-    assert re.search(r"renewed [56] s ago", result.stderr) and re.search(r"wait 17[45] s", result.stderr), result.stderr
+    age = int(re.search(r"renewed (\d+) s ago", result.stderr).group(1)); assert age in (5, 6), age
+    assert f"wait {180 - age} s" in result.stderr, result.stderr
     assert "run the same command again" not in result.stderr and "stop that tools process" not in result.stderr
     assert json.loads(state.read_text())["resources"] == before
     assert not _records(work)

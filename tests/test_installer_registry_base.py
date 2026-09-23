@@ -526,15 +526,18 @@ def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_pa
     assert "repair --operation" not in hint and "correct the node" not in hint
 
 
-@pytest.mark.parametrize("status", ["backup-verified", "applying"])
-def test_a_sustained_pull_failure_past_the_backup_names_repair_and_resume_never_abandon(runtime, tmp_path, status):
-    """Past its backup (status backup-verified: an install or upgrade over an
-    installed source, a repair's transition) the deployment is quiesced and
-    abandon refuses; the discriminator is the recorded status, never a file
-    resume's backup-verified phase does not read."""
+@pytest.mark.parametrize("status, installed", [("backup-verified", False), ("owned", True)])
+def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resume_never_a_first_install(runtime, tmp_path, status, installed):
+    """Two states reach this probe over an installed source: main and resume's
+    owned phase run it BEFORE the backup (status still "owned", the installed
+    record read), and resume's backup-verified phase runs it after (status
+    backup-verified, the record not read). Neither is a first install: the
+    hint never says "install again", and names repair for a changed site."""
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
     (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "upgrade", "status": status}))
+    if installed:
+        (work / "installed.json").write_text(json.dumps({"status": "complete"}))
     release = _public_release(); payload = _payload(tmp_path, release)
     site = _site(); site["registry"].update(base=BASE, pull_secret="corp-pull")
     (work / "site.json").write_text(json.dumps(site))
@@ -542,13 +545,17 @@ def test_a_sustained_pull_failure_past_the_backup_names_repair_and_resume_never_
     result = run(PROBE_PRELUDE.format(payload=payload) + 'STATE_DIR="$TEST_WORK"; relocated_images_probe')
     assert result.returncode != 0
     hint = result.stderr.rsplit("HINT=", 1)[1]
-    assert hint.startswith("repair --operation") and "resume --operation" in hint
-    assert "abandon" not in hint and "install again" not in hint
+    assert "repair --operation" in hint and "resume --operation" in hint
+    assert "first install" not in hint and "install again" not in hint
+    if status == "owned":
+        assert "run the same command again" in hint, "before the backup nothing is quiesced: abandon and the same command again is open too"
+    else:
+        assert "abandon" not in hint
 
 
 @pytest.mark.parametrize("status, verb, absent", [
     ("restoring-resources", "restore-repair --operation", ("resume --operation", " repair --operation")),     # resume refuses this phase
-    ("restore-files-verified", "resume --operation", ("resume refuses",)),                                     # resume accepts it; a corrected program is restore-repair's
+    ("restore-files-verified", "resume --operation", ("resume refuses", "corrected installer")),                # resume accepts it under the source installer
     ("applying", "repair --operation", ("restore-repair", "resume --operation")),                             # the repair path
 ])
 def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_accepts(runtime, tmp_path, status, verb, absent):
@@ -570,6 +577,25 @@ def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_acce
     assert hint.startswith(verb + " aaaaaaaaaaaabbbbbbbbbbbb"), hint
     for w in absent: assert w not in hint, (w, hint)
     if status == "restore-files-verified":
-        assert "restore-repair --operation" in hint and "corrected program" in hint
+        assert "exact source installer" in hint and "restore-repair" not in hint
     assert "cannot continue this restore" in hint and "registry.base" in hint
+
+
+@pytest.mark.parametrize("status", ["restore-files-verified", "applying"])
+def test_a_restore_continued_under_a_corrected_program_names_that_installer(runtime, tmp_path, status):
+    """After a restore-program transition neither resume nor the source
+    installer continues the restore: only restore-repair with the corrected
+    installer does, in every phase the probe runs in."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": status}))
+    release = _public_release(); payload = _payload(tmp_path, release)
+    site = _site(); site["registry"].update(base=BASE, pull_secret="corp-pull")
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    result = run(PROBE_PRELUDE.format(payload=payload) + 'STATE_DIR="$TEST_WORK"; RESTORE_PROGRAM_ACTIVE=true; relocated_images_probe')
+    assert result.returncode != 0
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith("restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb with this corrected installer"), hint
+    assert "resume --operation" not in hint and "exact saved target" not in hint and "exact source installer" not in hint
     assert "after correcting registry.base" not in hint
