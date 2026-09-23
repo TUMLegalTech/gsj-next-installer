@@ -353,3 +353,4 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert "cleanup incomplete" in message and "Name a claim of your own" not in message and "refused for an installed release" in message
     assert "abandon" not in hint and hint.startswith("HINT: resume --operation")
+    assert "correct the backend" not in result.stderr, "the check itself PASSED here: no backend fault"

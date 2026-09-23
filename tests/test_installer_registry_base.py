@@ -526,16 +526,18 @@ def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_pa
     assert "repair --operation" not in hint and "correct the node" not in hint
 
 
-@pytest.mark.parametrize("status, installed", [("backup-verified", False), ("owned", True)])
-def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resume_never_a_first_install(runtime, tmp_path, status, installed):
+@pytest.mark.parametrize("status, installed, kind", [("backup-verified", False, "upgrade"), ("owned", True, "upgrade"), ("owned", True, "install")])
+def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resume_never_a_first_install(runtime, tmp_path, status, installed, kind):
     """Two states reach this probe over an installed source: main and resume's
     owned phase run it BEFORE the backup (status still "owned", the installed
     record read), and resume's backup-verified phase runs it after (status
     backup-verified, the record not read). Neither is a first install: the
-    hint never says "install again", and names repair for a changed site."""
+    hint names repair for a changed site, and, before the backup, abandon and
+    the operation's OWN verb again (install, or upgrade --to) -- never the
+    other one."""
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
-    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "upgrade", "status": status}))
+    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": kind, "status": status}))
     if installed:
         (work / "installed.json").write_text(json.dumps({"status": "complete"}))
     release = _public_release(); payload = _payload(tmp_path, release)
@@ -548,10 +550,12 @@ def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resu
     assert "repair --operation" in hint and "resume --operation" in hint
     assert "first install" not in hint and "a repair would complete" not in hint
     if status == "owned":
-        # resume's owned phase follows an interrupted backup too, where abandon refuses: the hint
-        # names the route without claiming nothing is quiesced
-        # the verb is named: in resume's owned phase "the same command" would read as resume, which abandon has made unusable
-        assert "run install again" in hint and "upgrade --to VERSION once" in hint and "run the same command again" not in hint
+        # resume's owned phase follows an interrupted backup too, where abandon refuses: the hint names the
+        # route without claiming nothing is quiesced, and the verb is the operation's OWN ("the same command"
+        # would read as resume there; an interrupted upgrade is not told to install)
+        own = "run install again" if kind == "install" else "run upgrade --to VERSION again"
+        other = "run upgrade --to" if kind == "install" else "run install again"
+        assert own in hint and other not in hint and "run the same command again" not in hint, hint
         assert "nothing is quiesced" not in hint and "abandon refuses while" in hint
     else:
         assert "abandon" not in hint and "install again" not in hint

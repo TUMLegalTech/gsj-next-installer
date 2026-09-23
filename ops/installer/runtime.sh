@@ -2378,8 +2378,9 @@ PY
    elif ! $logs_read; then note=" The storage check itself passed (its Pod ended Succeeded), though its measurements could not be read (kubectl logs failed)."
    fi
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-   # After the backup a failed check (the Pod ran and did not pass) is the
-   # backend's, and resume will not repeat the check: both refusals say so.
+   # After the backup a check whose Pod ended Failed (it started, and its own
+   # asserts did not hold) is the backend's to correct, and resume will not
+   # repeat the check: both refusals say so. A Pod that never ran is not that.
    local backend_note=''
    if ! $first && (( result != 0 )) && [[ -z $never ]]; then backend_note=", and the check itself did not pass (below), so correct the backend first"; fi
    if [[ $phase == Failed ]]; then
@@ -2831,7 +2832,9 @@ relocated_images_probe() {
      elif [[ ( $status == owned || -z $status ) && ! -s $GSJ_WORK/installed.json ]]; then
        RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file after correcting registry.base, the registry's contents or registry.pull_secret (a repair would complete this first install without the storage check), or resume --operation $OPERATION $nodeside"
      elif [[ $status == owned || -z $status ]]; then
-       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and run install again from the corrected file (or upgrade --to VERSION once this release's install is complete; abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $nodeside"
+       # the operation's own verb again: an interrupted upgrade is not told to install
+       local again="run install again"; [[ $kind != upgrade ]] || again="run upgrade --to VERSION again"
+       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and $again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $nodeside"
      else
        RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
      fi
