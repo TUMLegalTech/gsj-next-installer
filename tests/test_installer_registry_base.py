@@ -504,7 +504,7 @@ def test_the_probe_runs_before_backup_quiesces_a_running_deployment():
 
 
 def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_path):
-    """The misattribution pass: the refusal listed only site values
+    """Measured: the refusal listed only site values
     to check -- digests, prefix, pull secret -- and a repair after changing
     them. A registry CA the node's runtime does not trust, node DNS or proxy,
     a full node disk, a rate limit or a registry outage end in the same
@@ -526,20 +526,29 @@ def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_pa
     assert "repair --operation" not in hint and "correct the node" not in hint
 
 
-def test_a_sustained_pull_failure_on_an_installed_source_names_repair_and_resume(runtime, tmp_path):
+@pytest.mark.parametrize("status", ["backup-verified", "applying"])
+def test_a_sustained_pull_failure_past_the_backup_names_repair_and_resume_never_abandon(runtime, tmp_path, status):
+    """Past its backup (status backup-verified: an install or upgrade over an
+    installed source, a repair's transition) the deployment is quiesced and
+    abandon refuses; the discriminator is the recorded status, never a file
+    resume's backup-verified phase does not read."""
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
-    (work / "installed.json").write_text(json.dumps({"status": "complete"}))
-    _, result = _probe(run, work, tmp_path)
+    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "upgrade", "status": status}))
+    release = _public_release(); payload = _payload(tmp_path, release)
+    site = _site(); site["registry"].update(base=BASE, pull_secret="corp-pull")
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    result = run(PROBE_PRELUDE.format(payload=payload) + 'STATE_DIR="$TEST_WORK"; relocated_images_probe')
     assert result.returncode != 0
     hint = result.stderr.rsplit("HINT=", 1)[1]
-    assert "repair --operation" in hint and "resume --operation" in hint
+    assert hint.startswith("repair --operation") and "resume --operation" in hint
     assert "abandon" not in hint and "install again" not in hint
 
 
 @pytest.mark.parametrize("status, verb, absent", [
     ("restoring-resources", "restore-repair --operation", ("resume --operation", " repair --operation")),     # resume refuses this phase
-    ("restore-files-verified", "resume --operation", ("restore-repair", "resume refuses")),                    # resume accepts it
+    ("restore-files-verified", "resume --operation", ("resume refuses",)),                                     # resume accepts it; a corrected program is restore-repair's
     ("applying", "repair --operation", ("restore-repair", "resume --operation")),                             # the repair path
 ])
 def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_accepts(runtime, tmp_path, status, verb, absent):
@@ -560,5 +569,7 @@ def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_acce
     hint = result.stderr.rsplit("HINT=", 1)[1]
     assert hint.startswith(verb + " aaaaaaaaaaaabbbbbbbbbbbb"), hint
     for w in absent: assert w not in hint, (w, hint)
+    if status == "restore-files-verified":
+        assert "restore-repair --operation" in hint and "corrected program" in hint
     assert "cannot continue this restore" in hint and "registry.base" in hint
     assert "after correcting registry.base" not in hint

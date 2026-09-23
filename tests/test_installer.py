@@ -1943,7 +1943,7 @@ def _partial_summary_run(runtime, endpoints, checks, extra=None):
 
 
 def test_the_partial_closing_line_states_what_the_probe_established_per_reason(runtime):
-    """The misattribution pass (instance 4 carried further): the
+    """Instance 4, carried further: the
     closing line used to end every partial verification with `Until … is set …
     Set llm.base_url … ocr.url …` — advice to SET an endpoint that IS set and
     merely did not answer, refused the request, or could not read an image.
@@ -1965,7 +1965,7 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
     for status, words, absent in ((404, ("chat-completions route", "names a model the endpoint serves"), ("credential",)),
                                   (500, ("text-only model", "vision-capable", "server itself"), ("busy",)),
                                   (503, ("could not serve the request", "busy or starting", "try again"), ("text-only", "nothing behind")),
-                                  (505, ("check the endpoint itself", "error"), ("credential", "text-only")),
+                                  (505, ("check the endpoint itself", "answered an error"), ("credential", "text-only", "retries")),
                                   (429, ("rate-limited",), ("credential",))):
         line, _ = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
             {"name": "operator-login", "status": "passed"},
@@ -2035,7 +2035,7 @@ def test_the_operator_guide_shows_the_closing_line_the_runtime_prints(runtime):
 
 
 def test_a_refused_site_value_is_a_named_refusal_that_states_the_expected_format(runtime, tmp_path):
-    """The misattribution pass: a site value the schema refuses surfaced as jq's own error
+    """Measured: a site value the schema refuses surfaced as jq's own error
     line (`jq: error (at <stdin>:170): site.operator.login: invalid format`) --
     not a `GSJ:` refusal, and without the format that was expected, so the
     operator learned only that a value was wrong, not how. Measured on the
@@ -2064,7 +2064,7 @@ def test_a_refused_site_value_is_a_named_refusal_that_states_the_expected_format
 
 
 def test_every_still_live_refusal_states_the_lease_age_and_the_wait():
-    """The misattribution pass: "the prior installer is still live;
+    """Measured: "the prior installer is still live;
     stop it" fires whenever the Lease was renewed less than 180 s ago -- after
     any failure that is simply the retained Lease of a dead process, and the
     operator looks for a process to stop. Every such refusal now states the
@@ -2198,6 +2198,6 @@ def test_the_public_tree_carries_no_internal_review_labels():
     hits = []
     for path in sorted(list((INSTALLER).glob("*.sh")) + list((INSTALLER).glob("*.md")) + list((INSTALLER.parent.parent / "tests").glob("*.py"))):
         for n, l in enumerate(path.read_text(errors="replace").splitlines(), 1):
-            if re.search("audit" + " rounds?|FIX" + "-PASS", l, re.I):        # spelled apart: this line must not match itself
+            if re.search("audit" + " rounds?|FIX" + "-PASS|misattribution" + " pass", l, re.I):   # spelled apart: this line must not match itself
                 hits.append(f"{path.name}:{n}")
     assert not hits, hits

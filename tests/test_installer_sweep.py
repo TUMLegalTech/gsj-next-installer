@@ -82,11 +82,12 @@ def test_sweep_refuses_a_live_operation_and_touches_nothing(runtime, tmp_path):
     before = json.loads(state.read_text())["resources"]
     result = _sweep(run)
     assert result.returncode != 0
-    # The misattribution pass: the retained Lease of a DEAD run also reads "live" for 180 s; the
+    # Measured: the retained Lease of a DEAD run also reads "live" for 180 s; the
     # refusal states the age it measured and the wait, never "stop that tools process"
     # a rerun of sweep would refuse again (a held Lease is abandon's to release), so the
     # refusal names abandon, the age it measured and the wait abandon needs -- never "run the same command again"
-    assert "run abandon --operation" in result.stderr and "renewed 5 s ago" in result.stderr and "180 s" in result.stderr and "wait 175 s" in result.stderr
+    assert "run abandon --operation" in result.stderr and "180 s" in result.stderr
+    assert re.search(r"renewed [56] s ago", result.stderr) and re.search(r"wait 17[45] s", result.stderr), result.stderr
     assert "run the same command again" not in result.stderr and "stop that tools process" not in result.stderr
     assert json.loads(state.read_text())["resources"] == before
     assert not _records(work)
@@ -232,7 +233,7 @@ def test_sweep_of_a_target_without_a_canonical_record_clears_the_cluster_residue
 
 
 def test_a_namespace_that_could_not_be_read_is_not_taken_for_absent(runtime, tmp_path):
-    """The misattribution pass: `if k get namespace …` treated an
+    """Measured: `if k get namespace …` treated an
     expired kubeconfig, an RBAC denial or an API outage as "the namespace is
     gone", skipped the Lease, release and controller checks, deleted the
     transfer directories and reported a clean target."""

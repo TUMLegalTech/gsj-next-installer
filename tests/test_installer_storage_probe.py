@@ -121,7 +121,7 @@ def test_a_named_claim_makes_no_temporary_claim_and_touches_no_volume(tmp_path):
 
 # ---- the check's Pod never ran: an image pull, a scheduling refusal, or a wait that ran out ----
 #
-# The misattribution pass: with no registry.base the pull probe does not run, so a pull Secret
+# Measured: with no registry.base the pull probe does not run, so a pull Secret
 # that is wrong, a token that has expired or a node that cannot reach the
 # registry is first met HERE, by the storage check's own Pod -- which then never
 # leaves Pending, and the refusal read `storage WAL/locking/fsync/free-space
@@ -129,7 +129,7 @@ def test_a_named_claim_makes_no_temporary_claim_and_touches_no_volume(tmp_path):
 # The operator would go and look at the disk. The storage backend was never
 # tested; the message must say what the Pod reported instead.
 
-def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending", json_read_fails=False, pull_secret=None, installed=False):
+def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending", json_read_fails=False, pull_secret=None, status="owned"):
     source = (ROOT / "ops/installer/runtime.sh").read_text().split("# ENTRY POINT", 1)[0]
     source = source.replace("@CLIENT_TABLE@", "gsj_client_info() { return 1; }")
     (tmp_path / "functions.sh").write_text(source)
@@ -138,8 +138,7 @@ def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending",
                         "data": {"existing_claim": ""}}}
     if pull_secret:
         site["registry"] = {"pull_secret": pull_secret}
-    if installed:
-        (work / "installed.json").write_text(json.dumps({"status": "complete"}))
+    (state / "operation.json").write_text(json.dumps({"operation": "a" * 24, "kind": "install", "status": status}))
     (work / "site.json").write_text(json.dumps(site))
     (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": [pull_secret] if pull_secret else []}}))
     (state / "pod-status.json").write_text(json.dumps(status_json))
@@ -215,19 +214,32 @@ def test_a_failed_pod_snapshot_keeps_the_phase_the_poll_saw(tmp_path):
     assert "could not be read" in message and "storage-check-pod.json" not in message
 
 
-def test_the_hints_for_an_installed_source_never_say_install_again(tmp_path):
-    """For an upgrade, or an install run again over a completed installation,
-    backup has quiesced the deployment and abandon refuses; a changed storage
-    block is refused by compatibility. The hints for a first install (abandon,
-    then install again) would send that operator into two refusals."""
-    result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED, installed=True)
+def test_the_hints_after_a_backup_never_say_install_again_or_a_repeated_check(tmp_path):
+    """Over an installed source the operation has passed its backup (status
+    backup-verified): the deployment is quiesced, so abandon refuses, and resume
+    continues from backup-verified WITHOUT this storage check (that phase's
+    pipeline skips it); a changed storage block is refused by compatibility.
+    The first-install hints (abandon, install again, "runs again on resume")
+    would send that operator into two refusals and a false expectation. The
+    discriminator is the operation's recorded status, which every caller
+    writes before this check runs -- not a file some resume paths never read."""
+    result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED, status="backup-verified")
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert hint.startswith("HINT: resume --operation") and "install again" not in hint and "abandon" not in hint
-    assert "repair --operation" in hint, "for an installed source a changed registry value goes through repair"
-    result, _ = _run_never_ran(tmp_path / "s", status_json=UNSCHEDULABLE, installed=True) if (tmp_path / "s").mkdir() is None else None
+    assert "repair --operation" in hint, "after the backup a changed registry value goes through repair"
+    assert "not repeated" in hint and "runs again on resume" not in message and "not repeated" in message
+    (tmp_path / "s").mkdir()
+    result, _ = _run_never_ran(tmp_path / "s", status_json=UNSCHEDULABLE, status="backup-verified")
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert hint.startswith("HINT: resume --operation") and "install again" not in hint and "abandon" not in hint
     assert "refused" in hint and "storage" in hint
+
+
+def test_a_first_install_is_told_the_check_runs_again_on_resume(tmp_path):
+    result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED, status="owned")
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "runs again on resume" in message
 
 
 def test_a_pod_the_scheduler_refused_is_not_reported_as_a_storage_failure(tmp_path):
@@ -251,7 +263,7 @@ def test_a_check_that_never_finished_names_the_wait_not_the_disk(tmp_path):
 
 
 def test_a_check_whose_pod_succeeded_passed_even_when_its_log_could_not_be_read(tmp_path):
-    """The misattribution pass: the Pod ran to an end (Succeeded:
+    """Measured: the Pod ran to an end (Succeeded:
     the check's own asserts all held, its exit was 0) but `kubectl logs` failed
     (pods/log is not in the preflight's permission list). The run first ended
     with the storage verdict, then with "tested but not judged" -- but the

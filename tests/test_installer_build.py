@@ -449,7 +449,7 @@ def test_a_qualification_build_is_not_held_to_the_pin_images(release, tmp_path, 
     assert output.exists()
 
 
-# --- The misattribution pass: a verifier that cannot run is not a forged release ----
+# --- Measured: a verifier that cannot run is not a forged release ----
 
 def _verify_shell(output, descriptor, signature, public, *, env=None):
     shell = ["bash", str(ROOT / "ops/installer/verify-release.sh"), str(output), str(descriptor), str(signature), str(public)]

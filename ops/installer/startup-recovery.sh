@@ -316,7 +316,7 @@ startup_proof_run() {
  if (( rc != 0 )); then
    # The receipt the refusal names must outlive the working directory, which
    # is removed at exit; and exit 78 is the helpers' lock code, not a failed
-   # inventory (the misattribution pass).
+   # inventory.
    local receipt="$STATE_DIR/startup-source-$OPERATION/proof-private.log"
    mkdir -p "$STATE_DIR/startup-source-$OPERATION"; cp "$private" "$receipt" 2>/dev/null || : > "$receipt"; chmod 600 "$receipt"
    if (( rc == 78 )); then fail "source inventory proof did not run: another verifier, restore or source proof holds the lock (exit 78); wait, then resume"; fi

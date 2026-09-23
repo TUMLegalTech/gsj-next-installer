@@ -539,7 +539,7 @@ def test_proof_pod_retry_preserves_raw_quantity_intent_and_same_uid(pods):
     assert sum(a[0]=='create' for a in state['calls'])==1
 
 
-# --- The misattribution pass: a fingerprint that could not be read is not "credentials changed" ----
+# --- Measured: a fingerprint that could not be read is not "credentials changed" ----
 
 def test_a_fingerprint_over_a_partial_snapshot_is_a_failure_not_a_digest(shell):
     """backup_credential_fingerprint runs inside $(...), where bash does not
@@ -589,7 +589,8 @@ startup_proof_run "$GSJ_WORK/result.json" bash -c 'echo receipt-words >&2; exit 
     assert receipt.is_file() and 'receipt-words' in receipt.read_text()
 
 
-def test_a_kubectl_that_fails_inside_backup_resources_is_a_failure_in_every_caller(shell):
+@pytest.mark.parametrize("failing", ["get configmaps,services,ingresses,serviceaccounts,roles,rolebindings,deployments,networkpolicies", "get secrets", "get Secret", "get pvc", "get pv"])
+def test_a_kubectl_that_fails_inside_backup_resources_is_a_failure_in_every_caller(shell, failing):
     """The fingerprint is called inside $(...) from an if, from an || list and
     plainly. bash 4.4+ ignores set -e inside such a substitution, and a
     function called in an || list runs with errexit ignored on every bash, so
@@ -605,7 +606,7 @@ def test_a_kubectl_that_fails_inside_backup_resources_is_a_failure_in_every_call
     body = """RELEASE=gsj; NAMESPACE=legal
 resolve_file() { printf '%s' "$1"; }
 k() { case "$1 $2" in
-  "get configmaps,services,ingresses,serviceaccounts,roles,rolebindings,deployments,networkpolicies") echo 'The connection to the server was refused' >&2; return 1;;
+  "FAILING") echo 'The connection to the server was refused' >&2; return 1;;
   "get pvc") printf '{"metadata":{"uid":"u1"},"spec":{"volumeName":"v1"}}';;
   "get pv") printf '{"spec":{"claimRef":{"namespace":"legal","uid":"u1"}}}';;
   *) printf '{"items":[]}';; esac; }
@@ -613,7 +614,7 @@ if out=$(backup_credential_fingerprint); then echo "IF:DIGEST:$out"; else echo "
 out=''; out=$(backup_credential_fingerprint) || echo "OR:FAILED:${out:-empty}"; [ -z "$out" ] || echo "OR:DIGEST:$out"
 ( set +e; out=''; out=$(backup_credential_fingerprint); rc=$?; echo "PLAIN:rc=$rc:${out:-empty}" )
 """
-    result = shell["run"](body)
+    result = shell["run"](body.replace("FAILING", failing))
     assert result.returncode == 0, result.stderr
     assert "DIGEST" not in result.stdout, result.stdout
     assert "IF:FAILED:empty" in result.stdout and "OR:FAILED:empty" in result.stdout and "PLAIN:rc=1:empty" in result.stdout, result.stdout
