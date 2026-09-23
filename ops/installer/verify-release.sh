@@ -5,6 +5,10 @@ set -euo pipefail
 installer=$1 descriptor=$2 signature=$3 public=$4
 fail() { printf 'Release verification failed: %s\n' "$*" >&2; exit 1; }
 for file in "$installer" "$descriptor" "$signature" "$public"; do [[ -f $file ]] || fail 'Required input is not a regular file.'; done
+# What could not be checked is never reported as a forged release: a missing
+# openssl, or a public key file openssl cannot read, are named as themselves.
+command -v openssl >/dev/null 2>&1 || fail 'openssl is required and was not found on PATH; nothing was verified.'
+openssl pkey -pubin -in "$public" -noout >/dev/null 2>&1 || fail 'Trusted public key is not a readable PEM public key; nothing was verified.'
 openssl dgst -sha256 -verify "$public" -signature "$signature" "$descriptor" >/dev/null 2>&1 || fail 'Descriptor signature is invalid.'
 # The builder signs this canonical descriptor shape. Parse only after signature verification.
 [[ $(sed -n 's/^  "schema": "\([^"]*\)",*$/\1/p' "$descriptor") == gsj.installer-descriptor/1 ]] || fail 'Unsupported descriptor schema.'

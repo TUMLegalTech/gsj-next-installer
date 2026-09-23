@@ -447,3 +447,54 @@ def test_a_qualification_build_is_not_held_to_the_pin_images(release, tmp_path, 
     status, err = _main(monkeypatch, capsys, "--manifest", manifest, "--output", output)
     assert status == 0, err
     assert output.exists()
+
+
+# --- The misattribution pass: a verifier that cannot run is not a forged release ----
+
+def _verify_shell(output, descriptor, signature, public, *, env=None):
+    shell = ["bash", str(ROOT / "ops/installer/verify-release.sh"), str(output), str(descriptor), str(signature), str(public)]
+    return subprocess.run(shell, capture_output=True, text=True, env=env)
+
+
+def _signed(release, tmp_path, keypair):
+    manifest, _ = release
+    output, descriptor, signature = (tmp_path / name for name in ("installer.sh", "descriptor.json", "signature.sig"))
+    assert run("--manifest", manifest, "--output", output).returncode == 0
+    assert run("sign", "--manifest", manifest, "--installer", output, "--private-key", keypair[0], "--descriptor", descriptor, "--signature", signature).returncode == 0
+    return output, descriptor, signature
+
+
+def test_a_missing_openssl_is_named_and_never_called_an_invalid_signature(release, tmp_path, keypair):
+    """`openssl … || fail 'Descriptor signature is invalid.'` told a customer
+    whose machine lacks openssl that the release was forged."""
+    output, descriptor, signature = _signed(release, tmp_path, keypair)
+    bare = tmp_path / "bare-bin"; bare.mkdir()
+    for tool in ("bash", "sed", "cut", "printf", "sha256sum", "shasum"):
+        found = shutil.which(tool)
+        if found:
+            (bare / tool).symlink_to(found)
+    result = _verify_shell(output, descriptor, signature, keypair[1], env={"PATH": str(bare)})
+    assert result.returncode == 1
+    assert "Descriptor signature is invalid" not in result.stderr
+    assert "openssl" in result.stderr
+
+
+def test_an_unreadable_public_key_is_named_and_never_called_an_invalid_signature(release, tmp_path, keypair):
+    output, descriptor, signature = _signed(release, tmp_path, keypair)
+    bad = tmp_path / "not-a-key.pem"; bad.write_text("this is not a PEM public key\n")
+    result = _verify_shell(output, descriptor, signature, bad)
+    assert result.returncode == 1
+    assert "Descriptor signature is invalid" not in result.stderr
+    assert "public key" in result.stderr.lower()
+
+
+def test_a_wrong_key_and_a_tampered_descriptor_are_still_refused(release, tmp_path, keypair):
+    output, descriptor, signature = _signed(release, tmp_path, keypair)
+    other = tmp_path / "other.pem"
+    subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(tmp_path / "other-private.pem")], check=True, capture_output=True)
+    subprocess.run(["openssl", "pkey", "-in", str(tmp_path / "other-private.pem"), "-pubout", "-out", str(other)], check=True, capture_output=True)
+    result = _verify_shell(output, descriptor, signature, other)
+    assert result.returncode == 1 and "Descriptor signature is invalid" in result.stderr
+    descriptor.write_bytes(descriptor.read_bytes() + b"\n")
+    result = _verify_shell(output, descriptor, signature, keypair[1])
+    assert result.returncode == 1 and "Descriptor signature is invalid" in result.stderr
