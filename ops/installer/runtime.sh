@@ -334,10 +334,24 @@ private_file() {
  (( (8#$mode & 077) == 0 )) || fail "protected input must have mode 0600 or 0400: $1"
 }
 resolve_file() { [[ $1 == /* ]] && printf '%s\n' "$1" || printf '%s/%s\n' "$SITE_DIR" "$1"; }
+validate_site() {
+ # The operator's file merged over the release's defaults, through the schema.
+ # A refusal used to surface as jq's own line (`jq: error (at <stdin>:N):
+ # site.operator.login: invalid format`, exit 5): not a named refusal, and
+ # without the format that was expected. It is now a GSJ refusal naming the
+ # field, the expected shape where the schema states one, and the file to
+ # correct -- never jq's framing, never the file's contents.
+ local words
+ if ! jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE" 2> "$GSJ_WORK/validate.err"; then
+   words=$(sed -n 's/^jq: error (at [^)]*): //p' "$GSJ_WORK/validate.err" | head -1)
+   [[ -n $words ]] || words=$(tr '\n' ' ' < "$GSJ_WORK/validate.err" | cut -c1-300)
+   fail "the site file was refused: $words. Correct it in $CONFIG; the effective site is that file merged over the release's defaults, and the payload's site.schema.json is the field reference"
+ fi
+}
 load_site() {
  [[ -f $CONFIG ]] || fail 'configuration file is missing; use --interactive'
  SITE_DIR=$(cd "$(dirname "$CONFIG")" && pwd); CONFIG="$SITE_DIR/$(basename "$CONFIG")"; SITE="$GSJ_WORK/site.json"
- jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE"
+ validate_site
  CONTEXT=$(j .target.context); NAMESPACE=$(j .target.namespace); RELEASE=$(j .target.release)
  [[ -z $CONTEXT_ARG || $CONTEXT_ARG == "$CONTEXT" ]] || fail '--context differs from site target'
  kubectl config get-contexts "$CONTEXT" -o name | jq -Rse 'length>1' >/dev/null || fail 'target Kubernetes context is unavailable'
@@ -356,7 +370,7 @@ load_site() {
      # rewrite during the operation would break its named resume.
      [[ -f $CONFIG && ! -L $CONFIG ]] || fail 'the saved site must be a regular file to record the managed local CA path'
      jq --arg ca "$STATE_DIR/tls/ca.crt" '.tls.ca_file=$ca | .verification.ca_file=$ca' "$CONFIG" | atomic "$CONFIG"
-     jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE"
+     validate_site
    fi
  fi
  OP_PASSWORD=$(resolve_file "$(j .operator.password_file)"); if [[ $COMMAND != restore || -f $OP_PASSWORD ]]; then private_file "$OP_PASSWORD"; [[ -s $OP_PASSWORD ]] || fail 'operator password is empty'; fi

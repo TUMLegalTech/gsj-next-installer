@@ -1968,3 +1968,32 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
     assert "Until an LLM endpoint is set" in line and "Einstellungen" in line and "llm.base_url and llm.model" in line
     assert "Until an OCR endpoint is set" in line and "ocr.url and ocr.model" in line
     assert "ocr_http_status" not in summary["verification"]
+
+
+def test_a_refused_site_value_is_a_named_refusal_that_states_the_expected_format(runtime, tmp_path):
+    """The misattribution pass: a site value the schema refuses surfaced as jq's own error
+    line (`jq: error (at <stdin>:170): site.operator.login: invalid format`) --
+    not a `GSJ:` refusal, and without the format that was expected, so the
+    operator learned only that a value was wrong, not how. Measured on the
+    published release with an operator login carrying an underscore."""
+    run, _, _ = runtime
+    payload = tmp_path / "load-payload"
+    payload.mkdir()
+    for name in ("defaults.json", "site.schema.json", "validate.jq", "compile.jq"):
+        shutil.copyfile(INSTALLER / name, payload / name)
+    (payload / "release.json").write_text(json.dumps(_release()))
+    site = _site()
+    site["operator"]["login"] = "gsj_admin"
+    config = tmp_path / "site.json"
+    config.write_text(json.dumps(site))
+    for name in ("operator-password", "backup-passphrase"):
+        path = tmp_path / name
+        path.write_text("secret")
+        path.chmod(0o600)
+    result = run(f'GSJ_PAYLOAD="{payload}"; CONFIG="{config}"; CONTEXT_ARG=""; load_site\n')
+    assert result.returncode == 1
+    lines = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")]
+    assert len(lines) == 1, result.stderr
+    assert "site.operator.login: invalid format" in lines[0]
+    assert "expected" in lines[0] and "letters, digits and dashes" in lines[0]
+    assert "jq: error" not in result.stderr

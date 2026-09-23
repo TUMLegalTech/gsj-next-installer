@@ -56,6 +56,7 @@
           "type": "string",
           "x-ownership": "site-supplied",
           "pattern": "^[a-z][a-z0-9-]{0,47}$",
+          "x-format-hint": "a lowercase name of letters, digits and dashes, 1 to 48 characters, starting with a letter (an underscore is refused)",
           "default": "operator"
         },
         "password_file": {
