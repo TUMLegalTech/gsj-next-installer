@@ -129,7 +129,7 @@ def test_a_named_claim_makes_no_temporary_claim_and_touches_no_volume(tmp_path):
 # The operator would go and look at the disk. The storage backend was never
 # tested; the message must say what the Pod reported instead.
 
-def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending", json_read_fails=False, pull_secret=None):
+def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending", json_read_fails=False, pull_secret=None, installed=False):
     source = (ROOT / "ops/installer/runtime.sh").read_text().split("# ENTRY POINT", 1)[0]
     source = source.replace("@CLIENT_TABLE@", "gsj_client_info() { return 1; }")
     (tmp_path / "functions.sh").write_text(source)
@@ -138,6 +138,8 @@ def _run_never_ran(tmp_path, *, status_json, deleted=True, poll_phase="Pending",
                         "data": {"existing_claim": ""}}}
     if pull_secret:
         site["registry"] = {"pull_secret": pull_secret}
+    if installed:
+        (work / "installed.json").write_text(json.dumps({"status": "complete"}))
     (work / "site.json").write_text(json.dumps(site))
     (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": [pull_secret] if pull_secret else []}}))
     (state / "pod-status.json").write_text(json.dumps(status_json))
@@ -189,7 +191,7 @@ def test_an_image_the_node_cannot_pull_is_not_reported_as_a_storage_failure(tmp_
     assert "was not tested" in message
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa"), "repair never runs the storage check; resume does"
-    # audit round 2: the site names no pull Secret, so the hint must not name one ("the pull Secret null")
+    # the site names no pull Secret, so the hint must not name one ("the pull Secret null")
     assert "null" not in hint and "deleted first" not in hint
     assert "repair --operation" not in hint, "repair applies a changed site without ever running this check"
     assert "abandon" in hint and "install again" in hint, "a changed site value cannot be resumed: a new operation from the corrected file"
@@ -202,13 +204,30 @@ def test_the_pull_hint_names_the_sites_pull_secret_when_there_is_one(tmp_path):
 
 
 def test_a_failed_pod_snapshot_keeps_the_phase_the_poll_saw(tmp_path):
-    """Audit round 2: when the final `-o json` read failed, the empty snapshot
+    """A later audit found: when the final `-o json` read failed, the empty snapshot
     overwrote the polled phase and a check last seen Running was reported as
     "never ran (unknown)" -- the misattribution the Running branch removes."""
     result, _ = _run_never_ran(tmp_path, status_json=STILL_RUNNING, poll_phase="Running", json_read_fails=True)
     assert result.returncode == 1
     message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
     assert "still running" in message and "unknown" not in message and "never ran" not in message
+    # the status file is empty on this path: the message says the status could not be read, never names the file
+    assert "could not be read" in message and "storage-check-pod.json" not in message
+
+
+def test_the_hints_for_an_installed_source_never_say_install_again(tmp_path):
+    """For an upgrade, or an install run again over a completed installation,
+    backup has quiesced the deployment and abandon refuses; a changed storage
+    block is refused by compatibility. The hints for a first install (abandon,
+    then install again) would send that operator into two refusals."""
+    result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED, installed=True)
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert hint.startswith("HINT: resume --operation") and "install again" not in hint and "abandon" not in hint
+    assert "repair --operation" in hint, "for an installed source a changed registry value goes through repair"
+    result, _ = _run_never_ran(tmp_path / "s", status_json=UNSCHEDULABLE, installed=True) if (tmp_path / "s").mkdir() is None else None
+    hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
+    assert hint.startswith("HINT: resume --operation") and "install again" not in hint and "abandon" not in hint
+    assert "refused" in hint and "storage" in hint
 
 
 def test_a_pod_the_scheduler_refused_is_not_reported_as_a_storage_failure(tmp_path):
@@ -220,7 +239,7 @@ def test_a_pod_the_scheduler_refused_is_not_reported_as_a_storage_failure(tmp_pa
     hint = [l for l in result.stderr.splitlines() if l.startswith("HINT:")][0]
     assert hint.startswith("HINT: resume --operation aaaaaaaaaaaaaaaaaaaaaaaa")
     assert "abandon --operation" in hint and "storage.node" in hint         # a changed node needs a new operation
-    assert "upgrade and repair refuse" not in hint, "audit round 2: repair does not refuse a changed storage block on a first install"
+    assert "upgrade and repair refuse" not in hint, "a later audit: repair does not refuse a changed storage block on a first install"
 
 
 def test_a_check_that_never_finished_names_the_wait_not_the_disk(tmp_path):
@@ -232,7 +251,7 @@ def test_a_check_that_never_finished_names_the_wait_not_the_disk(tmp_path):
 
 
 def test_a_check_whose_pod_succeeded_passed_even_when_its_log_could_not_be_read(tmp_path):
-    """The misattribution pass, audit round 2: the Pod ran to an end (Succeeded:
+    """The misattribution pass: the Pod ran to an end (Succeeded:
     the check's own asserts all held, its exit was 0) but `kubectl logs` failed
     (pods/log is not in the preflight's permission list). The run first ended
     with the storage verdict, then with "tested but not judged" -- but the
@@ -251,7 +270,7 @@ def test_a_check_whose_pod_succeeded_passed_even_when_its_log_could_not_be_read(
 
 
 def test_a_check_still_running_at_the_wait_is_named_for_that_not_for_the_pull(tmp_path):
-    """Audit round 1: a Pod in phase Running when the 300 s ran out was
+    """A later audit found: a Pod in phase Running when the 300 s ran out was
     blamed on the image pull or the claim binding, which had both finished."""
     result, _ = _run_never_ran(tmp_path, status_json=STILL_RUNNING, poll_phase="Running")
     assert result.returncode == 1
@@ -264,7 +283,7 @@ def test_a_check_still_running_at_the_wait_is_named_for_that_not_for_the_pull(tm
 
 
 def test_a_pod_that_never_ran_leaves_a_cleanup_note_that_never_says_did_not_pass(tmp_path):
-    """Audit round 1: when the cleanup refusal comes first, its note said "the
+    """A later audit found: when the cleanup refusal comes first, its note said "the
     storage check itself did not pass either" for a Pod that never ran."""
     result, _ = _run_never_ran(tmp_path, status_json=PULL_FAILED, deleted=False)
     assert result.returncode == 1

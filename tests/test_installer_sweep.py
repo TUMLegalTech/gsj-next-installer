@@ -82,15 +82,28 @@ def test_sweep_refuses_a_live_operation_and_touches_nothing(runtime, tmp_path):
     before = json.loads(state.read_text())["resources"]
     result = _sweep(run)
     assert result.returncode != 0
-    # The misattribution pass, audit round 1: the retained Lease of a DEAD run also reads "live" for 180 s; the
+    # The misattribution pass: the retained Lease of a DEAD run also reads "live" for 180 s; the
     # refusal states the age it measured and the wait, never "stop that tools process"
-    # audit round 2: a rerun of sweep would refuse again (a held Lease is abandon's to release), so the
+    # a rerun of sweep would refuse again (a held Lease is abandon's to release), so the
     # refusal names abandon, the age it measured and the wait abandon needs -- never "run the same command again"
-    assert "run abandon --operation" in result.stderr and "renewed" in result.stderr and "180 s" in result.stderr and "wait" in result.stderr
+    assert "run abandon --operation" in result.stderr and "renewed 5 s ago" in result.stderr and "180 s" in result.stderr and "wait 175 s" in result.stderr
     assert "run the same command again" not in result.stderr and "stop that tools process" not in result.stderr
     assert json.loads(state.read_text())["resources"] == before
     assert not _records(work)
     assert json.loads((work / "operation.json").read_text())["status"] == "initializing"
+
+
+def test_sweep_says_a_renewal_ahead_of_this_clock_as_that_and_waits_for_it(runtime, tmp_path):
+    run, state, work = runtime
+    _dead_target(state, work, tmp_path, lease=_lease(OP, -40))
+    before = json.loads(state.read_text())["resources"]
+    result = _sweep(run)
+    assert result.returncode != 0
+    assert "-40" not in result.stderr and "renewed 0 s" not in result.stderr
+    # the fake renewal time is 40 s ahead when written; a second may pass before the runtime reads it
+    assert re.search(r"ahead of this clock by (39|40) s", result.stderr) and re.search(r"wait (219|220) s", result.stderr), result.stderr
+    assert "run abandon --operation" in result.stderr
+    assert json.loads(state.read_text())["resources"] == before and not _records(work)
 
 
 def test_sweep_refuses_a_stale_held_lease_and_names_abandon(runtime, tmp_path):
@@ -234,7 +247,7 @@ def test_a_namespace_that_could_not_be_read_is_not_taken_for_absent(runtime, tmp
 
 
 def test_a_removed_namespace_is_absent_not_unreadable_and_still_sweeps_the_host_residue(runtime, tmp_path):
-    """Audit round 2 (a guard): the fake modelled only the unreadable side of
+    """A later audit (a guard): the fake modelled only the unreadable side of
     the absent/unreadable split. A removed namespace answers nothing with
     --ignore-not-found: sweep must take that as absent -- no Lease, release or
     controller read -- and still clear the host-side residue with a record."""

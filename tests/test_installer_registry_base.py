@@ -332,9 +332,11 @@ def test_a_registry_that_does_not_hold_the_digest_is_refused_in_the_kubelet_s_ow
         "true on every chain; 'nothing was applied' was false on a repair of a quiesced deployment")
     assert (work / "deletes").exists(), "the probe Pod is removed on refusal too"
     # The cure is a CHANGED site file. `resume` refuses a changed site by design, so
-    # naming it here (the default hint) would send the operator into a second refusal.
+    # naming it first (the default hint) would send the operator into a second refusal;
+    # and on a FIRST install a repair would complete it without the storage check, so the
+    # route is abandon and install again from the corrected file.
     hint = result.stderr.rsplit("HINT=", 1)[1]
-    assert hint.startswith("repair --operation aaaaaaaaaaaabbbbbbbbbbbb --config ")
+    assert hint.startswith("abandon --operation aaaaaaaaaaaabbbbbbbbbbbb")
     assert "180 s" in hint, "measured on the pilot host: a repair 110 s after the stop was refused as 'still live'"
 
 
@@ -515,19 +517,39 @@ def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_pa
     assert "node's side" in result.stderr
     assert "trust" in result.stderr and "DNS" in result.stderr and "rate limit" in result.stderr
     assert "resume --operation" in result.stderr
-    # audit round 2: the closing hint (what cleanup_exit prints) named repair alone -- a site change --
+    # the closing hint (what cleanup_exit prints) named repair alone -- a site change --
     # for a failure the probe cannot tell from a node-side one; it now names both routes
     hint = result.stderr.rsplit("HINT=", 1)[1]
-    assert "repair --operation" in hint and "resume --operation" in hint and "node" in hint
-    assert "correct the node" not in hint
+    # a FIRST install (no installed record): a repair would complete it without the storage check, so a changed
+    # site value means abandon and install again; a node that cannot pull means resume
+    assert "abandon --operation" in hint and "install again" in hint and "resume --operation" in hint and "node" in hint
+    assert "repair --operation" not in hint and "correct the node" not in hint
 
 
-def test_a_sustained_pull_failure_during_a_restore_names_restore_repair(runtime, tmp_path):
-    """Audit round 2: resume refuses a restore stopped in restoring-resources
-    ("use restore-repair"); the node-side sentence sent the operator to resume."""
+def test_a_sustained_pull_failure_on_an_installed_source_names_repair_and_resume(runtime, tmp_path):
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
-    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": "restoring-resources"}))
+    (work / "installed.json").write_text(json.dumps({"status": "complete"}))
+    _, result = _probe(run, work, tmp_path)
+    assert result.returncode != 0
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert "repair --operation" in hint and "resume --operation" in hint
+    assert "abandon" not in hint and "install again" not in hint
+
+
+@pytest.mark.parametrize("status, verb, absent", [
+    ("restoring-resources", "restore-repair --operation", ("resume --operation", " repair --operation")),     # resume refuses this phase
+    ("restore-files-verified", "resume --operation", ("restore-repair", "resume refuses")),                    # resume accepts it
+    ("applying", "repair --operation", ("restore-repair", "resume --operation")),                             # the repair path
+])
+def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_accepts(runtime, tmp_path, status, verb, absent):
+    """resume refuses a restore stopped in restoring-resources ("use
+    restore-repair"), accepts restore-files-verified, and the repair path
+    (applying) is repair's; a restore keeps its site byte for byte, so a
+    changed registry.base or registry.pull_secret cannot continue it."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": status}))
     release = _public_release()
     payload = _payload(tmp_path, release)
     site = _site(); site["registry"].update(base=BASE, pull_secret="corp-pull")
@@ -535,5 +557,8 @@ def test_a_sustained_pull_failure_during_a_restore_names_restore_repair(runtime,
     (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
     result = run(PROBE_PRELUDE.format(payload=payload) + 'STATE_DIR="$TEST_WORK"; relocated_images_probe')
     assert result.returncode != 0
-    assert "restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb" in result.stderr
-    assert "resume --operation" not in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith(verb + " aaaaaaaaaaaabbbbbbbbbbbb"), hint
+    for w in absent: assert w not in hint, (w, hint)
+    assert "cannot continue this restore" in hint and "registry.base" in hint
+    assert "after correcting registry.base" not in hint

@@ -1956,15 +1956,16 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
         {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}])
     assert "with a model list" in line and "reachable from the Pods" in line and "ending in /v1" in line
-    # audit round 2: "the agent cannot answer" is not established (a gateway without /models answers turns; a per-case LLM may serve)
+    # "the agent cannot answer" is not established (a gateway without /models answers turns; a per-case LLM may serve)
     assert "the agent cannot answer" not in line and "the two agent checks stay skipped" in line
     assert "the configured one answered the acceptance probe without the text of the test page, so scanned pages would be stored as whatever it answers" in line
     assert "vision-capable endpoint" in line and "scanned pages are not read" not in line
     assert "Until the endpoints are set" not in line and "Set ocr.url" not in line and "Einstellungen" not in line
     # the OCR refusal's advice by status: 404 names the model too; 500 names a text-only model; 5xx gateways say nothing answered; 429 is a rate limit
     for status, words, absent in ((404, ("chat-completions route", "names a model the endpoint serves"), ("credential",)),
-                                  (500, ("text-only model", "vision-capable"), ("busy",)),
-                                  (503, ("busy or starting", "try again"), ("text-only",)),
+                                  (500, ("text-only model", "vision-capable", "server itself"), ("busy",)),
+                                  (503, ("could not serve the request", "busy or starting", "try again"), ("text-only", "nothing behind")),
+                                  (505, ("check the endpoint itself", "error"), ("credential", "text-only")),
                                   (429, ("rate-limited",), ("credential",))):
         line, _ = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
             {"name": "operator-login", "status": "passed"},
@@ -2007,8 +2008,9 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-absent"},
         {"name": "generated-document", "status": "skipped", "reason": "llm-absent"}])
     assert "Until an LLM endpoint is set, the two agent checks stay skipped" in line and "llm.base_url and llm.model" in line
-    # audit round 2: an LLM chosen per case under Einstellungen serves that case but never closes the acceptance, which probes the site's endpoint
+    # an LLM chosen per case under Einstellungen serves that case but never closes the acceptance, which probes the site's endpoint
     assert "an LLM chosen per case under Einstellungen serves that case" in line and "the acceptance probes only the site" in line
+    assert "the site sets no LLM endpoint" in line and "the agent has no endpoint" not in line
     assert "Until an OCR endpoint is set, the scanned-page check stays skipped" in line and "ocr.url and ocr.model" in line
     assert "the agent cannot answer" not in line
     assert "ocr_http_status" not in summary["verification"]
@@ -2018,7 +2020,7 @@ def test_the_operator_guide_shows_the_closing_line_the_runtime_prints(runtime):
     """The guide's example of a PARTIAL closing line is the runtime's own
     sentence for its reasons (an LLM that did not answer with a model list, an
     absent OCR endpoint), compared from the counts to the summary path -- an
-    example edited by hand drifts (audit round 1 found one mid-sentence)."""
+    example edited by hand drifts (a later audit found one mid-sentence)."""
     guide = (INSTALLER / "OPERATOR.md").read_text()
     example = [l for l in guide.splitlines() if "GSJ installation complete, verification PARTIAL" in l and l.startswith("[")][0]
     names = re.findall(r"`([a-z-]+)`", guide.split("The\nfifteen application checks, in the order they run:", 1)[1])[:15]
@@ -2079,7 +2081,7 @@ def test_every_still_live_refusal_states_the_lease_age_and_the_wait():
 
 
 def test_a_site_file_that_is_not_json_is_refused_as_that_with_its_own_line_numbers(runtime, tmp_path):
-    """Audit round 2: the merge stage's failure surfaced through the capture as
+    """A later audit found: the merge stage's failure surfaced through the capture as
     "the site file was refused: parse error … at line N" where N counted from
     the release's defaults, which precede the operator's file in the merged
     stream. The site file is now parsed alone first, so jq's line numbers are
@@ -2102,7 +2104,7 @@ def test_a_site_file_that_is_not_json_is_refused_as_that_with_its_own_line_numbe
 @pytest.mark.parametrize("path", ["target.namespace", "target.release", "operator.login", "operator.secret",
                                   "ingress.class", "ingress.namespace", "tls.secret"])
 def test_the_seven_name_fields_refuse_a_trailing_newline_and_state_the_format(path):
-    """Audit round 1 found operator.login's pattern admitted "gsj-admin\\n" (`$`
+    """a later audit found operator.login's pattern admitted "gsj-admin\\n" (`$`
     matches before a final newline in Oniguruma); the lookahead closes that
     for every name-shaped field, and each states the format it expects."""
     site = _site()
@@ -2123,10 +2125,12 @@ def test_lease_still_live_states_the_measured_age_and_the_remaining_wait(runtime
     assert "renewed 42 s ago" in line and "wait 138 s" in line and "run the same command again" in line
     assert "if one is running, stop it first" in line and "abandon takes the Lease only after that" in line
     assert "stop that tools process" not in line
-    # audit round 2: a renewal time ahead of this host's clock (skew) is not a negative age and not a 220 s wait
+    # a renewal time ahead of this host's clock is said as that, not as a negative age -- and this host's own
+    # admission check measures the age against its own clock, so the wait it needs is 180 s plus the skew
     result = run('lease_still_live "the previous installer" -40\n')
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
-    assert "-40" not in line and "ahead of this clock" in line and "wait 180 s" in line
+    assert "-40" not in line and "renewed 0 s" not in line
+    assert "ahead of this clock by 40 s" in line and "wait 220 s" in line
 
 
 def test_no_still_live_site_appends_a_stop_it_clause(runtime):
@@ -2138,7 +2142,7 @@ def test_no_still_live_site_appends_a_stop_it_clause(runtime):
 
 
 def test_a_certificate_file_that_is_not_pem_is_refused_as_that(runtime, tmp_path):
-    """Audit round 1: the files TLS profile fed a non-PEM certificate to the
+    """A later audit found: the files TLS profile fed a non-PEM certificate to the
     host check, which reported a host mismatch for a file it could not read."""
     run, _, work = runtime
     crt = tmp_path / "not-a-certificate.pem"; crt.write_text("synthetic, not PEM\n")
@@ -2152,3 +2156,48 @@ def test_a_certificate_file_that_is_not_pem_is_refused_as_that(runtime, tmp_path
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
     assert "tls.certificate_file is not a readable PEM certificate" in line and "the host was not checked" in line
     assert "host mismatch" not in result.stderr
+
+
+def test_a_site_file_that_cannot_be_read_is_named_as_that_not_as_invalid_json(runtime, tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root reads every file")
+    run, _, _ = runtime
+    payload = tmp_path / "load-payload"; payload.mkdir()
+    for name in ("defaults.json", "site.schema.json", "validate.jq", "compile.jq"):
+        shutil.copyfile(INSTALLER / name, payload / name)
+    (payload / "release.json").write_text(json.dumps(_release()))
+    config = tmp_path / "site.json"; config.write_text(json.dumps(_site())); config.chmod(0)
+    try:
+        result = run(f'GSJ_PAYLOAD="{payload}"; CONFIG="{config}"; CONTEXT_ARG=""; load_site\n')
+    finally:
+        config.chmod(0o600)
+    assert result.returncode == 1
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "cannot be read" in line and str(config) in line and "not valid JSON" not in line
+
+
+def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path):
+    """jq accepts a UTF-8 BOM on its own input but the merged stream fails
+    at a line counted from the defaults; the mark is named up front."""
+    run, _, _ = runtime
+    payload = tmp_path / "load-payload"; payload.mkdir()
+    for name in ("defaults.json", "site.schema.json", "validate.jq", "compile.jq"):
+        shutil.copyfile(INSTALLER / name, payload / name)
+    (payload / "release.json").write_text(json.dumps(_release()))
+    config = tmp_path / "site.json"; config.write_bytes(b"\xef\xbb\xbf" + json.dumps(_site()).encode())
+    result = run(f'GSJ_PAYLOAD="{payload}"; CONFIG="{config}"; CONTEXT_ARG=""; load_site\n')
+    assert result.returncode == 1
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert "byte-order mark" in line and str(config) in line
+
+
+def test_the_public_tree_carries_no_internal_review_labels():
+    """The installer repository is public and runtime.sh is the header of the
+    shipped installer: a reader there cannot resolve a review round or a
+    phase record by name."""
+    hits = []
+    for path in sorted(list((INSTALLER).glob("*.sh")) + list((INSTALLER).glob("*.md")) + list((INSTALLER.parent.parent / "tests").glob("*.py"))):
+        for n, l in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if re.search("audit" + " rounds?|FIX" + "-PASS", l, re.I):        # spelled apart: this line must not match itself
+                hits.append(f"{path.name}:{n}")
+    assert not hits, hits

@@ -587,3 +587,33 @@ startup_proof_run "$GSJ_WORK/result.json" bash -c 'echo receipt-words >&2; exit 
     assert 'did not complete (exit 3)' in result.stderr and 'receipt-words' not in result.stderr
     receipt = shell['state'] / f'startup-source-{OP}' / 'proof-private.log'
     assert receipt.is_file() and 'receipt-words' in receipt.read_text()
+
+
+def test_a_kubectl_that_fails_inside_backup_resources_is_a_failure_in_every_caller(shell):
+    """The fingerprint is called inside $(...) from an if, from an || list and
+    plainly. bash 4.4+ ignores set -e inside such a substitution, and a
+    function called in an || list runs with errexit ignored on every bash, so
+    backup_resources itself must check each kubectl: its last command is an
+    rm that always succeeds, and a kubectl that failed part-way used to leave
+    a partial snapshot that was digested all the same."""
+    installed = {"storage": [{"name": "a", "uid": "u1", "volume": "v1"}, {"name": "b", "uid": "u1", "volume": "v1"}, {"name": "c", "uid": "u1", "volume": "v1"}],
+                 "namespace_uid": "ns-uid",
+                 "site": {"operator": {"secret": "", "password_file": ""}, "tls": {"profile": "existing", "secret": "gsj-tls"}, "registry": {"pull_secret": "", "config_file": ""},
+                          "llm": {"credential": {"file": "", "secret": ""}}, "ocr": {"credential": {"file": "", "secret": ""}}, "trust": {"proxy_file": "", "ca_file": ""},
+                          "backup": {"passphrase_file": "", "auth_header_file": ""}, "delivery": {"auth_header_file": ""}}}
+    (shell["work"] / "installed.json").write_text(json.dumps(installed))
+    body = """RELEASE=gsj; NAMESPACE=legal
+resolve_file() { printf '%s' "$1"; }
+k() { case "$1 $2" in
+  "get configmaps,services,ingresses,serviceaccounts,roles,rolebindings,deployments,networkpolicies") echo 'The connection to the server was refused' >&2; return 1;;
+  "get pvc") printf '{"metadata":{"uid":"u1"},"spec":{"volumeName":"v1"}}';;
+  "get pv") printf '{"spec":{"claimRef":{"namespace":"legal","uid":"u1"}}}';;
+  *) printf '{"items":[]}';; esac; }
+if out=$(backup_credential_fingerprint); then echo "IF:DIGEST:$out"; else echo "IF:FAILED:${out:-empty}"; fi
+out=''; out=$(backup_credential_fingerprint) || echo "OR:FAILED:${out:-empty}"; [ -z "$out" ] || echo "OR:DIGEST:$out"
+( set +e; out=''; out=$(backup_credential_fingerprint); rc=$?; echo "PLAIN:rc=$rc:${out:-empty}" )
+"""
+    result = shell["run"](body)
+    assert result.returncode == 0, result.stderr
+    assert "DIGEST" not in result.stdout, result.stdout
+    assert "IF:FAILED:empty" in result.stdout and "OR:FAILED:empty" in result.stdout and "PLAIN:rc=1:empty" in result.stdout, result.stdout
