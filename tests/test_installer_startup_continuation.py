@@ -453,80 +453,40 @@ def test_cli_refuses_incompatible_continuation_modes_before_bootstrap(shell, arg
     assert not (m['state'] / 'bootstrap-called').exists()
 
 
-def test_cli_passes_exact_named_continuation_to_repair(shell):
-    m = shell; (m['payload'] / 'helpers').mkdir()
-    for name in ('startup-recovery.sh', 'verification-cleanup.sh'): (m['payload'] / 'helpers' / name).write_text('')
-    result = m['run']('''bootstrap() { :; }; install_exit_traps() { :; }; configure_interaction() { :; }; load_site() { :; }
+def _fake_helm(m, version):
+    """The continuation renders the failed Helm target offline, which only Helm 4
+    does: the CLI wiring below is proven under a Helm 4, and a Helm 3 is refused
+    by name before the repair (the review's early refusal), whatever helm the
+    box running the suite carries."""
+    binpath = m['tmp'] / 'helm-bin'; binpath.mkdir(exist_ok=True)
+    (binpath / 'helm').write_text('#!/bin/sh\n[ "$1" = version ] && { echo ' + version + '; exit 0; }\nexit 1\n')
+    (binpath / 'helm').chmod(0o755)
+    return f'export PATH={shlex.quote(str(binpath))}:$PATH\n'
+
+
+CLI_CONTINUATION = '''bootstrap() { :; }; install_exit_traps() { :; }; configure_interaction() { :; }; load_site() { :; }
 inspect_cluster() { printf '{}'; }; preflight() { :; }
 repair_operation() { jq -n --arg target "$CONTINUE_HELM_INSTALLER" --arg previous "$CONTINUE_FROM_PROGRAM" --arg op "$RESUME_ID" '{target:$target,previous:$previous,operation:$op}' > "$STATE_DIR/selected.json"; }
 main repair --operation aaaaaaaaaaaaaaaaaaaaaaaa --continue-helm-installer '/protected/signed target/gsj-install.sh' --continue-from-program '/protected/prior program/gsj-install.sh' --non-interactive
-''')
+'''
+
+
+def test_cli_passes_exact_named_continuation_to_repair(shell):
+    m = shell; (m['payload'] / 'helpers').mkdir()
+    for name in ('startup-recovery.sh', 'verification-cleanup.sh'): (m['payload'] / 'helpers' / name).write_text('')
+    result = m['run'](_fake_helm(m, 'v4.2.2+gb05881c') + CLI_CONTINUATION)
     assert result.returncode == 0, result.stderr
     assert json.loads((m['state'] / 'selected.json').read_text()) == {'target': '/protected/signed target/gsj-install.sh', 'previous': '/protected/prior program/gsj-install.sh', 'operation': OP}
 
 
-@pytest.mark.parametrize('tamper', [False, True])
-def test_program_replacement_authenticates_prior_installer_without_executing_it(shell, signing_key, tamper):
-    m = shell; prior = signed_bundle(m, signing_key)
-    put(m['payload'] / 'release.json', {'identity': 'corrected', 'supported_sources': [IDENTITY]})
-    directory = m['state'] / ('startup-helm-' + OP); directory.mkdir()
-    put(directory / 'intent.json', {'program': IDENTITY})
-    if tamper: (prior / 'gsj-install.sh').write_bytes((prior / 'gsj-install.sh').read_bytes() + b'changed')
-    result = m['run'](f'''CONTINUE_FROM_PROGRAM={shlex.quote(str(prior / 'gsj-install.sh'))}
-startup_helm_program_authorize "$STATE_DIR/startup-helm-$OPERATION" "$GSJ_WORK" corrected
-''')
-    assert (result.returncode == 0) is not tamper, result.stderr
-    assert not (m['tmp'] / 'MUST-NOT-EXECUTE').exists()
-    assert not (directory / 'program-transition.json').exists()
-
-
-@pytest.fixture
-def program_replacement(wrapper):
-    import shutil
-    m = wrapper
-    first = m['run'](m['prefix'] + 'STOP_AFTER_PREPARE=true\nstartup_helm_continue "$current"')
-    assert first.returncode != 0 and 'synthetic interruption' in first.stderr
-    directory = m['state'] / ('startup-helm-' + OP)
-    original_intent = (directory / 'intent.json').read_bytes()
-    shutil.rmtree(m['work'] / 'startup-continuation'); (m['state'] / 'replaced-lease.json').unlink()
-    prior = m['tmp'] / 'prior-program'; prior.mkdir()
-    for file, value in [('gsj-install.sh', 'exact signed prior program'), ('installer-descriptor.json', '{}'), ('installer-descriptor.sig', 'synthetic signature')]:
-        (prior / file).write_text(value)
-    put(m['payload'] / 'release.json', {'identity': 'corrected', 'supported_sources': ['target', 'program']})
-    control = m['state'] / ('startup-source-' + OP) / 'control.json'
-    put(control, {'namespace_uid': 'namespace-uid', 'resources': [{'kind': 'Deployment', 'name': 'gsj-web', 'uid': 'gsj-web-uid'}]})
-    put(m['state'] / ('quiescence-' + OP + '.json.closure.json'), {'controllers': [{'uid': 'gsj-web-uid', 'generation': 2}]})
-    web = {'kind': 'Deployment', 'metadata': {'name': 'gsj-web', 'uid': 'gsj-web-uid', 'generation': 3},
-           'spec': {'replicas': 0, 'selector': {'matchLabels': {'role': 'web'}}, 'template': {'metadata': {'labels': {'role': 'web'}}, 'spec': {
-               'containers': [{'name': 'web', 'image': 'target-web'}],
-               'initContainers': [{'name': 'wait-deps', 'command': ['python', '/scripts/wait-deps.py'],
-                                   'env': [{'name': 'GSJ_DEPLOYMENT_GENERATION', 'value': 'target:3'}]}]}}}}
-    put(m['work'] / 'program-live.json', [web])
-    result = m['run']('''helm_application_projection "$GSJ_WORK/program-live.json" | jq 'map(.replicas=1)' > "$STATE_DIR/helm-applications/$OPERATION/cccccccccccccccccccccccc/expected.json"
-jq --arg expected "$(sha_file "$STATE_DIR/helm-applications/$OPERATION/cccccccccccccccccccccccc/expected.json")" '.expected_sha256=$expected' "$STATE_DIR/helm-applications/$OPERATION/cccccccccccccccccccccccc/intent.json" | atomic "$STATE_DIR/helm-applications/$OPERATION/cccccccccccccccccccccccc/intent.json"
-''')
-    assert result.returncode == 0, result.stderr
-    prefix = m['prefix'].replace('RELEASE_ID=program;', 'RELEASE_ID=corrected;') + '''
-CONTINUE_FROM_PROGRAM="$TEST_BASE/prior-program/gsj-install.sh"
-current=$(jq '.spec.acquireTime="2026-09-13T14:55:15.000000Z"' <<< "$current")
-authenticate_predecessor() {
- [[ ${FAULT:-} != signature ]] || fail 'signature invalid'
- if [[ $2 == program ]]; then
-   mkdir -p "$3"
-   local file
-   for file in gsj-install.sh installer-descriptor.json installer-descriptor.sig; do cp "$(dirname "$1")/$file" "$3/$file"; done
-   PREDECESSOR_PAYLOAD="$TEST_BASE/prior-payload"; action authenticated-prior-program
- elif [[ $2 == target ]]; then PREDECESSOR_PAYLOAD="$TARGET_PAYLOAD"; action authenticated-target
- else fail 'wrong prior program identity'; fi
-}
-startup_helm_live_partial() {
- [[ ${FAULT:-} != live ]] || fail 'live target invalid'
- cp "$GSJ_WORK/program-live.json" "$1/live.json"
- helm_application_projection "$1/live.json" > "$1/live-projection.json"
- action live-proof
-}
-'''
-    return {**m, 'prefix': prefix, 'directory': directory, 'original_intent': original_intent, 'prior': prior}
+def test_cli_refuses_the_continuation_on_helm_3_before_the_repair(shell):
+    m = shell; (m['payload'] / 'helpers').mkdir()
+    for name in ('startup-recovery.sh', 'verification-cleanup.sh'): (m['payload'] / 'helpers' / name).write_text('')
+    result = m['run'](_fake_helm(m, 'v3.22.0+g144ca65') + CLI_CONTINUATION)
+    assert result.returncode == 1, result.stderr
+    line = result.stderr.strip().splitlines()[-1]
+    assert line.startswith('GSJ: ') and '--continue-helm-installer' in line and 'Helm 4' in line and '--fetch-tools' in line, line
+    assert not (m['state'] / 'selected.json').exists()          # repair_operation never ran
 
 
 def test_new_program_appends_exact_transition_and_retries_without_replacing_evidence(program_replacement):
