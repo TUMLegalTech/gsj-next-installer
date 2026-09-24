@@ -51,7 +51,9 @@ install and when you would find out.
   LibreSSL or an OpenSSL below the floor, are named with the tool, the floor
   and what was found; an `openssl` absent from the PATH altogether is refused
   by name alone, as a required utility. `--fetch-tools` downloads its own
-  pinned clients instead (it does not supply OpenSSL).
+  pinned clients instead (it does not supply OpenSSL). `init` is the one
+  command that does not stop at the first: it names them all at once, in its
+  report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible
   chat-completions route whose model can read an image. Step 0 of the guide
   has a probe you can run with `curl` and `jq` before you start, and the
@@ -71,6 +73,79 @@ install and when you would find out.
   directly, with the release; it never travels through this repository.
 - About 3.5 GB free on the machine you install from (the corpus vectors and
   their envelope), and the volume sizes in the guide on the cluster.
+
+## `init`: one file, one command, one report
+
+<!-- init: begin -->
+The shortest path onto a customer's box is one download and one command.
+Download `gsj-install.sh` alone from the release into an empty folder on the
+Linux machine you will install from, export `KUBECONFIG`, and run:
+
+```sh
+bash gsj-install.sh init
+```
+
+`init` fetches the rest of its own release — `verify-release.sh`,
+`release.pem`, `installer-descriptor.json` and `installer-descriptor.sig`,
+from the release directory the installer names, for its own version. Files
+already beside the installer (or, for the key and the verifier, in
+`$HOME/gsj-operator/trust/`, the guide's layout) are used and never
+overwritten; a file from another release — another version, another build
+of the same version, another key, a verifier that is not the one this
+release was published with — is refused by name and never replaced. A
+download is checked before it is kept: the key against the one the
+installer carries, the descriptor's version and build against the
+installer's own, the signature under the embedded key; only then are the
+four put beside the installer. Then the installer's own bytes are held to
+the signed descriptor (SHA-256 and length, under the embedded key), and the
+published verifier is run over the same files — a companion
+`verify-release.sh` is executed only when its bytes are the ones this
+release was published with.
+
+Then it checks the box, all at once, and writes every result as PASS, FAIL
+or UNKNOWN with the reason and the fix: every client against its floor —
+helm, kubectl (and its skew against the cluster), jq, OpenSSL, bash, curl,
+tar, gzip, base64, the SHA-256 tool — saying what to install and which of
+them `--fetch-tools` can supply for the other commands (never OpenSSL); the
+cluster its kubeconfig points at, named by its context, and its version
+against the floor; `github.com`, where the corpus release lives, and
+`ghcr.io`, where the images are, from this machine; the free disk the corpus
+download needs (about 3.5 GB on one filesystem, or 1.9 GB under `TMPDIR`
+and 1.7 GB under the cache when they are different filesystems), the OS,
+the architecture — and the nodes' architecture against the release's
+images, once `inspect` has run. It prepares `$HOME/gsj-operator/` with a
+private `credentials/` folder (created 0700, create-only, never through a
+symlink; a folder it did not make is refused unless it is a plain folder
+you own, and that refusal comes before anything is written anywhere), runs
+`inspect`, and writes **one report** —
+`$HOME/gsj-operator/gsj-init-report-<time>.json`: the verification result,
+every check, and the inspect profile — the one file to send back to TUM
+Legal Tech. It ends with a plain summary: what passed, what must be fixed
+before an install, and that file. It exits 0 when the release is verified
+and nothing failed, 3 when the report names something to fix (an unverified
+release included), 1 when it stopped on a named refusal (a failed
+verification, a companion file from another release, a working folder it
+refused, `--fetch-tools`).
+
+`init` is **read-only against your cluster**: its only reads are one
+`kubectl version` and `inspect`'s gets; it creates, changes and deletes
+nothing there — no namespace, no Lease, no Pod, no probe — so it is safe to
+run against a production cluster. It downloads only its own release's four
+files, only over HTTPS, and executes nothing it downloaded except the
+published verifier; it refuses `--fetch-tools`, which would download and
+run three clients. Without a network it still produces its report from what
+is on the box, and says what the no-egress route needs instead. A missing or
+LibreSSL `openssl`, or a machine without `sha256sum` or `shasum`, is refused
+by name before `init` runs, like before every other command: those are the
+tools `init` cannot report around.
+
+**The honest limit.** `init` proves that the installer arrived intact and
+matches its published descriptor. It cannot prove that the installer is
+genuine, because a modified installer could skip its own check. The
+separate verifier, run by hand **before** executing anything, is the
+stronger check and stays documented below; run it if that difference
+matters to you.
+<!-- init: end -->
 
 ## Releases: how they are named, what they contain, how to verify one
 
@@ -113,6 +188,15 @@ themselves. The key travels with the release, and the verification proves
 that the installer the customer holds is the one that was signed: a download
 that was cut short, altered or swapped is refused. There is no separate key
 channel, no fingerprint delivered out of band, and no key ceremony.
+
+<!-- init: begin -->
+`bash gsj-install.sh init` runs this same verifier for you — after fetching
+the four companion files of its own release and checking each one — and
+reports the result (see *`init`: one file, one command, how to verify one*
+above). That is the convenient check; the command above, run by hand before
+executing anything, is the stronger one: `init` runs from inside the file it
+verifies, and a modified installer could skip its own check.
+<!-- init: end -->
 
 **Releases are hand-run.** This repository's GitHub Actions run its tests on
 GitHub-hosted runners and hold no secret — and cannot run the whole suite,

@@ -444,6 +444,76 @@ by reading anything; step 4 proves it with a Pod, before step 5.
 
 ### Step 1 — check your machine and your cluster
 
+<!-- init: begin -->
+**One command covers steps 1, 2 and 5: `init`.** Download `gsj-install.sh`
+alone into an empty folder on the machine you will install from, export
+`KUBECONFIG` (or pass `--context NAME`), and run:
+
+```sh
+bash gsj-install.sh init
+```
+
+It fetches the four companion files of its own release — `verify-release.sh`,
+`release.pem`, `installer-descriptor.json`, `installer-descriptor.sig` —
+beside itself (files already there, or the key and the verifier in
+`$HOME/gsj-operator/trust/`, are used, never overwritten; one from another
+release is refused by name; a download is checked before it is kept), holds
+its own bytes to the signed descriptor under the key it carries, runs the
+published verifier (a companion `verify-release.sh` only when its bytes are
+this release's), checks every client below against its floor at once and
+says what to install, checks what it can reach (your cluster, named by its
+context; `github.com` for the corpus; `ghcr.io` for the images), checks the
+disk, the OS and the architecture, creates `$HOME/gsj-operator/` and
+`$HOME/gsj-operator/credentials/` (0700, create-only, refused by name before
+any write when something else is there), runs step 5's `inspect`, and writes
+one report, `$HOME/gsj-operator/gsj-init-report-<time>.json` — the file to
+send us. Its closing lines say what passed and what to fix; exit 0 is a
+verified release with nothing to fix, 3 a report with something to fix (an
+unverified release included), 1 a refusal it names. It is read-only against
+your cluster — one `kubectl version` and `inspect`'s gets — and it refuses
+`--fetch-tools`. Then continue at **step 3** with the files where `init` left
+them (`$INSTALLER` is the file you downloaded). What it checks, and what each
+row settles:
+
+<!-- init: checks -->
+| check | PASS means | FAIL or UNKNOWN means |
+|---|---|---|
+| `release-verification` | this file's SHA-256 and length match the descriptor signed for it, under the key it carries, and the published verifier agreed | UNKNOWN: a companion file could not be obtained — the row names the origin's answer or the missing file; the release is **not verified**, do not install from it. A file that fails a check is a refusal (exit 1), never a row |
+| `helm` | at or above the floor (3.13), version and path named | missing, no version, or below the floor; the fix names what to install and whether `--fetch-tools` (the other commands) can supply it |
+| `kubectl` | at or above the floor (1.24) | as for helm |
+| `jq` | at or above the floor (1.6) | as for helm |
+| `kubectl-skew` | the client is within one minor of the server | more than one minor apart; UNKNOWN when either version is unknown |
+| `openssl` | OpenSSL 3.0 or newer, named | never: a missing or LibreSSL `openssl` was refused before `init` ran |
+| `bash` | present, version named | never: refused before `init` ran |
+| `curl` | present, version named | never: refused before `init` ran |
+| `tar` | present | never: refused before `init` ran |
+| `gzip` | present | never: refused before `init` ran |
+| `base64` | present | never: refused before `init` ran |
+| `sha256` | `sha256sum` or `shasum` present | never: refused before `init` ran |
+| `cluster` | the context answered and its Kubernetes is 1.27 or newer | no context selected, no answer (unreachable, no such context, refused credentials, or a proxy without `no_proxy`), or below the floor; UNKNOWN when kubectl is missing |
+| `egress-github` | `github.com` answered from this machine | no answer: the corpus cannot be downloaded from here — a proxy, egress, or `corpus.vectors_path` |
+| `egress-ghcr` | `ghcr.io` answered from this machine (which says nothing about your nodes: step 4) | no answer: open the route, or `registry.base` |
+| `disk` | room for the corpus download: about 3.5 GB on the one filesystem holding the cache and `TMPDIR`, or 1.9 GB under `TMPDIR` and 1.7 GB under the cache on two | less than that; UNKNOWN when `df` could not measure it |
+| `os` | Linux | anything else |
+| `architecture` | linux/amd64 or linux/arm64 | never: refused before `init` ran |
+| `working-folder` | `$HOME/gsj-operator` created (mode 700) or an existing plain folder you own | never a row: a symlink, a file, another owner's folder or one writable by group or others is refused before anything is written |
+| `credentials-folder` | `$HOME/gsj-operator/credentials` created or existing at mode 700 | existing but readable by group or others — `chmod 700` it; a symlink or a file there is refused |
+| `inspect` | the cluster profile is in the report | UNKNOWN: not run (it needs kubectl and jq at their floors and a cluster that answered) or did not complete |
+| `node-architecture` | every node's architecture is one the release has images for | a node is not; UNKNOWN when there is no profile |
+<!-- /init: checks -->
+
+**What `init` does not answer:** the six questions of step 0. The profile in
+its report (`inspect`) shows your storage classes and ingress classes, which
+feed step 6; the model endpoints, a registry prefix, NetworkPolicy and the
+ingress timeout stay yours to settle before step 7, as step 0 says.
+
+**The honest limit:** `init` proves the installer arrived intact and matches
+its published descriptor; it cannot prove the installer is genuine, because a
+modified installer could skip its own check. Step 2, run by hand before
+executing anything, is the stronger check. The rest of this step is the
+manual route and the numbers behind it.
+<!-- init: end -->
+
 **Paste this guide's blocks into an interactive `bash`.** They are written for
 it and they carry `#` comments: a stock `zsh` does not treat `#` as a comment
 at the prompt — it hands the rest of the line to the command, quotes and
@@ -529,6 +599,16 @@ application's own outbound calls are two separate proxies, met in steps 4 and 7.
 → [Client tools and versions](#client-tools-and-versions) for the floors.
 
 ### Step 2 — verify the release you were given
+
+<!-- init: begin -->
+**If you ran `init`**, the four companion files are already beside the
+executable, checked, and the report's `verification.status` says whether the
+release verified. Running the block below by hand, before you execute
+anything, is the stronger check — `init` runs from inside the installer it
+verifies, so a modified installer could skip its own check; the verifier
+cannot be skipped by the file it checks. Do it when that difference matters
+to you; the files `init` fetched are exactly the ones it takes.
+<!-- init: end -->
 
 You were handed a release — its page, or the five files from it: the
 executable, `installer-descriptor.json`, its `.sig`, the release key
@@ -807,6 +887,13 @@ pull will do.
 
 `inspect` writes nothing, takes no Lease, reads no site file, and is safe
 against production.
+
+<!-- init: begin -->
+**If you ran `init`**, this step is done: its report carries the same
+profile under `inspect`, and `jq '.inspect | {…}'` over
+`"$HOME"/gsj-operator/gsj-init-report-*.json` answers the same seven rows.
+Run `inspect` again by hand after any change to the cluster.
+<!-- init: end -->
 
 ```sh
 export KUBECONFIG=/path/to/kubeconfig
@@ -1246,6 +1333,15 @@ bash "$HOME/gsj-operator/trust/verify-release.sh" \
 chmod 500 "$(jq -r .installer.name installer-descriptor.json)"
 ```
 
+<!-- init: begin -->
+`bash gsj-install.sh init`, run from a folder holding only the executable,
+fetches those four files for you (it finds a key and verifier already in
+`trust/`), verifies, and writes the one report to send back (step 1 of the
+walk-through says what it checks). The block above, by hand, stays the
+stronger check: `init` cannot prove the installer is genuine, because a
+modified installer could skip its own check.
+<!-- init: end -->
+
 **2. The executable's name is whatever the descriptor says.** Every example in
 this guide writes `gsj-install.sh`; substitute
 `jq -r .installer.name installer-descriptor.json`. Nothing else changes. Where
@@ -1331,6 +1427,15 @@ or re-run with --fetch-tools to download this release's pinned clients for
 this run only.
 ```
 
+<!-- init: begin -->
+`init` has one more: `3` is a report written with something to fix — at
+least one FAIL row, or a release that could not be verified — and the
+closing lines list it and name the file. Its `0` is a verified release with
+nothing to fix, and its `1` the ordinary named refusal (a failed
+verification, a companion file from another release, a working folder it
+refused, `--fetch-tools`), with no report written.
+<!-- init: end -->
+
 | client | floor | why that number |
 |---|---|---|
 | `helm` | **3.13** | Two things meet here, and the higher one is the floor. The add-on step passes `--labels gsj.io/addon-owner=…` — the ownership label the add-on repair and rollback paths fence on — and `--labels` does not exist before Helm 3.13 (3.12 answers `unknown flag: --labels`). Separately, the chart declares `kubeVersion: ">=1.27.0-0"`, and the installer renders it with `helm template`, which checks that against Helm's own built-in default Kubernetes version rather than your server's: Helm 3.11 defaults to 1.26 and refuses the chart, 3.12 defaults to 1.27 and renders it. Helm 3.12 through 3.22 and Helm 4 render this chart identically. |
@@ -1363,7 +1468,7 @@ which only Helm 4 can do (found helm 3.22.0 at /usr/local/bin/helm). Install
 Helm 4 alongside, or re-run this command with --fetch-tools …`); nothing has
 been written when they do.
 
-**`--fetch-tools`** — accepted by every command — restores the old behaviour:
+**`--fetch-tools`** — accepted by every command but `init` — restores the old behaviour:
 the installer downloads this release's own checksum-pinned Helm, kubectl and jq
 into a private directory for that run and uses those instead. Use it on a box
 whose clients are too old to upgrade, on an air-gapped host that already has
@@ -3614,6 +3719,16 @@ from a fixed list, so quote it verbatim when you report it.
 exactly four arguments), `1` is a release that **failed verification** — do not
 run that installer.
 
+<!-- init: begin -->
+`init` is the exception to "refuses at the first one": it checks all three
+clients, OpenSSL, bash, curl, tar, gzip, base64 and the SHA-256 tool in one
+run and names every one that is missing or too old, with its floor and what
+was found, and which of them `--fetch-tools` can supply for the other
+commands. A missing or LibreSSL `openssl`, and a machine with neither
+`sha256sum` nor `shasum`, are still refused before `init` runs; and `init`
+itself refuses `--fetch-tools`, which would download and run three clients.
+<!-- init: end -->
+
 ### 2. `command terminated with exit code N` inside the log
 
 These are not the installer's own status. They are `kubectl exec` reporting how
@@ -3843,6 +3958,14 @@ downloads. An authenticated origin must serve these bytes directly without
 redirects. Never replace bytes behind an already distributed signed version.
 Also distribute the public manifest, release verification utility and trusted
 key through the documented channels.
+
+<!-- init: begin -->
+`init` fetches `release.pem` and `verify-release.sh` from the same
+`BASE/EXACT_VERSION/` directory, for its own version; this line's releases
+attach both there, on the release page. An origin that does not serve them
+leaves `init`'s verification UNKNOWN, naming the file, and the customer puts
+the two beside the installer by hand.
+<!-- init: end -->
 
 Credential-free public GitHub download URLs can work with the runtime's HTTPS
 redirect handling when their tag segment equals the descriptor version. With
