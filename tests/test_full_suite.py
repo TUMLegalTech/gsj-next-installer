@@ -97,3 +97,37 @@ def test_an_explicitly_named_file_is_collected_despite_collect_ignore(tmp_path):
     assert "1 passed" in by_directory.stdout, by_directory.stdout      # the directory walk honours both ignores
     assert "2 passed" in by_name.stdout, by_name.stdout                # the explicit names do not
     assert by_broken.returncode != 0 and "test_broken.py" in by_broken.stdout and "error" in by_broken.stdout.lower(), by_broken.stdout
+
+
+def _fake_helm(tmp_path, version):
+    """A `helm` on PATH that reports the given version and nothing else."""
+    bindir = tmp_path / "bin"; bindir.mkdir(exist_ok=True)
+    fake = bindir / "helm"
+    fake.write_text("#!/bin/sh\n[ \"$1\" = version ] && { echo " + version + "; exit 0; }\nexit 1\n")
+    fake.chmod(0o755)
+    return bindir
+
+
+def test_the_gate_refuses_any_helm_but_the_engineered_client(tmp_path, monkeypatch):
+    """Review finding B3: the gate checked only that `helm` was on
+    PATH -- it accepted Helm 3.22 and a fake client reporting v0.0.1, and
+    under Helm 3 two modules gave 27 failures (Helm 3 attempts cluster
+    discovery for the offline render Helm 4.2.2 performs without a cluster).
+    The gate now refuses, before collection, any client other than the one
+    it is engineered for -- the catalog's (ops/installer/clients.json) --
+    naming both versions."""
+    engineered = full_suite.engineered_helm_version()
+    assert engineered == "v4.2.2"
+    for found in ("v0.0.1+gdeadbee", "v3.22.0+g144ca65", "v3.13.3+gc8b9489", "v4.2.1+g0000000"):
+        monkeypatch.setenv("PATH", str(_fake_helm(tmp_path, found)) + ":/usr/bin:/bin")
+        lines = [line for line in full_suite.missing_prerequisites() if "helm" in line]
+        assert lines, found
+        assert found.split("+")[0] in lines[0] and engineered in lines[0], lines[0]
+        assert "clients.json" in lines[0]
+    # the engineered client itself: no helm line
+    monkeypatch.setenv("PATH", str(_fake_helm(tmp_path, "v4.2.2+gb05881c")) + ":/usr/bin:/bin")
+    assert not [line for line in full_suite.missing_prerequisites() if "helm" in line]
+    # no helm at all: still named, with the engineered version
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    lines = [line for line in full_suite.missing_prerequisites() if "helm" in line]
+    assert lines and engineered in lines[0]

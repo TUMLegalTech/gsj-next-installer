@@ -1850,7 +1850,7 @@ def test_endpoint_preflight_reports_absent_endpoints_without_a_request_and_never
     (7, "unreachable", 7, "unreachable"),
     ([401, "{}"], "refused (HTTP 401)", [400, json.dumps({"error": "not a multimodal model"})], "refused (HTTP 400)"),
     ([200, json.dumps({"data": [{"id": "another-model"}]})], "answers, but does not list llm.model",
-     [200, json.dumps({"choices": [{"message": {"content": "An essay about text recognition."}}]})], "not vision-capable (answered, but did not read the image)"),
+     [200, json.dumps({"choices": [{"message": {"content": "An essay about text recognition."}}]})], "answered without the test image's text (did not read it)"),
     ([200, json.dumps({"data": [{"id": "synthetic-model"}]})], "working", 28, "no answer within 90 s"),
     ([200, json.dumps({"data": [{"id": "synthetic-model"}]})], "working", [200, json.dumps({"detail": "sign in"})], "answers, but not as a chat-completions route"),
 ])
@@ -1874,7 +1874,7 @@ def test_endpoint_preflight_probes_a_configured_endpoint_as_the_application_woul
     if llm_state == "working": assert "answers from this host and lists synthetic-model" in result.stderr
     else: assert "skips agent-turn-note-history and generated-document" in result.stderr
     if ocr_state == "working": assert "read the test image from this host" in result.stderr
-    elif ocr_state.startswith("not vision"): assert "would store whatever this endpoint answers as the text of a scanned page" in result.stderr
+    elif ocr_state.startswith("answered without"): assert "would store whatever this endpoint answers as the text of a scanned page" in result.stderr
     else: assert "skips scanned-ingest-search" in result.stderr
 
 
@@ -1885,10 +1885,10 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     release.update(core={"tag": "v4.9.2-deployment", "commit": "c" * 40}, model={"model": "m", "revision": "d" * 40, "manifest_sha256": "e" * 64, "dimensions": 768, "distance": "cosine", "encoding": "x"})
     release["corpus"].update(fingerprint="f" * 64, rows=33979, chunks=1141170)
     (payload / "release.json").write_text(json.dumps(release)); (payload / "chart.tgz").write_bytes(b"synthetic chart")
-    (work / "verification.json").write_text(json.dumps({"status": "passed", "coverage": "partial", "endpoints": {"llm": "unreachable", "ocr": "absent"}, "checks": [
+    (work / "verification.json").write_text(json.dumps({"status": "passed", "coverage": "partial", "endpoints": {"llm": "no-model-list", "ocr": "absent"}, "checks": [
         {"name": "operator-login", "status": "passed"}, {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-absent"},
-        {"name": "mcp-tools-corpus-schema", "status": "passed"}, {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
-        {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}]}))
+        {"name": "mcp-tools-corpus-schema", "status": "passed"}, {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-no-model-list"},
+        {"name": "generated-document", "status": "skipped", "reason": "llm-no-model-list"}]}))
     (work / "public-check.json").write_text(json.dumps({"name": "public-https", "status": "passed"}))
     (work / "network-check.json").write_text(json.dumps({"name": "networkpolicy-deny-allow", "status": "passed"}))
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
@@ -1897,12 +1897,12 @@ def test_a_partial_verification_is_named_in_the_summary_and_on_screen(runtime):
     assert summary["status"] == "complete"                                               # the INSTALL is complete; the verification is what is partial
     assert summary["verification"] == {"status": "passed", "coverage": "partial", "checks_passed": 2, "checks_skipped": 3, "checks": 5,
                                        "skipped": [{"name": "scanned-ingest-search", "reason": "ocr-absent"},
-                                                   {"name": "agent-turn-note-history", "reason": "llm-unreachable"},
-                                                   {"name": "generated-document", "reason": "llm-unreachable"}],
-                                       "endpoints": {"llm": "unreachable", "ocr": "absent"}, "public_https": "passed", "networkpolicy": "passed"}
+                                                   {"name": "agent-turn-note-history", "reason": "llm-no-model-list"},
+                                                   {"name": "generated-document", "reason": "llm-no-model-list"}],
+                                       "endpoints": {"llm": "no-model-list", "ocr": "absent"}, "public_https": "passed", "networkpolicy": "passed"}
     closing = [line for line in result.stderr.splitlines() if "verification PARTIAL" in line]
     assert len(closing) == 1 and "Complete GSJ installation verified" not in result.stderr
-    assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable)" in closing[0]
+    assert "2 of 5 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-no-model-list), generated-document (llm-no-model-list)" in closing[0]
     # per reason: the LLM is configured and did not answer; the OCR endpoint is absent
     assert "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back" in closing[0]
     assert "Until an OCR endpoint is set, the scanned-page check stays skipped and scanned pages cannot be read: set ocr.url and ocr.model in the site file. Then run install again with the site file" in closing[0]
@@ -1950,11 +1950,11 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
     The operator would edit a site value that was right. Each reason word the
     probe recorded has its own established fact; the line says that one."""
     # an LLM that is set but did not answer, and an OCR endpoint that answered without reading the page
-    line, summary = _partial_summary_run(runtime, {"llm": "unreachable", "ocr": "not-vision-capable"}, [
+    line, summary = _partial_summary_run(runtime, {"llm": "no-model-list", "ocr": "no-page-text"}, [
         {"name": "operator-login", "status": "passed"},
-        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-not-vision-capable"},
-        {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-unreachable"},
-        {"name": "generated-document", "status": "skipped", "reason": "llm-unreachable"}])
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-no-page-text"},
+        {"name": "agent-turn-note-history", "status": "skipped", "reason": "llm-no-model-list"},
+        {"name": "generated-document", "status": "skipped", "reason": "llm-no-model-list"}])
     assert "with a model list" in line and "reachable from the Pods" in line and "ending in /v1" in line
     # "the agent cannot answer" is not established (a gateway without /models answers turns; a per-case LLM may serve)
     assert "the agent cannot answer" not in line and "the two agent checks stay skipped" in line
@@ -1974,12 +1974,19 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         assert f"answered HTTP {status}" in line, line
         for w in words: assert w in line, (status, w, line)
         for w in absent: assert w not in line, (status, w, line)
-    # an OCR endpoint the adapter got no recognition result from: unreachable, or an answer that is not a chat completion
+    # an OCR endpoint that gave no HTTP answer at all: unreachable -- and nothing else (review finding M5:
+    # an HTTP or schema failure is never "unreachable")
     line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "unreachable"}, [
         {"name": "operator-login", "status": "passed"},
         {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-unreachable"},
         {"name": "agent-turn-note-history", "status": "passed"}])
-    assert "with a recognition result" in line and "not a chat completion" in line and "chat-completions route" in line
+    assert "no HTTP answer" in line and "reachable from the Pods" in line and "not a chat completion" not in line
+    # a 200 whose body is not a chat completion: its own word, its own advice (the route)
+    line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "not-a-chat-completion"}, [
+        {"name": "operator-login", "status": "passed"},
+        {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-not-a-chat-completion"},
+        {"name": "agent-turn-note-history", "status": "passed"}])
+    assert "not a chat completion" in line and "chat-completions route" in line and "unreachable" not in line
     # a refusal whose status the verifier did not record: "HTTP ?", never an invented number
     line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "refused"}, [
         {"name": "operator-login", "status": "passed"},
@@ -2025,9 +2032,9 @@ def test_the_operator_guide_shows_the_closing_line_the_runtime_prints(runtime):
     example = [l for l in guide.splitlines() if "GSJ installation complete, verification PARTIAL" in l and l.startswith("[")][0]
     names = re.findall(r"`([a-z-]+)`", guide.split("The\nfifteen application checks, in the order they run:", 1)[1])[:15]
     assert names[0] == "operator-login" and names[-1] == "bot-contract-hook", names
-    skipped = {"scanned-ingest-search": "ocr-absent", "agent-turn-note-history": "llm-unreachable", "generated-document": "llm-unreachable"}
+    skipped = {"scanned-ingest-search": "ocr-absent", "agent-turn-note-history": "llm-no-model-list", "generated-document": "llm-no-model-list"}
     checks = [{"name": n, "status": "skipped", "reason": skipped[n]} if n in skipped else {"name": n, "status": "passed"} for n in names]
-    line, _ = _partial_summary_run(runtime, {"llm": "unreachable", "ocr": "absent"}, checks)
+    line, _ = _partial_summary_run(runtime, {"llm": "no-model-list", "ocr": "absent"}, checks)
     def body(text):
         return text.split("12 of 15", 1)[1].rsplit(" Summary:", 1)[0]
     assert "12 of 15" in line and "12 of 15" in example
@@ -2201,3 +2208,180 @@ def test_the_public_tree_carries_no_internal_review_labels():
             if re.search("audit" + " rounds?|FIX" + "-PASS|misattribution" + "[- ]pass", l, re.I):   # spelled apart: this line must not match itself
                 hits.append(f"{path.name}:{n}")
     assert not hits, hits
+
+
+# --- review finding B3: the Helm 4 verbs are refused in the first seconds, before the Lease ---
+
+def _fake_helm_on_path(work, version):
+    fake = work.parent / "bin" / "helm"
+    fake.write_text("#!/bin/sh\n[ \"$1\" = version ] && { echo " + version + "; exit 0; }\nexit 1\n")
+    fake.chmod(0o755)
+
+
+@pytest.mark.parametrize("command,kind,refused", [
+    ("addon-repair", None, True),          # always renders offline
+    ("repair", "restore", True),           # a restore stopped at its application
+    ("repair", "install", False),
+    ("repair", None, False),               # no operation record: another refusal's business
+    ("install", None, False), ("upgrade", None, False), ("resume", None, False), ("backup", None, False),
+    ("restore", None, False), ("restore-repair", None, False), ("sweep", None, False), ("abandon", None, False),
+])
+def test_a_verb_that_needs_helm_4_is_refused_in_the_first_seconds_before_the_lease(runtime, command, kind, refused):
+    """Review finding B3: two paths serialize a release with no
+    cluster at all (`KUBECONFIG=/dev/null helm install --dry-run=client`),
+    which only Helm 4 does: the managed add-on repair (addon-repair) and the
+    repair of a restore stopped at its application Helm revision. A Helm 3
+    operator was refused AT that step -- after the site was read, the cluster
+    inspected and, for the restore, most of the evidence re-read. The refusal
+    now comes from helm_verb_preflight, right after the clients are known and
+    before the Lease, naming the verb, the Helm found, and --fetch-tools.
+    Every other verb runs on the Helm 3.13 floor."""
+    run, state, work = runtime
+    _fake_helm_on_path(work, "v3.22.0+g144ca65")
+    if kind:
+        (work / "operation.json").write_text(json.dumps({"operation": "a" * 24, "kind": kind, "status": "applying"}))
+    result = run(f"COMMAND={command}; RESUME_ID={'a' * 24}\nhelm_verb_preflight\necho reached\n")
+    if refused:
+        assert result.returncode == 1, result.stderr
+        line = result.stderr.strip().splitlines()[-1]
+        assert line.startswith("GSJ: ") and command in line and "Helm 4" in line and "3.22.0" in line and "--fetch-tools" in line, line
+        assert "reached" not in result.stdout
+    else:
+        assert result.returncode == 0 and "reached" in result.stdout, result.stderr
+    assert json.loads(state.read_text())["calls"] == []             # the cluster was not touched
+
+
+def test_helm_4_itself_passes_the_verb_preflight(runtime):
+    run, _, work = runtime
+    _fake_helm_on_path(work, "v4.2.2+gb05881c")
+    (work / "operation.json").write_text(json.dumps({"operation": "a" * 24, "kind": "restore", "status": "applying"}))
+    for command in ("addon-repair", "repair"):
+        result = run(f"COMMAND={command}; RESUME_ID={'a' * 24}\nhelm_verb_preflight\necho reached\n")
+        assert result.returncode == 0 and "reached" in result.stdout, result.stderr
+
+
+def test_the_verb_preflight_runs_before_the_cluster_is_read_and_before_the_lease():
+    """The placement, pinned in the source: main() calls helm_verb_preflight
+    after the site is loaded and before preflight (the first cluster read)
+    and acquire (the Lease)."""
+    main = (INSTALLER / "runtime.sh").read_text().split("\nmain() {", 1)[1].split("# ENTRY POINT", 1)[0]
+    lines = main.splitlines()
+    first = next(i for i, l in enumerate(lines) if l.strip().startswith("helm_verb_preflight"))
+    load = next(i for i, l in enumerate(lines) if l.strip() == "load_site")
+    preflight = next(i for i, l in enumerate(lines) if l.strip() == "preflight")
+    acquire = next(i for i, l in enumerate(lines) if l.strip().startswith("compatibility; acquire"))
+    assert load < first < preflight < acquire
+
+
+# --- review finding B2: a refusal names the condition and the field, never the payload ---
+
+def test_a_site_file_that_is_not_an_object_is_refused_without_repeating_its_contents(runtime, tmp_path):
+    """the review's canary `site-merge-echo`: a site file whose whole JSON value
+    was a string reached the defaults merge, and jq's own diagnostic (`object
+    ({...}) and string ("<the value>") cannot be multiplied`) rode the
+    refusal -- quoting the file's contents, which may be a secret pasted in
+    the wrong place. The top-level shape is now checked first and named;
+    and no jq diagnostic that can quote input is ever repeated: only the
+    validator's own `field: reason` lines are, with the file's line number."""
+    run, _, _ = runtime
+    payload = tmp_path / "load-payload"; payload.mkdir()
+    for name in ("defaults.json", "site.schema.json", "validate.jq", "compile.jq"):
+        shutil.copyfile(INSTALLER / name, payload / name)
+    (payload / "release.json").write_text(json.dumps(_release()))
+    marker = "ZZSECRET-CANARY"
+    for body, shape in ((json.dumps(marker), "string"), (json.dumps([marker]), "array"), ("42", "number")):
+        config = tmp_path / "site.json"
+        config.write_text(body)
+        result = run(f'GSJ_PAYLOAD="{payload}"; CONFIG="{config}"; CONTEXT_ARG=""; load_site\n')
+        assert result.returncode == 1, result.stderr
+        lines = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")]
+        assert len(lines) == 1, result.stderr
+        assert marker not in result.stdout + result.stderr, shape
+        assert "must be a JSON object" in lines[0] and shape in lines[0] and str(config) in lines[0], lines[0]
+
+
+def test_validator_words_pass_only_the_validator_s_own_line_never_a_jq_diagnostic(runtime, tmp_path):
+    """The one function that turns validate.jq's stderr into printable words:
+    the validator's own `field: reason` line passes through (with the line
+    number jq reported), a jq diagnostic -- which quotes input -- does not,
+    and the file's line is still named."""
+    run, _, work = runtime
+    marker = "ZZSECRET-CANARY"
+    cases = {
+        "own": "jq: error (at /x/site.json:170): site.operator.login: invalid format -- expected a lowercase name of letters, digits and dashes\n",
+        "own-hint": "jq: error (at /x/site.json:3): registry.base: the first component must be a registry HOST -- it needs a dot, a port or to be localhost. A container runtime reads a bare name such as myregistry/team as docker.io/myregistry/team\n",
+        "diag": 'jq: error (at /x/site.json:0): object ({"schema_version":"gsj.si...}) and string ("' + marker + '") cannot be multiplied\n',
+        "diag2": 'jq: error (at /x/site.json:12): Cannot index string with "' + marker + '"\n',
+        "compile": "jq: error: syntax error, unexpected INVALID_CHARACTER (Unix shell quoting issues?) at <top-level>, line 1:\n" + marker + "\njq: 1 compile error\n",
+    }
+    for label, text in cases.items():
+        (work / "validate.err").write_text(text)
+        result = run('validator_words "$GSJ_WORK/validate.err"\n')
+        assert result.returncode == 0, result.stderr
+        words = result.stdout.strip()
+        assert marker not in words, (label, words)
+        if label.startswith("own"):
+            assert words == text.split("): ", 1)[1].strip() + " (line " + text.split(":")[2].split(")")[0] + ")", (label, words)
+        else:
+            assert "not repeated" in words, (label, words)
+            if label.startswith("diag"): assert "line " + text.split(":")[2].split(")")[0] in words, (label, words)
+
+
+def test_the_endpoint_preflight_prints_an_endpoint_s_origin_never_its_path_or_userinfo(runtime, tmp_path):
+    """the review's canary `endpoint-canary`: the preflight logged the full
+    configured URL, path included -- and a credential can sit in a path or
+    in the userinfo of a URL. It now names the origin only: scheme, host
+    and port."""
+    marker = "ZZSECRET-CANARY"
+    site = _site()
+    site["llm"].update(base_url=f"https://u:{marker}@llm.example:8443/{marker}/v1", model="synthetic-model")
+    site["ocr"].update(url=f"https://ocr.example/{marker}/v1/chat/completions", model="glm-ocr")
+    result, calls, record = _preflight(runtime, site, {f"https://u:{marker}@llm.example:8443/{marker}/v1/models": 7,
+                                                        f"https://ocr.example/{marker}/v1/chat/completions": [400, "{}"]})
+    assert result.returncode == 0, result.stderr
+    assert record["llm"] == "unreachable" and record["ocr"] == "refused (HTTP 400)"
+    assert marker not in result.stderr and marker not in result.stdout
+    assert "LLM endpoint https://llm.example:8443:" in result.stderr and "OCR endpoint https://ocr.example:" in result.stderr
+
+
+def test_url_origin_only_strips_the_path_and_the_userinfo(runtime):
+    run, _, _ = runtime
+    result = run('for u in https://u:pw@h.example:8443/a/b http://h.example/x https://h.example "not a url" http://u@h.example:1/; do url_origin_only "$u"; echo; done\n')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["https://h.example:8443", "http://h.example", "https://h.example", "not a url", "http://h.example:1"]
+
+
+# --- review finding M7: the guide names the key file the release carries ---
+
+def test_the_guide_names_the_key_file_the_release_carries():
+    """the review's `guide-key-path` probe: three guide commands verified with
+    trust/gsj-release.pem while the acquisition steps copy the supplied
+    release.pem into trust/ -- literal execution failed with "Required input
+    is not a regular file". Every verification command now names the file
+    the release carries, and no comment still calls the trust root
+    out-of-band (it travels with the release)."""
+    guide = (INSTALLER / "OPERATOR.md").read_text()
+    assert "gsj-release.pem" not in guide
+    commands = [l for l in guide.splitlines() if "verify-release.sh" in l and l.strip().startswith(("bash ", "bash \"", "  bash", "    bash"))]
+    assert commands, "the guide's verification commands were not found"
+    recovery = (INSTALLER / "startup-recovery.sh").read_text()
+    assert "out-of-band" not in recovery and "out of band" not in recovery
+    assert "trust/release.pem" in recovery
+
+
+def test_the_closing_line_knows_every_skip_reason_the_verifier_can_record():
+    """review finding M5: the skip reasons are a CONTRACT between the product's
+    verifier (gsj_deploy.verify.SKIP_REASONS) and this installer's closing
+    line (installation_summary): the words the line branches on are exactly
+    the words the verifier can record, and each states only what the probe
+    established. Read from the INSTALLED product, like the runtime
+    qualification: on a product that still carries the old words this fails
+    by name, until the pin bump brings the words together."""
+    verify = pytest.importorskip("gsj_deploy.verify")
+    source = (INSTALLER / "runtime.sh").read_text().split("\ninstallation_summary() {", 1)[1].split("\nverify_target() {", 1)[0]
+    words = set(re.findall(r'"((?:llm|ocr)-[a-z-]+)"', source))
+    recorded = getattr(verify, "SKIP_REASONS", None)
+    assert recorded is not None, "the installed product records no skip reasons: it predates the degraded install (the pin bump is pending)"
+    assert words == set(recorded), {"installer": sorted(words), "verifier": sorted(recorded)}
+    assert set(verify.SKIP_REASONS) == {"llm-absent", "llm-no-model-list", "ocr-absent", "ocr-unreachable",
+                                        "ocr-refused", "ocr-not-a-chat-completion", "ocr-no-page-text"}

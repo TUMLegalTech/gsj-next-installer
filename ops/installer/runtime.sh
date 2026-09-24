@@ -16,6 +16,59 @@ log() { printf '[%s] %s\n' "$(date -u +%FT%T.000000Z)" "$*" >&2; }
 sha_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d ' ' -f1; else shasum -a 256 "$1" | cut -d ' ' -f1; fi; }
 atomic() { local dst=$1; cat > "$dst.pending.$$"; chmod 600 "$dst.pending.$$"; sync "$dst.pending.$$"; mv -f "$dst.pending.$$" "$dst"; sync "$(dirname "$dst")"; }
 url_origin() { local rest=${1#*://}; printf '%s://%s' "${1%%://*}" "${rest%%/*}"; }
+url_origin_only() {
+ # scheme://host[:port] of a URL, the path AND any userinfo dropped: a
+ # credential can sit in either, and a log line names the endpoint, never
+ # what it carries [review B2]. Not a URL: printed as it is.
+ local rest
+ [[ $1 == *://* ]] || { printf '%s' "$1"; return; }
+ rest=${1#*://}; rest=${rest%%/*}; rest=${rest##*@}
+ printf '%s://%s' "${1%%://*}" "$rest"
+}
+validator_words() {
+ # validate.jq's stderr, made printable [review B2]. The validator's OWN
+ # line (`field: reason`, no quote, brace or bracket in it) passes through
+ # with the line jq reported; a jq diagnostic -- a type error quotes the
+ # input it choked on, a compile error the program -- is named by its line
+ # and never repeated. The file is kept where the caller says.
+ local line at own='^[a-z][a-z0-9_.]*: [^]"{}[]*$'
+ line=$(sed -n 's/^jq: error (at [^)]*): //p' "$1" | head -n1)
+ at=$(sed -n 's/^jq: error (at [^:)]*:\([0-9]*\)): .*/\1/p' "$1" | head -n1)
+ if [[ -n $line && $line =~ $own ]]; then
+   printf '%s (line %s)' "$line" "${at:-?}"
+ else
+   printf 'a jq diagnostic at line %s, not repeated here because it can quote the file'"'"'s contents (kept in %s)' "${at:-?}" "${2:-$1}"
+ fi
+}
+pull_failure_condition() {
+ # The CONDITION a container runtime's pull message establishes, in this
+ # installer's words. The message itself is untrusted text -- a registry or
+ # a proxy composes it, a bearer can ride in it -- and is never repeated
+ # [review B2]; it is kept in the state directory for the operator.
+ local m; m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+ case $m in
+   *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'the registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
+   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'the registry does not hold that name and digest (not found: the digest was not copied there unchanged, or the prefix is not exact)';;
+   *"no such host"*|*"server misbehaving"*|*"lookup "*|*"i/o timeout"*|*"connection refused"*|*"no route"*|*"dial tcp"*|*"network is unreachable"*|*"connection reset"*) printf 'the node could not connect to the registry (DNS, a route, a proxy, or a refused or timed-out connection)';;
+   *x509*|*certificate*|*"tls handshake"*) printf 'the node does not trust the registry'"'"'s certificate (a CA the container runtime does not know)';;
+   *toomanyrequests*|*"too many requests"*|*"rate limit"*) printf 'the registry rate-limited the pull (a limit or an outage on its side)';;
+   *"no space"*|*"disk pressure"*) printf 'the node'"'"'s disk is full';;
+   *) printf 'a condition this installer does not classify';;
+ esac
+}
+kubectl_failure_condition() {
+ # The same rule for kubectl's stderr on a refused create: classified, kept,
+ # never repeated (an admission webhook's message is whatever its author
+ # wrote) [review B2].
+ local m; m=$(tr '[:upper:]' '[:lower:]' < "$1")
+ case $m in
+   *podsecurity*|*"admission webhook"*|*"denied the request"*|*admission*) printf 'an admission policy refused it';;
+   *forbidden*) printf 'the API server refused it as forbidden (the kubeconfig'"'"'s permissions in this namespace)';;
+   *"already exists"*) printf 'a Pod of that name already exists';;
+   *"connection refused"*|*"unable to connect"*|*"no such host"*|*"i/o timeout"*|*"timed out"*) printf 'the API server could not be reached';;
+   *) printf 'a condition this installer does not classify';;
+ esac
+}
 system_ca_bundle() {
  local candidate
  if [[ -n ${CURL_CA_BUNDLE:-} && -r $CURL_CA_BUNDLE ]]; then printf '%s' "$CURL_CA_BUNDLE"; return; fi
@@ -272,6 +325,31 @@ require_offline_render() {
  # never had a helm binary to model.
  (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "this step serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools."
 }
+helm_verb_preflight() {
+ # THE HELM 4 VERBS, refused in the first seconds [review B3] -- after the
+ # clients are known and the site is read, before the cluster is read and
+ # before the Lease. Two verbs reach the offline render above: addon-repair
+ # always (repair_managed_addon), and repair of a RESTORE (its application
+ # Helm revision is re-proven offline in restore_application_evidence).
+ # Every other verb -- install, upgrade, upgrade --to, resume, repair of an
+ # install or upgrade, backup, backup-repair, restore, restore-repair,
+ # sweep, abandon, the credential/tls/lease repairs, inspect -- runs on the
+ # Helm 3.13 floor. Before this, a Helm 3 operator was refused AT the step:
+ # after the site was read, the cluster inspected and, for the restore,
+ # most of its evidence re-read. require_offline_render still guards the
+ # two sites themselves.
+ local verb=''
+ case $COMMAND in
+   addon-repair) verb=addon-repair;;
+   repair)
+     if [[ -f ${STATE_DIR:-}/operation.json ]] && jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null 2>&1; then
+       verb='repair of a restore (its application Helm revision is re-proven offline)'
+     fi;;
+ esac
+ [[ -n $verb ]] || return 0
+ (( HELM_MAJOR > 0 )) || helm_dialect
+ (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "$verb serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm) at $(command -v helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools (this release's pinned Helm 4 for this run only); every other command runs on Helm >= $GSJ_HELM_FLOOR"
+}
 bootstrap() {
  for utility in bash curl tar gzip base64 openssl awk cut uname mktemp date sync; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
  openssl_preflight
@@ -357,10 +435,16 @@ validate_site() {
    words=$(sed 's/^jq: //' "$GSJ_WORK/validate.err" | tr '\n' ' ' | cut -c1-300)
    fail "the site file is not valid JSON: ${words% }. Correct it in $CONFIG"
  fi
+ # The top-level shape, named before the merge: a site whose whole value is
+ # a string or a list would reach `.[0] * .[1]`, and jq's diagnostic for
+ # that quotes the value -- a secret pasted in the wrong place [review B2].
+ local shape; shape=$(jq -r type "$CONFIG")
+ [[ $shape == object ]] || fail "the site file must be a JSON object at the top level, and $CONFIG holds a $shape. Its contents are not repeated here; the payload's site.schema.json is the field reference"
  if ! { jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE"; } 2> "$GSJ_WORK/validate.err"; then
-   words=$(sed -n 's/^jq: error (at [^)]*): //p' "$GSJ_WORK/validate.err" | head -1)
-   [[ -n $words ]] || words=$(tr '\n' ' ' < "$GSJ_WORK/validate.err" | cut -c1-300)
-   fail "the site file was refused: $words. Correct it in $CONFIG; the effective site is that file merged over the release's defaults, and the payload's site.schema.json is the field reference"
+   # the validator's own line passes; a jq diagnostic is kept beside the
+   # site's state, never printed (it can quote the file's contents)
+   mkdir -p "$SITE_DIR/.gsj"; chmod 700 "$SITE_DIR/.gsj"; atomic "$SITE_DIR/.gsj/site-refusal.err" < "$GSJ_WORK/validate.err"
+   fail "the site file was refused: $(validator_words "$GSJ_WORK/validate.err" "$SITE_DIR/.gsj/site-refusal.err"). Correct it in $CONFIG; the effective site is that file merged over the release's defaults, and the payload's site.schema.json is the field reference"
  fi
 }
 load_site() {
@@ -458,7 +542,13 @@ wizard_discover() {
 wizard() {
  [[ -r /dev/tty ]] || fail 'interactive mode requires a terminal'
  mkdir -p "$(dirname "$CONFIG")"; WIZARD="$GSJ_WORK/wizard.json"
- if [[ -f $CONFIG ]]; then jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" > "$WIZARD"; else cp "$GSJ_PAYLOAD/defaults.json" "$WIZARD"; fi
+ if [[ -f $CONFIG ]]; then
+   # the saved site's shape first: a string or a list would reach the merge,
+   # whose diagnostic quotes the value [review sweep B2]
+   local shape; shape=$(jq -r type "$CONFIG" 2>/dev/null || printf 'value that is not valid JSON')
+   [[ $shape == object ]] || fail "the saved site file must be a JSON object at the top level, and $CONFIG holds a $shape. Its contents are not repeated here"
+   jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" > "$WIZARD"
+ else cp "$GSJ_PAYLOAD/defaults.json" "$WIZARD"; fi
  local context value secret_dir pwd path
  context=${CONTEXT_ARG:-$(kubectl config current-context 2>/dev/null || true)}
  set_site .target.context "$(ask 'Kubernetes context' "$(jq -r --arg c "$context" '.target.context | if .=="" then $c else . end' "$WIZARD")")"
@@ -496,8 +586,9 @@ wizard() {
  # Validate to a private file first: a refused answer must never replace the
  # saved site with an empty one, and the refusal is a named one.
  if ! jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$WIZARD" > "$GSJ_WORK/wizard-validated.json" 2> "$GSJ_WORK/validate.err"; then
-   words=$(sed -n 's/^jq: error (at [^)]*): //p' "$GSJ_WORK/validate.err" | head -1)
-   [[ -n $words ]] || words=$(tr '\n' ' ' < "$GSJ_WORK/validate.err" | cut -c1-300)
+   # the validator's own line passes; a jq diagnostic is kept, never printed [review B2]
+   local kept; kept="$(dirname "$CONFIG")/.gsj"; mkdir -p "$kept"; chmod 700 "$kept"; atomic "$kept/site-refusal.err" < "$GSJ_WORK/validate.err"
+   words=$(validator_words "$GSJ_WORK/validate.err" "$kept/site-refusal.err")
    # The effective site is the saved file merged with these answers; a refused
    # setting the wizard never asks for lives in the file.
    if [[ -f $CONFIG ]]; then fail "the effective site (the saved $CONFIG merged with these answers) was refused: $words. The saved site file was left as it was; if that setting is one the wizard did not ask for, correct it in $CONFIG, then run the wizard again"
@@ -1067,21 +1158,21 @@ endpoint_preflight() {
      answer=$(jq -r '(.choices[0].message.content // null) | if type=="array" then map(strings // (.text? | strings) // "") | join("") elif . == null then "" else tostring end' "$GSJ_WORK/endpoint-ocr.json" 2>/dev/null) || answer=''
      if ! jq -e '.choices[0].message | type=="object" and has("content")' "$GSJ_WORK/endpoint-ocr.json" >/dev/null 2>&1; then ocr="answers, but not as a chat-completions route"
      elif [[ $(printf '%s' "$answer" | tr -d ' \t\r\n') == *58203* ]]; then ocr=working
-     else ocr="not vision-capable (answered, but did not read the image)"; fi
+     else ocr="answered without the test image's text (did not read it)"; fi
    fi
  fi
  rm -f "$GSJ_WORK/endpoint-llm.header" "$GSJ_WORK/endpoint-ocr.header"
  jq -n --arg llm "$llm" --arg ocr "$ocr" --arg host "$(hostname 2>/dev/null || printf unknown)" '{format:"gsj.endpoint-preflight/1",probed_from:$host,llm:$llm,ocr:$ocr}' | atomic "$STATE_DIR/endpoint-preflight.json"
  case $llm in
    absent) log 'LLM endpoint: none in the site file. The install will complete; acceptance skips agent-turn-note-history and generated-document, and the agent cannot answer until an endpoint is set (per case under Einstellungen, or llm.base_url/llm.model here and install again)';;
-   working) log "LLM endpoint $base: answers from this host and lists $(j .llm.model)";;
-   *) log "LLM endpoint $base: $llm from this host$(if [[ -n $(j .llm.credential.secret) ]]; then printf ' (its credential is a Secret in the cluster, which this host did not send)'; fi). If it does not answer from inside the cluster either, acceptance skips agent-turn-note-history and generated-document and the agent cannot answer until it does; the install completes either way";;
+   working) log "LLM endpoint $(url_origin_only "$base"): answers from this host and lists $(j .llm.model)";;
+   *) log "LLM endpoint $(url_origin_only "$base"): $llm from this host$(if [[ -n $(j .llm.credential.secret) ]]; then printf ' (its credential is a Secret in the cluster, which this host did not send)'; fi). If it does not answer from inside the cluster either, acceptance skips agent-turn-note-history and generated-document and the agent cannot answer until it does; the install completes either way";;
  esac
  case $ocr in
    absent) log 'OCR endpoint: none in the site file. The install will complete; acceptance skips scanned-ingest-search, and scanned pages are not read until ocr.url names a vision-capable endpoint and install runs again';;
-   working) log "OCR endpoint $url: read the test image from this host";;
-   "not vision"*) log "OCR endpoint $url: answered HTTP 200 from this host but did not read the test image. Acceptance will skip scanned-ingest-search, and the application would store whatever this endpoint answers as the text of a scanned page: replace it before anyone uploads scanned files";;
-   *) log "OCR endpoint $url: $ocr from this host$(if [[ -n $(j .ocr.credential.secret) ]]; then printf ' (its credential is a Secret in the cluster, which this host did not send)'; fi). If it does not read the verifier's page from inside the cluster either, acceptance skips scanned-ingest-search and scanned pages are not read until it does; the install completes either way";;
+   working) log "OCR endpoint $(url_origin_only "$url"): read the test image from this host";;
+   "answered without"*) log "OCR endpoint $(url_origin_only "$url"): answered HTTP 200 from this host but did not read the test image. Acceptance will skip scanned-ingest-search, and the application would store whatever this endpoint answers as the text of a scanned page: replace it before anyone uploads scanned files";;
+   *) log "OCR endpoint $(url_origin_only "$url"): $ocr from this host$(if [[ -n $(j .ocr.credential.secret) ]]; then printf ' (its credential is a Secret in the cluster, which this host did not send)'; fi). If it does not read the verifier's page from inside the cluster either, acceptance skips scanned-ingest-search and scanned pages are not read until it does; the install completes either way";;
  esac
 }
 preflight() {
@@ -1670,7 +1761,10 @@ sweep_target() {
      local live='' renewed
      if (( age < 0 )); then renewed="its renewal time is ahead of this clock by $(( -age )) s, a clock skew between the renewing host and this one"; else renewed="renewed $age s ago"; fi
      if (( age < 180 )); then live=" -- and it is still live: abandon takes a Lease only after 180 s unrenewed, so if no installer process is running against this target, wait $(( 180 - age )) s first"; fi
-     fail "the operation Lease is held by $holder ($renewed); sweep clears only what abandon cannot: run abandon --operation $holder --reason ... first$live"
+     # the holder is printed only when it is an operation id this installer
+     # writes; a foreign Lease's text is not repeated [review sweep B2]
+     local shown=$holder; [[ $holder =~ ^[a-f0-9]{24}$ ]] || shown='<a holder identity this installer did not write>'
+     fail "the operation Lease is held by $shown ($renewed); sweep clears only what abandon cannot: run abandon --operation $shown --reason ... first$live"
    fi
    history=$(k get secrets,configmaps -l "owner=helm,name=$RELEASE" -o json | jq '[.items[]|select(.kind=="ConfigMap" or .type=="helm.sh/release.v1")]|length')
    (( history == 0 )) || fail "a Helm release named $RELEASE exists in namespace $NAMESPACE ($history Helm revision(s)); sweep never removes a deployment - uninstall it (its claims are kept) and sweep the residue afterwards"
@@ -2341,6 +2435,9 @@ PY
      | ([(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | (.reason // "Unschedulable")] | first // "") as $sched
      | if $pull != "" then "pull " + $pull elif $sched != "" then "sched " + $sched else "wait " + (.status.phase // "unknown") end end' "$STATE_DIR/storage-check-pod.json" 2>/dev/null || true)
    [[ -n $never || $phase == Succeeded || $phase == Failed ]] || never="wait ${phase:-unknown}"
+   # the reason and the phase are the API's enum words; the message is never
+   # read here, and anything beyond letters is not repeated [review sweep B2]
+   never=$(printf '%s' "$never" | tr -cd 'A-Za-z0-9 ' | awk '{print $1, $2}')
  fi
  # The Pod's phase is the verdict (the check exits 0 only when every assert
  # held); the log carries its measurements. A log that could not be read is
@@ -2378,6 +2475,7 @@ PY
    elif ! $logs_read; then note=" The storage check itself passed (its Pod ended Succeeded), though its measurements could not be read (kubectl logs failed)."
    fi
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+   phase=$(printf '%s' "$phase" | awk '{print $1}' | tr -cd 'A-Za-z' | cut -c1-24)   # an enum word, nothing beyond letters is repeated [review sweep B2]
    # After the backup a check whose Pod ended Failed (it started, and its own
    # asserts did not hold) is the backend's to correct, and resume will not
    # repeat the check: both refusals say so. A Pod that never ran is not that.
@@ -2766,7 +2864,8 @@ relocated_images_probe() {
           nodeSelector:(if $node=="" then {} else {"kubernetes.io/hostname":$node} end),
           containers:[$r[0].images|to_entries[]|{name:("pull-"+(.key|ascii_downcase)),image:(.value|image_ref($base)),imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:"1m",memory:"1Mi"},limits:{memory:"16Mi"}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
    PROBE_POD=''
-   fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $(tr '\n' ' ' < "$GSJ_WORK/pull-probe-create.err" | cut -c1-400). If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
+   atomic "$STATE_DIR/pull-probe-create.err" < "$GSJ_WORK/pull-probe-create.err"
+   fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $(kubectl_failure_condition "$GSJ_WORK/pull-probe-create.err"); kubectl's own words are kept in $STATE_DIR/pull-probe-create.err. If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
  fi
  while :; do
    status=$(k get pod "$pod" -o json 2>/dev/null) || status='{}'
@@ -2800,6 +2899,10 @@ relocated_images_probe() {
    # deadlines.dependencies_seconds would otherwise turn into a nameless timeout.
    if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 || spent >= deadline )); then
      verdict=${verdict%% SAID *}
+     # the Pod's status, kept 0600 for the operator: the runtime's own words
+     # live there, never in the refusal (the block below re-declares
+     # `status` for the operation's) [review B2]
+     printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
      # The same ImagePullBackOff comes from a changed site (a wrong base, digest or
      # pull Secret: a repair after the correction) and from the node's side (a
      # registry CA it does not trust, DNS, a proxy, a full disk, a rate limit, an
@@ -2838,11 +2941,14 @@ relocated_images_probe() {
      else
        RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
      fi
-     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime said, of the first: ${words:0:600}. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host. The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
+     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host. The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
    fi
    if (( spent >= deadline )); then
      RECOVERY_HINT="resume --operation $OPERATION once the registry answers, or repair --operation $OPERATION --config $CONFIG --non-interactive after raising deadlines.dependencies_seconds"
-     fail "the node did not finish pulling this release's images from $where within deadlines.dependencies_seconds ($deadline s): $(jq -r '[(.status.conditions // [])[]|select(.status=="False")|.type+": "+(.message // .reason // "")]|join("; ")' <<< "$status"). Helm has applied nothing in this run"
+     # the conditions' REASONS (the API's enum words); their messages are the
+     # scheduler's free text and are kept, never repeated [review sweep B2]
+     printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
+     fail "the node did not finish pulling this release's images from $where within deadlines.dependencies_seconds ($deadline s): $(jq -r '[(.status.conditions // [])[]|select(.status=="False")|.type+": "+((.reason // "unknown")|gsub("[^A-Za-z0-9]";""))]|join("; ")' <<< "$status"); the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
    fi
    sleep 5; spent=$(( spent + 5 ))
  done
@@ -4071,12 +4177,13 @@ installation_summary() {
      | ([$r[]|select(startswith("llm-"))]|first // "") as $llm
      | ([$r[]|select(startswith("ocr-"))]|first // "") as $ocr
      | ([ (if $llm == "llm-absent" then "Until an LLM endpoint is set, the two agent checks stay skipped (the site sets no LLM endpoint): set llm.base_url and llm.model in the site file (an LLM chosen per case under Einstellungen serves that case, but the acceptance probes only the site endpoint)"
-           elif $llm == "llm-unreachable" then "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1"
+           elif $llm == "llm-no-model-list" then "Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1"
            elif $llm != "" then "Until the LLM endpoint answers, the two agent checks stay skipped (" + $llm + ")" else empty end),
           (if $ocr == "ocr-absent" then "Until an OCR endpoint is set, the scanned-page check stays skipped and scanned pages cannot be read: set ocr.url and ocr.model in the site file"
-           elif $ocr == "ocr-unreachable" then "Until the OCR endpoint at ocr.url answers the acceptance probe with a recognition result, the scanned-page check stays skipped: it is configured, but the probe got no answer, or one that is not a chat completion, so check that it is up and reachable from the Pods and that ocr.url is the complete chat-completions route"
+           elif $ocr == "ocr-unreachable" then "Until the OCR endpoint at ocr.url gives an HTTP answer to the acceptance probe, the scanned-page check stays skipped: it is configured, but no HTTP answer came back from the Pods, so check that it is up and reachable from the Pods (the address, a proxy, TLS)"
+           elif $ocr == "ocr-not-a-chat-completion" then "Until the OCR endpoint at ocr.url answers the acceptance probe with a chat completion, the scanned-page check stays skipped: it answered HTTP 200 with a body that is not a chat completion, so check that ocr.url is the complete chat-completions route"
            elif $ocr == "ocr-refused" then ((.verification.ocr_http_status // 0) as $h | "Until the OCR endpoint at ocr.url accepts the recognition request, the scanned-page check stays skipped: it answered HTTP " + (if $h == 0 then "?" else ($h|tostring) end) + " to the acceptance probe" + (if $h == 401 or $h == 403 then ", so check its credential (ocr.credential)" elif $h == 404 then ", so check that ocr.url is the complete chat-completions route and that ocr.model names a model the endpoint serves (a missing model answers 404 too)" elif $h == 400 or $h == 422 or $h == 415 then ", so check ocr.model and that the endpoint takes an image" elif $h == 500 then ", so the endpoint failed on the request: a text-only model answers 500 to an image (replace ocr.url and ocr.model with a vision-capable endpoint), or the server itself is failing" elif $h >= 502 and $h <= 504 then ", so a gateway or the server reported it could not serve the request (a busy or starting server): try again, then check that the model is up" elif $h >= 500 then ", so the server answered an error: check the endpoint itself" elif $h == 429 then ", so it is rate-limited: try again later" else ", so check ocr.url, ocr.model and its credential" end))
-           elif $ocr == "ocr-not-vision-capable" then "Until ocr.url names an endpoint that reads images, the scanned-page check stays skipped: the configured one answered the acceptance probe without the text of the test page, so scanned pages would be stored as whatever it answers; replace ocr.url and ocr.model with a vision-capable endpoint"
+           elif $ocr == "ocr-no-page-text" then "Until ocr.url names an endpoint that reads images, the scanned-page check stays skipped: the configured one answered the acceptance probe without the text of the test page, so scanned pages would be stored as whatever it answers (a model that does not read images earns this, and so does one that paraphrased the page); replace ocr.url and ocr.model with a vision-capable endpoint"
            elif $ocr != "" then "Until the OCR endpoint reads images, the scanned-page check stays skipped (" + $ocr + ")" else empty end) ]
         | join(". ")) + ". Then run install again with the site file: the acceptance then exercises what answers."' "$summary") Summary: $summary"
  else
@@ -5391,6 +5498,7 @@ main() {
  [[ -z $EXPECTED_VERSION || $EXPECTED_VERSION == $(jq -er .version "$GSJ_PAYLOAD/release.json") ]] || fail 'downloaded installer embeds a different release version'
  configure_interaction
  load_site
+ helm_verb_preflight
  (CONTEXT_ARG="$CONTEXT"; inspect_cluster) | tee "$STATE_DIR/inspection.json"
  # An explicit version always names the authenticated distribution artifact,
  # including a repeat of this version. The verified child receives only

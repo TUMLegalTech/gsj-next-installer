@@ -97,6 +97,27 @@ def test_the_installed_library_is_at_the_core_tag_the_product_ships():
 
 
 @needs_web
+def test_the_pinned_initializer_and_corpus_sources_are_qualified_runtimes():
+    """Review finding B1: startup-runtime-preflight.py admits a source
+    Pod's runtime only when the sha256 pair of ITS initialize.py and corpus.py
+    is registered in QUALIFIED_SOURCE_RUNTIMES -- and the review found the
+    next product's initializer unregistered, so the combined release's gate
+    failed (`test_actual_source_runtime_is_qualified_without_model_or_network`
+    on the installed package). How a changed initializer becomes qualified:
+    the installer PR that adopts the product tree ADDS the new pair by hand,
+    with a comment naming the change and what runs each pair (never a swap),
+    and the gate proves it against the installed package. This test ties the
+    registration to the PIN, so a pin bump whose product carries an
+    unregistered pair fails here by name, before the gate runs it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("startup_preflight_pin", ROOT / "ops/installer/startup-runtime-preflight.py")
+    preflight = importlib.util.module_from_spec(spec); spec.loader.exec_module(preflight)
+    pair = tuple(hashlib.sha256(show("gsj_deploy/" + name)).hexdigest() for name in ("initialize.py", "corpus.py"))
+    assert pair in preflight.QUALIFIED_SOURCE_RUNTIMES, \
+        f"the pinned product's (initialize.py, corpus.py) pair {pair} is not a qualified source runtime; register it in ops/installer/startup-runtime-preflight.py with a comment naming the change (added, never swapped)"
+
+
+@needs_web
 def test_the_pinned_git_objects_match_the_record():
     assert tree("chart") == PIN["chart"]["tree"], "the chart tree at the pinned commit differs from web-pin.json"
     assert tree("gsj_deploy") == PIN["gsj_deploy"]["tree"], "the gsj_deploy tree at the pinned commit differs from web-pin.json"

@@ -174,7 +174,7 @@ def native_child(image):
     pins and the registry serves; the child is the only manifest a
     single-platform engine ever holds locally, so every `docker image
     inspect`, `docker create` and `docker run` below names the child. The
-    PROMOTION preparation inspected the index and found "No such image" on a
+    The first release preparation inspected the index and found "No such image" on a
     clean engine until the four product images had been pulled by hand."""
     return image["repository"] + "@" + image["platforms"][PLATFORM]
 

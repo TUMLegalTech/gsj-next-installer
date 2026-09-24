@@ -31,7 +31,7 @@ if (.llm.base_url == "") != (.llm.model == "") then error("llm: base_url and mod
 if .llm.base_url == "" and (.llm.credential.file != "" or .llm.credential.secret != "" or (.llm.allowed_origins | length) > 0) then error("llm: a credential or allowed origins without base_url and model") else . end |
 if .ocr.url == "" and (.ocr.credential.file != "" or .ocr.credential.secret != "") then error("ocr: a credential without url") else . end |
 if any([.llm.credential,.ocr.credential][]; .file != "" and .secret != "") then error("credential: choose one file or Secret") else . end |
-if .registry.config_file != "" and .registry.pull_secret == "" then error("registry.pull_secret required with config_file") else . end |
+if .registry.config_file != "" and .registry.pull_secret == "" then error("registry.pull_secret: required with config_file") else . end |
 if ((.registry.base // "") != "") and ((.registry.base | split("/")[0]) as $host | ($host | test("[.:]") | not) and $host != "localhost")
 then error("registry.base: the first component must be a registry HOST -- it needs a dot, a port or to be localhost. A container runtime reads a bare name such as myregistry/team as docker.io/myregistry/team, so the pulls would go to Docker Hub") else . end |
 if .tls.profile == "files" and (.tls.certificate_file == "" or .tls.private_key_file == "") then error("tls: certificate and private key required") else . end |

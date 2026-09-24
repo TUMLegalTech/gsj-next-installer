@@ -94,6 +94,19 @@ QUALIFIED_SOURCE_RUNTIMES = {
     # runs and what a proof deployment on a second cluster ran.
     ('2a587b583824472f8b13b82a3a42e0a51982ffef23af1715f3af0cd45e88bfc4',
      'c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8'),
+    # initialize.py names what it established instead of the budget: a
+    # restart repeats the recorded deterministic reason, a deterministic
+    # shard failure surfaces as itself, and a deadline spent waiting for
+    # Chroma is `chroma-unavailable` (the product's message pass; no
+    # receipt, checkpoint, identity or shard format changed, and the
+    # signatures this preflight pins are the same). corpus.py is
+    # BYTE-IDENTICAL to the pair above. Added, never swapped: the pair above
+    # is what the standing rollout target and the reference deployment run,
+    # and this one is what the next product release ships. The registration
+    # is checked against the PIN by tests/test_web_pin.py, so a pin bump to a
+    # product whose pair is missing here fails the gate by name.
+    ('4de81568c19676cb31d2ac31163f135e8be8b02b58f1ee5f2a965f1e155fe35d',
+     'c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8'),
 }
 
 

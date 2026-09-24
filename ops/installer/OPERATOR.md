@@ -300,13 +300,17 @@ same request as the block below, and the verdict is logged and recorded in the
 state directory as `endpoint-preflight.json`) and from inside the cluster at
 acceptance, where the verifier renders the scanned test page, sends it as the
 application would, and requires the recognised sentence back. An endpoint that
-gives no HTTP answer there, or a 200 that is not a chat completion, skips the
-check as `ocr-unreachable`; one that answers with an HTTP status other than
-200 skips it as `ocr-refused` (the status is recorded, and the closing line
-advises by it); one that answers HTTP 200 **without** the sentence skips it as
-`ocr-not-vision-capable` — and that is the dangerous one, because the
-application stores whatever a 200 says as the text of a scanned page: replace
-it before anyone uploads scanned files. Only an endpoint that reads the page
+gives no HTTP answer there skips the check as `ocr-unreachable`; one that
+answers with an HTTP status other than 200 skips it as `ocr-refused` (the
+status is recorded, and the closing line advises by it); a 200 whose body is
+not a chat completion skips it as `ocr-not-a-chat-completion`; one that
+answers a chat completion **without** the sentence skips it as
+`ocr-no-page-text` — and that is the dangerous one, because the application
+stores whatever a 200 says as the text of a scanned page: replace it before
+anyone uploads scanned files. Each word claims only what the probe
+established: `no-page-text` says the page's text did not come back, not that
+the model cannot read images (a model that paraphrased earns it too). Only an
+endpoint that reads the page
 runs the check, and then the check must pass. (The application itself runs
 without OCR, and the bare chart treats it as optional; a partial verification
 says in its record and on screen that the scanned-page path was not
@@ -473,11 +477,16 @@ anything: the release ships none of them, and `--fetch-tools` equips the
 *installer* for one run, not the blocks you paste into your own shell — steps 2
 to 7 use your own `jq` and `kubectl`.
 
-Helm 3.13 installs, upgrades and removes. **Helm 4 is required only by the
-managed-add-on repair/rollback path and the restore-repair path** — steps you
-reach when something has already gone wrong, and which say so by name at the
-moment you reach them. You do not need it today; know that you will need it
-then, and that on an air-gapped host `--fetch-tools` cannot fetch it.
+Helm 3.13 installs, upgrades and removes. **Helm 4 is required by two verbs
+only: `addon-repair`, and `repair --operation` of a *restore* that stopped at
+its application Helm revision** — recovery verbs you reach when something has
+already gone wrong. Each refuses a Helm 3 in its first seconds, before it
+reads the cluster and before it takes the Lease, naming the verb, the Helm it
+found and `--fetch-tools`. `install`, `upgrade`, `upgrade --to`, `resume`,
+`repair` of an install or upgrade, `backup`, `backup-repair`, `restore`,
+`restore-repair`, `sweep` and `abandon` run on Helm 3.13 and later. You do
+not need Helm 4 today; know that you will need it for those two, and that on
+an air-gapped host `--fetch-tools` cannot fetch it.
 
 **[if]** this machine reaches the internet only through a proxy. The installer
 has no proxy setting of its own: it downloads with `curl`, and `curl` takes the
@@ -534,7 +543,7 @@ cd "$HOME/gsj-operator/releases/r1"
 INSTALLER=$(jq -r .installer.name installer-descriptor.json)
 bash "$HOME/gsj-operator/trust/verify-release.sh" "$INSTALLER" \
      installer-descriptor.json installer-descriptor.sig \
-     "$HOME/gsj-operator/trust/gsj-release.pem"
+     "$HOME/gsj-operator/trust/release.pem"
 chmod 500 "$INSTALLER"
 ```
 
@@ -1107,8 +1116,9 @@ On a **partial** one — an endpoint left out of the site file, or one the
 acceptance probe found unreachable, refusing, or not reading images —
 `coverage` is `partial`, `checks_passed`
 plus `checks_skipped` make fifteen, `skipped` lists every skipped check with
-its reason (`llm-absent`, `llm-unreachable`, `ocr-absent`, `ocr-unreachable`,
-`ocr-refused`, `ocr-not-vision-capable`), `endpoints` records the state the
+its reason (`llm-absent`, `llm-no-model-list`, `ocr-absent`, `ocr-unreachable`,
+`ocr-refused`, `ocr-not-a-chat-completion`, `ocr-no-page-text`), `endpoints`
+records the state the
 acceptance probe found each endpoint in, and the closing line begins **GSJ
 installation complete, verification PARTIAL** instead of *Complete GSJ
 installation verified*, names the skipped checks with their reasons, and says,
@@ -1122,7 +1132,7 @@ and an LLM chosen per case may serve — what is established is which checks
 stayed skipped:
 
 ```
-[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-unreachable), generated-document (llm-unreachable). Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1. Until an OCR endpoint is set, the scanned-page check stays skipped and scanned pages cannot be read: set ocr.url and ocr.model in the site file. Then run install again with the site file: the acceptance then exercises what answers. Summary: …/summary.json
+[2026-01-01T00:00:00.000000Z] GSJ installation complete, verification PARTIAL: 0.10.0-beta.5 at https://cases.example.org. 12 of 15 application checks ran and passed; 3 skipped: scanned-ingest-search (ocr-absent), agent-turn-note-history (llm-no-model-list), generated-document (llm-no-model-list). Until the LLM endpoint at llm.base_url answers the acceptance probe with a model list, the two agent checks stay skipped: it is configured, but no model list came back (the endpoint was unreachable from the Pods, refused the request, or is not an OpenAI-compatible root), so check that it is up and reachable from the Pods, that its credential is right and that llm.base_url is the OpenAI root ending in /v1. Until an OCR endpoint is set, the scanned-page check stays skipped and scanned pages cannot be read: set ocr.url and ocr.model in the site file. Then run install again with the site file: the acceptance then exercises what answers. Summary: …/summary.json
 ```
 
 The install is complete either way — `backup` and `upgrade` work on it — but
@@ -1230,7 +1240,7 @@ cd "$HOME/gsj-operator/releases/THIS-RELEASE"
 bash "$HOME/gsj-operator/trust/verify-release.sh" \
   "$(jq -r .installer.name installer-descriptor.json)" \
   installer-descriptor.json installer-descriptor.sig \
-  "$HOME/gsj-operator/trust/gsj-release.pem"
+  "$HOME/gsj-operator/trust/release.pem"
 # success prints, and exits 0:
 #   Verified signed descriptor and exact installer bytes. The installer was not executed.
 chmod 500 "$(jq -r .installer.name installer-descriptor.json)"
@@ -1336,20 +1346,28 @@ policy matching nothing — silently. The installer now checks the server versio
 in its preflight and refuses there, before it writes anything to your cluster;
 the chart's `kubeVersion` is the second gate behind it.
 
-**Helm 4 is required by the managed-add-on repair/rollback path and the
-restore-repair path, and only those.** They
-serialize a release with no cluster at all (`KUBECONFIG=/dev/null helm install
---dry-run=client`), which no Helm 3 can do — Helm 3 has no `--kube-version` on
-`install` to suppress the discovery, and it fails with `Kubernetes cluster
-unreachable`. An ordinary install and upgrade need only the floor above. If you
-reach one of those steps on Helm 3 the installer says so exactly, at that step,
-naming Helm 4 and `--fetch-tools`.
+**Helm 4 is required by two verbs, and only those: `addon-repair` (the
+managed add-on repair/rollback path) and `repair --operation` of a restore
+that stopped at its application Helm revision (the restore's evidence is
+re-proven offline).** Both serialize a release with no cluster at all
+(`KUBECONFIG=/dev/null helm install --dry-run=client`), which no Helm 3 can
+do — Helm 3 has no `--kube-version` on `install` to suppress the discovery,
+and it fails with `Kubernetes cluster unreachable`. Every other verb — an
+ordinary install and upgrade, `upgrade --to`, `resume`, `repair` of an install
+or upgrade, `backup`, `backup-repair`, `restore`, `restore-repair`, `sweep`,
+`abandon` — needs only the floor above. On Helm 3 the two verbs refuse in
+their first seconds, after the site file is read and before the cluster is
+read or the Lease taken, naming the verb, the Helm found and `--fetch-tools`
+(`GSJ: addon-repair serializes a release without contacting the cluster,
+which only Helm 4 can do (found helm 3.22.0 at /usr/local/bin/helm). Install
+Helm 4 alongside, or re-run this command with --fetch-tools …`); nothing has
+been written when they do.
 
 **`--fetch-tools`** — accepted by every command — restores the old behaviour:
 the installer downloads this release's own checksum-pinned Helm, kubectl and jq
 into a private directory for that run and uses those instead. Use it on a box
 whose clients are too old to upgrade, on an air-gapped host that already has
-the cache populated, or to get Helm 4 for the two paths above. The pinned
+the cache populated, or to get Helm 4 for the two verbs above. The pinned
 versions and their SHA256s are in the release you already hold —
 `payload release.json | jq .clients` — re-define the two-line `payload()` helper
 from "Before you start" in whatever shell you are in; it does not survive a new
@@ -1357,7 +1375,7 @@ one. **Read them before you let `--fetch-tools` run:** its kubectl is
 pinned for the release, not for your cluster, and it can sit well outside the
 +/-1 window the kubectl row above makes a rule. If it does, upgrade your own
 kubectl rather than fetching that one, and reserve `--fetch-tools` for the two
-cluster-free-render paths that genuinely require Helm 4. The download happens
+verbs that genuinely require Helm 4. The download happens
 before the site file is read, so a proxy or custom CA needed for it must
 already be available to `curl`.
 
@@ -2178,15 +2196,16 @@ requires the recognised sentence to come back searchable. Before it runs, the
 verifier probes the endpoint you named with that same page, from inside the
 cluster: an endpoint that reads it runs the check, and the check must pass; one
 that is absent, gives no answer, refuses, or answers without reading the page
-**skips** the check, recorded as `ocr-absent`, `ocr-unreachable`,
-`ocr-refused` (with the HTTP status) or `ocr-not-vision-capable`, and the
+**skips** the check, recorded as `ocr-absent`, `ocr-unreachable` (no HTTP
+answer), `ocr-refused` (with the HTTP status), `ocr-not-a-chat-completion` (a
+200 that is not one) or `ocr-no-page-text`, and the
 install completes with *verification PARTIAL* — a completed-install record,
 which `upgrade` and the ordinary `backup` require, and a closing line that
 says the scanned-page path was not exercised. Until you set a working
 endpoint and run `install` again, an absent, unreachable or refusing endpoint
 leaves scanned pages stored with no text (`ocr_fallback`) and the agent is
 told so — while an endpoint that answers without reading the page
-(`ocr-not-vision-capable`) has its answer stored as the page's text: replace
+(`ocr-no-page-text`) has its answer stored as the page's text: replace
 it before anyone uploads scanned files.
 
 Measured on an earlier build of this release line, with `ocr.url` naming a
@@ -2674,6 +2693,20 @@ take that backup before the edit, or after the operation that adopts it.
 That uses the site file as it stands. With `--interactive` in place of
 `--non-interactive`, the target release runs its own configuration wizard once
 its signature has been verified.
+
+**What an upgrade does not touch: the cases.** A case is a Git repository in
+Forgejo, born complete when it was created — its pre-receive hook, its
+`AGENTS.md` and its skill cards are copied in at that moment, from the product
+release then installed. An upgrade replaces the product's code and chart and
+leaves every existing case repository as it is: a case created before this
+release keeps its hook (the RULESET it was born with) and the contract text the
+lawyer may have edited. Only a NEW case gets the new release's hook and
+contract; so does a case an administrator *re-processes* (which also resets the
+lawyer's `AGENTS.md` edits — do not re-process a colleague's case without them).
+No hook migration is run by an upgrade or by this release (ruled 2026-09-24);
+what an older hook lets through is caught on the other side of the push
+instead — the agent runner never commits a link or a nested repository under
+`notes/` and discloses it as an unsaved leftover.
 
 The current installer downloads the target descriptor/signature and executable,
 verifies them with its existing trust root, and runs that target installer.
@@ -3406,7 +3439,7 @@ if [ -z "${GSJ_BACKUP_ARCHIVE:-}" ]; then
 else
   export KUBECONFIG=/path/to/recovery-kubeconfig
   bash "$HOME/gsj-operator/trust/verify-release.sh" source-gsj-install.sh source-installer-descriptor.json \
-    source-installer-descriptor.sig "$HOME/gsj-operator/trust/gsj-release.pem" &&
+    source-installer-descriptor.sig "$HOME/gsj-operator/trust/release.pem" &&
   bash source-gsj-install.sh restore --archive "$GSJ_BACKUP_ARCHIVE" \
     --config "$HOME/gsj-operator/recovery-site.json" --non-interactive
 fi
@@ -3656,19 +3689,22 @@ ingest checks already measured, so an index problem shows up on
 `digital-ingest-search` or `scanned-ingest-search`.
 
 A **skipped** check records no code either: its entry is `{"name", "status":
-"skipped", "reason"}` with one of six reasons — `llm-absent`,
-`llm-unreachable`, `ocr-absent`, `ocr-unreachable`, `ocr-refused`,
-`ocr-not-vision-capable` — the state the acceptance probe found the endpoint
+"skipped", "reason"}` with one of seven reasons — `llm-absent`,
+`llm-no-model-list`, `ocr-absent`, `ocr-unreachable`, `ocr-refused`,
+`ocr-not-a-chat-completion`, `ocr-no-page-text` — the state the acceptance
+probe found the endpoint
 in (the run's `endpoints` field repeats it; `ocr_http_status` accompanies
 `ocr-refused`). Only `scanned-ingest-search` (OCR), `agent-turn-note-history`
 and `generated-document` (LLM) can be skipped, and only for those reasons; a
 run with any skipped check is `coverage: partial` and its closing line says
 so (step 9). Two edges of the probe, so a partial verification is read
-right: `llm-unreachable` is the Verbindungstest's verdict — the runner asked
-the endpoint's `/models` route and got no usable answer — so a gateway that
-serves chat completions but not `/models` is skipped as unreachable rather
-than exercised (name an endpoint that serves both, or test the agent by hand
-after the install); and `ocr-not-vision-capable` means the recognised text
+right: `llm-no-model-list` is the Verbindungstest's verdict — the runner asked
+the endpoint's `/models` route and got no model list back, and the word claims
+no more than that (the relay cannot tell an unreachable endpoint, a refusal
+and a non-list answer apart) — so a gateway that serves chat completions but
+not `/models` is skipped as `no-model-list` rather than exercised (name an
+endpoint that serves both, or test the agent by hand after the install); and
+`ocr-no-page-text` means the recognised text
 did not contain the test page's sentence, which a model that reads the page
 but paraphrases it also earns — the check would have failed on the same
 sentence. A probe that could not run at all (the relay route failing, the

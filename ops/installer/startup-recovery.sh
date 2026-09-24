@@ -6,8 +6,9 @@ authenticate_predecessor() {
  for file in "$installer" "$descriptor" "$signature"; do
    [[ -f $file && ! -L $file ]] || fail 'source installer and its detached signature must be regular files'
  done
- # The current installer's out-of-band trust root is authoritative. Never use
- # a key supplied alongside the predecessor and never execute its Bash header.
+ # The current installer's embedded trust root (trust/release.pem, the key
+ # that travels with the release) is authoritative. Never use a key supplied
+ # alongside the predecessor and never execute its Bash header.
  openssl dgst -sha256 -verify "$GSJ_PAYLOAD/trust/release.pem" -signature "$signature" "$descriptor" >/dev/null 2>&1 || fail 'source installer signature is invalid'
  version=$(jq -er '.version|select(type=="string" and length>0)' "$descriptor")
  verify_target "$descriptor" "$signature" "$installer" "$version"

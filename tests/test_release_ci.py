@@ -141,6 +141,20 @@ def test_a_digest_mismatch_names_the_image_and_both_digests_through_the_cli(modu
     assert "Release preparation failed: remote image differs from its approved digest: registry.example/gsj-web is " + served in err and approved in err, err
 
 
+def real_or_stubbed_expected_checks(module, monkeypatch):
+    """Review finding N2: three upgrade-mode tests stubbed
+    expected_checks() unconditionally, so the hand-run gate -- with the
+    pinned Git objects present -- never ran the real check-list read in
+    them. The stub is now the public CI's alone (no Git directory carries
+    the pinned product there); wherever the objects are present the REAL
+    list is read, and the test asserts the report carries the pinned
+    product's check names. Returns the names in force."""
+    if module.webpin.available():
+        return set(module.expected_checks())
+    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})
+    return {"synthetic-check"}
+
+
 def installed_state(module):
     manifest = {"identity": "target-identity", "images": {"web": "fixed"}, "corpus": {"fingerprint": "a" * 64}}
     report = {"status": "passed", "cleanup_users": "passed", "case_and_pat_cleanup": "passed",
@@ -372,7 +386,8 @@ def test_failed_delivery_preflight_prevents_source_install_or_cluster_mutation(m
 def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp_path, monkeypatch, failure):
     import base64
     module = modules[1]
-    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the harness environment's concern, tested on its own
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     target = tmp_path / "candidate"
     target.mkdir()
     (target / "manifest.json").write_text(json.dumps({"identity": "target", "supported_sources": ["source"],
@@ -435,7 +450,8 @@ def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp
 @pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM])
 def test_cancellation_signal_saves_interruption_before_owned_cleanup(modules, tmp_path, monkeypatch, number):
     module = modules[1]
-    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the harness environment's concern, tested on its own
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     target = tmp_path / "candidate"
     target.mkdir()
     (target / "manifest.json").write_text(json.dumps({"identity": "target",
@@ -493,7 +509,8 @@ def test_populated_hard_restart_kills_web_runner_and_mcp_with_proven_sigkill(mod
     import httpx
     import hardfault
     module = modules[1]
-    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the harness environment's concern, tested on its own
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     images = {role: {"repository": "example.test/" + role, "digest": "sha256:" + "a" * 64}
               for role in ("web", "runner", "mcp", "forgejo", "chroma", "decisionsData")}
     target = tmp_path / "candidate"
@@ -869,7 +886,7 @@ def test_the_manifest_the_release_preparation_writes_builds_under_the_pin_and_a_
 
 
 def test_the_preparation_pulls_only_the_four_product_images_and_inspects_only_native_children_on_a_clean_engine(modules, tmp_path, monkeypatch):
-    """PROMOTION's `ci/release.py build` failed twice on a clean engine and
+    """The first release's `ci/release.py build` failed twice on a clean engine and
     once more on Docker Hub's budget: `installed()` and
     `corpus_manifest_from_image()` ran `docker image inspect` on the INDEX
     digest the pin records, while `inspect_image` had pulled only the amd64
@@ -1025,7 +1042,7 @@ def test_the_preparation_pulls_only_the_four_product_images_and_inspects_only_na
 
 
 def test_qualification_refuses_a_missing_pinned_git_directory_in_its_first_second_and_in_words(modules, tmp_path, monkeypatch, capsys):
-    """PROMOTION's first ordinary run reached `expected_checks()` after a
+    """The first release qualification's ordinary run reached `expected_checks()` after a
     two-hour install and died on a bare `ValueError` because the launch
     shell carried no GSJ_NEXT_WEB_GIT_DIR. The check list is now the first
     thing `qualify` resolves: with no Git directory it refuses before the

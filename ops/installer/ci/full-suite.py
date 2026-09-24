@@ -12,10 +12,13 @@ release's first step, and this script makes it mechanical:
 
   - it refuses to START when a prerequisite it knows is missing: the four
     packages (gsj_deploy, gsj_web, agent_runner, gsj), a chromadb-client still
-    installed, a Git directory carrying the pinned product commit, bash, helm,
-    jq and openssl on PATH, the two staged add-on archives, an interpreter that
-    is not X.509-strict, a missing system CA bundle -- the verdict, not this
-    list, is the authority: a skip the list did not foresee still fails the run;
+    installed, a Git directory carrying the pinned product commit, bash, jq
+    and openssl on PATH, THE ENGINEERED HELM -- the catalog's exact version
+    (ops/installer/clients.json), since two modules render releases offline,
+    which Helm 3 cannot do, and a gate that can pass on the wrong client is
+    not a gate -- the two staged add-on archives, an interpreter that is not
+    X.509-strict, a missing system CA bundle -- the verdict, not this list, is
+    the authority: a skip the list did not foresee still fails the run;
   - it names every tests/test_*.py file to pytest explicitly, so a module the
     conftest would ignore is a collection error, never a silent omission;
   - it FAILS on any skip, xfail, xpass, deselection, collection error, failure,
@@ -31,6 +34,7 @@ import importlib.util
 import json
 from pathlib import Path
 import platform
+import re
 import shutil
 import ssl
 import subprocess
@@ -43,7 +47,29 @@ _spec.loader.exec_module(webpin)
 ADDONS = ROOT / "ops/.build/installer-addons"
 ADDON_FILES = ("traefik-41.5.0.tgz", "cert-manager-v1.21.2.tgz")     # the two the add-on tests read
 PRODUCT_PACKAGES = ("gsj_deploy", "gsj_web", "agent_runner", "gsj")
-TOOLS = ("bash", "helm", "jq", "openssl")
+TOOLS = ("bash", "jq", "openssl")
+CLIENTS = ROOT / "ops/installer/clients.json"
+
+
+def engineered_helm_version():
+    """The Helm this suite is engineered for: the catalog's, read off its
+    download name (ops/installer/clients.json is the one place the pin lives)."""
+    catalog = json.loads(CLIENTS.read_text())
+    url = next(iter(catalog["helm"].values()))["url"]
+    return re.search(r"helm-(v\d+\.\d+\.\d+)-", url).group(1)
+
+
+def helm_version_found():
+    """The Helm on PATH, as `helm version --short` reports it (vX.Y.Z), or
+    None when there is none or it reports no version."""
+    if shutil.which("helm") is None:
+        return None
+    try:
+        out = subprocess.run(["helm", "version", "--short"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.match(r"v?(\d+\.\d+\.\d+)", out.strip())
+    return "v" + match.group(1) if match else None
 CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem")
 
 
@@ -68,6 +94,15 @@ def missing_prerequisites():
     for tool in TOOLS:
         if shutil.which(tool) is None:
             missing.append(f"`{tool}` is not on PATH")
+    # review finding B3: the gate admitted any helm -- Helm 3.22, a fake reporting
+    # v0.0.1 -- and under Helm 3 two modules failed on the offline render
+    # only Helm 4 performs. The client is the catalog's exact version, named
+    # beside what was found.
+    engineered, found = engineered_helm_version(), helm_version_found()
+    if found != engineered:
+        missing.append(f"`helm` on PATH is {found or 'absent, or reports no version'}, not the engineered client {engineered} this suite runs "
+                       f"under (ops/installer/clients.json; the add-on and application modules render releases offline, which only Helm 4 does): "
+                       f"put {engineered} first on PATH, e.g. python3 -B ops/installer/ci/release.py clients --output DIR")
     for name in ADDON_FILES:
         if not (ADDONS / name).is_file():
             missing.append(f"the add-on archive {ADDONS.relative_to(ROOT) / name} is not staged "
@@ -164,6 +199,7 @@ def main():
               "installer_dirty": bool(subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=all"], text=True).strip()),
               "product_commit": pin["commit"], "product_release": pin["release"], "core_tag": pin["core"]["tag"],
               "platform": platform.platform(), "python": platform.python_version(), "pytest": pytest.__version__,
+              "helm": helm_version_found(),
               "collected": results.collected, "passed": results.passed, "failed": results.failed, "skipped": results.skipped,
               "xfailed": results.xfailed, "xpassed": results.xpassed, "deselected": results.deselected, "errors": results.errors,
               "files": {name: results.per_file.get(name, 0) for name in files}}

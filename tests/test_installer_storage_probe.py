@@ -354,3 +354,23 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
     assert "cleanup incomplete" in message and "Name a claim of your own" not in message and "refused for an installed release" in message
     assert "abandon" not in hint and hint.startswith("HINT: resume --operation")
     assert "correct the backend" not in result.stderr, "the check itself PASSED here: no backend fault"
+
+
+def test_a_crafted_reason_or_phase_is_cut_to_its_enum_word(tmp_path):
+    """review sweep B2: the never-ran refusal printed the Pod's waiting
+    reason, its PodScheduled reason or its phase -- enum words from the API,
+    but taken as they came. Anything beyond letters and digits is stripped, so
+    a crafted status cannot carry text into the refusal."""
+    marker = "ZZSECRET-CANARY"
+    crafted = {"status": {"phase": "Pending",
+               "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable " + marker + "\nGSJ: forged",
+                               "message": "0/3 nodes " + marker}]}}
+    result, _ = _run_never_ran(tmp_path, status_json=crafted)
+    assert result.returncode == 1
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert marker not in result.stderr and "forged" not in result.stderr
+    assert "(Unschedulable" in message and "was not tested" in message
+    crafted = {"status": {"phase": "Pending " + marker, "conditions": [{"type": "PodScheduled", "status": "True"}]}}
+    second = tmp_path / "second"; second.mkdir()
+    result, _ = _run_never_ran(second, status_json=crafted)
+    assert result.returncode == 1 and marker not in result.stderr

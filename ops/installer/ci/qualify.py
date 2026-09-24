@@ -59,8 +59,9 @@ def expected_checks():
     staged bare clone or the ../gsj-next-web sibling (webpin.git_dir) -- which
     is a fact about the machine the harness runs on, not about the installer.
     qualify() therefore resolves it ONCE, in its first second, before the
-    bundle is verified or the cluster is touched: the first PROMOTION run
-    reached this call after a two-hour install and died on a bare ValueError.
+    bundle is verified or the cluster is touched: the first release
+    qualification reached this call after a two-hour install and died on a
+    bare ValueError.
     Here a missing directory is this harness's own refusal, in words."""
     try:
         source = webpin.show("gsj_deploy/verify.py").decode()
