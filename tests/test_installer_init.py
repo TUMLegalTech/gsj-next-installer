@@ -198,6 +198,7 @@ def _sandbox(tmp_path, **versions):
             continue
         if tool == "jq":
             target.symlink_to(shutil.which("jq"))
+            continue                                                  # a link: chmod would follow it
         elif tool == "openssl":
             target.write_text(f'#!/bin/sh\nif [ "${{1:-}}" = version ]; then printf "%s\\n" \'{version}\'; else exec {real_openssl} "$@"; fi\n')
         elif tool == "helm":
@@ -742,9 +743,11 @@ def test_an_installer_folder_that_cannot_be_written_still_verifies_from_the_chec
         os.chmod(box.installer.parent, 0o755)
     assert result.returncode == 0, result.stderr + result.stdout
     report = _report(result)
-    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_downloaded"] == 4 and report["verification"]["companions_saved"] == 0
-    assert "not saved" in result.stderr
-    assert box.beside() == []
+    saved = 4 if os.geteuid() == 0 else 0                              # root writes through mode 555
+    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_downloaded"] == 4 and report["verification"]["companions_saved"] == saved
+    if saved == 0:
+        assert "not saved" in result.stderr
+        assert box.beside() == []
 
 
 # --- the read-only proof and the secrets rule ---------------------------------------

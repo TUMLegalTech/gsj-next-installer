@@ -5744,7 +5744,7 @@ init_box() {
    log 'init: running inspect'
    if ( CONTEXT_ARG=$context; inspect_cluster ) </dev/null > "$GSJ_WORK/init-inspect.out" 2>"$GSJ_WORK/init-inspect.err" && jq -e '.schema=="gsj.inspect/1"' "$GSJ_WORK/init-inspect.out" >/dev/null 2>&1; then
      mv -f "$GSJ_WORK/init-inspect.out" "$profile"; init_row inspect PASS "context $context" "the cluster profile (gsj.inspect/1) is in the report"
-   else printf '{"unavailable":true,"reason":"inspect did not complete"}\n' > "$profile"; init_row inspect UNKNOWN "context $context" 'inspect did not complete; run ./gsj-install.sh inspect by hand and read its line' ''; fi
+   else printf '{"unavailable":true,"reason":"inspect did not complete"}\n' > "$profile"; init_row inspect UNKNOWN "context $context" 'inspect did not complete; run the inspect command by hand and read its line' ''; fi
  else init_row inspect UNKNOWN '' 'not run: inspect needs kubectl and jq at their floors and a cluster that answered (above)' ''; fi
  if jq -e '.nodes' "$profile" >/dev/null 2>&1; then
    node_arch=$(jq -r '[.nodes[]?.architecture // empty | "linux/" + .] | unique | join(", ")' "$profile" 2>/dev/null) || node_arch=''
