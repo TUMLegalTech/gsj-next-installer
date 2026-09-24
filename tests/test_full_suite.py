@@ -118,12 +118,19 @@ def test_the_gate_refuses_any_helm_but_the_engineered_client(tmp_path, monkeypat
     naming both versions."""
     engineered = full_suite.engineered_helm_version()
     assert engineered == "v4.2.2"
-    for found in ("v0.0.1+gdeadbee", "v3.22.0+g144ca65", "v3.13.3+gc8b9489", "v4.2.1+g0000000"):
+    for found in ("v0.0.1+gdeadbee", "v3.22.0+g144ca65", "v3.13.3+gc8b9489", "v4.2.1+g0000000",
+                  # review finding: a pre-release of the engineered version is not it --
+                  # the parser once read v4.2.2-rc.1+g1234567 as v4.2.2
+                  "v4.2.2-rc.1+g1234567", "v4.2.2-rc.1", "v4.2.2.1+gabcdef0"):
         monkeypatch.setenv("PATH", str(_fake_helm(tmp_path, found)) + ":/usr/bin:/bin")
         lines = [line for line in full_suite.missing_prerequisites() if "helm" in line]
         assert lines, found
         assert found.split("+")[0] in lines[0] and engineered in lines[0], lines[0]
         assert "clients.json" in lines[0]
+    # the exact release, with or without Helm's build metadata, is the engineered client
+    for found in ("v4.2.2+gb05881c", "v4.2.2"):
+        monkeypatch.setenv("PATH", str(_fake_helm(tmp_path, found)) + ":/usr/bin:/bin")
+        assert full_suite.helm_version_found() == "v4.2.2", found
     # the engineered client itself: no helm line
     monkeypatch.setenv("PATH", str(_fake_helm(tmp_path, "v4.2.2+gb05881c")) + ":/usr/bin:/bin")
     assert not [line for line in full_suite.missing_prerequisites() if "helm" in line]

@@ -254,6 +254,16 @@ def qualified_files(module, tmp_path, monkeypatch):
     staged = staged_release()
     (tmp_path / "staging.json").write_text(json.dumps(staged))
     monkeypatch.setattr(module, "bundle", lambda path: descriptor)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gsj_startup_runtime_preflight", ROOT / "ops/installer/startup-runtime-preflight.py")
+    registry = importlib.util.module_from_spec(spec); spec.loader.exec_module(registry)
+    pair = next(p for p in registry.QUALIFIED_SOURCE_RUNTIMES if p[0].startswith("9c8426"))
+    (tmp_path / "initializer-qualification.json").write_text(json.dumps({
+        "schema": "gsj.initializer-qualification/1", "status": "passed",
+        "images": {name: {"reference": f"{images[name]['repository']}@{images[name]['digest']}", "digest": f"{images[name]['repository']}@{images[name]['digest']}",
+                          "id": "sha256:" + "0" * 64, "local": False} for name in ("web", "chroma")},
+        "pair": {"initialize_sha256": pair[0], "corpus_sha256": pair[1], "registered": True},
+        "cases": {name: {"status": "passed"} for name in ("import", "readback", "core", "block")}}))
     reports = []
     for mode, names in {"ordinary": ["fresh-full-corpus-install", "same-bundle-repeat"],
                         "upgrade": ["populated-source-created", "full-populated-source-to-target-upgrade", "source-backup-and-preservation",
@@ -1087,3 +1097,30 @@ def test_qualification_refuses_a_missing_pinned_git_directory_in_its_first_secon
         module.qualify(args)
     assert calls and calls[0][:7] == ("kubectl", "--context", "disposable", "--namespace", "gsj-qualification-test", "get", "namespace")
     assert json.loads(report.read_bytes())["failure_phase"] == "target-preflight"
+
+
+@pytest.mark.parametrize("fault", ["missing", "failed", "digest", "unregistered", "case"])
+def test_the_release_gate_requires_the_initializer_qualification(modules, tmp_path, monkeypatch, fault):
+    """The initializer registration in startup-runtime-preflight.py records
+    a claim; ci/qualify-initializer.py's report backs it, and the gate holds
+    that report to the candidate: passed, run on the manifest's own web and
+    chroma images by digest, the pair it measured inside the image
+    registered, every case passed. Any of those missing stops the release."""
+    module = modules[1]
+    _, reports = qualified_files(module, tmp_path, monkeypatch)
+    path = tmp_path / "initializer-qualification.json"
+    report = json.loads(path.read_text())
+    if fault == "missing":
+        path.unlink()
+    elif fault == "failed":
+        report["status"] = "failed"
+    elif fault == "digest":
+        report["images"]["web"]["digest"] = "registry.invalid/web@sha256:" + "f" * 64
+    elif fault == "unregistered":
+        report["pair"]["initialize_sha256"] = "e" * 64
+    elif fault == "case":
+        report["cases"]["block"]["status"] = "failed"
+    if fault != "missing":
+        path.write_text(json.dumps(report))
+    with pytest.raises(ValueError):
+        module.gate(tmp_path, reports)

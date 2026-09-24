@@ -1623,7 +1623,7 @@ def test_success_summary_reports_identity_status_and_redacted_settings(runtime):
                                        "skipped": [], "endpoints": {}, "public_https": "passed", "networkpolicy": "passed"}
     assert summary["settings"]["operator"]["password_file"] == "(protected file)"
     assert summary["settings"]["llm"]["credential"] == {"file": "(protected file)", "secret": ""}
-    assert summary["settings"]["llm"]["base_url"] == "https://llm.example/v1"
+    assert summary["settings"]["llm"]["base_url"] == "https://llm.example"      # the origin: review B2
     assert "/secure/" not in result.stdout + result.stderr
     assert summary["installed_record"] == str(work / "installed.json")
     assert summary["verification_report"] == str(work / "verification.json")
@@ -2251,6 +2251,68 @@ def test_a_verb_that_needs_helm_4_is_refused_in_the_first_seconds_before_the_lea
     assert json.loads(state.read_text())["calls"] == []             # the cluster was not touched
 
 
+_RESTORE_PHASES = ("owned", "restoring-resources", "restoring-files", "restore-files-verified",
+                   "applying", "initializing", "verifying", "complete")
+
+
+@pytest.mark.parametrize("command,record,flags,refused,named", [
+    # the review's two omitted paths: the startup-source proof (three
+    # cluster reads before a generic refusal; a same-target repair renewed
+    # its Lease first) and the startup continuation (two reads)
+    ("repair", {"kind": "install", "status": "applying"}, "SOURCE_INSTALLER=/x/gsj-install.sh", True, "--source-installer"),
+    ("repair", {"kind": "install", "status": "applying", "startup_source": {"release_identity": "src"}}, "", True, "recorded"),
+    ("repair", {"kind": "install", "status": "repair-prepared", "startup_source": {"release_identity": "src"}}, "", True, "recorded"),
+    ("repair", {"kind": "install", "status": "applying"}, "CONTINUE_HELM_INSTALLER=/x/gsj-install.sh", True, "--continue-helm-installer"),
+    ("resume", {"kind": "install", "status": "owned", "startup_source": {"release_identity": "src"}}, "", True, "resume"),
+    ("resume", {"kind": "install", "status": "backup-verified", "startup_source": {"release_identity": "src"}}, "", True, "resume"),
+    # the audit's two: resume at repair-prepared re-enters repair_operation
+    # (the repair transition re-reads the source), and backup-repair reads
+    # the repair's backup source -- both render, both renewed the Lease first
+    ("resume", {"kind": "install", "status": "repair-prepared", "startup_source": {"release_identity": "src"}}, "", True, "resume"),
+    ("backup-repair", {"kind": "install", "status": "repair-backing-up", "startup_source": {"release_identity": "src"}}, "", True, "backup-repair"),
+    # a backup ROUND reads the backup source instead and never renders
+    ("repair", {"kind": "install", "status": "applying", "startup_source": {"release_identity": "src"}}, "BACKUP_ROUND=2", False, ""),
+    ("repair", {"kind": "install", "status": "applying", "startup_source": {"release_identity": "src"}, "backup_round": 1}, "", False, ""),
+    ("resume", {"kind": "install", "status": "owned", "startup_source": {"release_identity": "src"}, "backup_round": 1}, "", False, ""),
+    ("backup-repair", {"kind": "install", "status": "repair-backing-up"}, "", False, ""),
+    # the same records where no render follows: an ordinary repair or resume
+    ("repair", {"kind": "install", "status": "applying"}, "", False, ""),
+    ("resume", {"kind": "install", "status": "applying", "startup_source": {"release_identity": "src"}}, "", False, ""),
+    ("resume", {"kind": "install", "status": "initializing", "startup_source": {"release_identity": "src"}}, "", False, ""),
+    ("resume", {"kind": "install", "status": "verifying", "startup_source": {"release_identity": "src"}}, "", False, ""),
+    ("resume", {"kind": "install", "status": "owned"}, "", False, ""),
+    # restore-repair with a source installer is the restore PROGRAM path (no render)
+    ("restore-repair", {"kind": "restore", "status": "owned"}, "SOURCE_INSTALLER=/x/gsj-install.sh", False, ""),
+    # a restore: only `applying` re-proves its Helm revision offline (the
+    # the review's minor: every other phase ran on Helm 3 before, and still does)
+    *[("repair", {"kind": "restore", "status": phase}, "", phase == "applying", "restore") for phase in _RESTORE_PHASES],
+    *[("repair", {"kind": "restore", "status": phase}, "SOURCE_INSTALLER=/x/gsj-install.sh", phase == "applying", "restore") for phase in _RESTORE_PHASES],
+])
+def test_the_recovery_paths_that_render_offline_are_refused_early_by_name(runtime, command, record, flags, refused, named):
+    """Review finding (the recovery paths): two more paths reach
+    the offline render -- the startup-source repair (--source-installer, or
+    a recorded `startup_source`, and its resumed recovery) and the startup
+    continuation (--continue-helm-installer) -- and passed the early refusal:
+    they read the cluster (three and two reads) and the same-target repair
+    renewed its Lease before a generic refusal that named no verb. Both are
+    refused here, before any cluster read or Lease activity, naming the verb
+    and --fetch-tools. And the restore refusal is narrowed to `applying`,
+    the one phase that renders."""
+    run, state, work = runtime
+    _fake_helm_on_path(work, "v3.22.0+g144ca65")
+    (work / "operation.json").write_text(json.dumps({"operation": "a" * 24, **record}))
+    result = run(f"COMMAND={command}; RESUME_ID={'a' * 24}; {flags}\nhelm_verb_preflight\necho reached\n")
+    if refused:
+        assert result.returncode == 1, result.stderr
+        line = result.stderr.strip().splitlines()[-1]
+        assert line.startswith("GSJ: ") and command in line and named in line, line
+        assert "Helm 4" in line and "3.22.0" in line and "--fetch-tools" in line, line
+        assert "reached" not in result.stdout
+    else:
+        assert result.returncode == 0 and "reached" in result.stdout, result.stderr
+    assert json.loads(state.read_text())["calls"] == []             # the cluster was not touched, the Lease untouched
+
+
 def test_helm_4_itself_passes_the_verb_preflight(runtime):
     run, _, work = runtime
     _fake_helm_on_path(work, "v4.2.2+gb05881c")
@@ -2349,6 +2411,100 @@ def test_url_origin_only_strips_the_path_and_the_userinfo(runtime):
     result = run('for u in https://u:pw@h.example:8443/a/b http://h.example/x https://h.example "not a url" http://u@h.example:1/; do url_origin_only "$u"; echo; done\n')
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["https://h.example:8443", "http://h.example", "https://h.example", "not a url", "http://h.example:1"]
+
+
+def test_the_summary_keeps_and_prints_only_the_origin_of_every_site_url(runtime):
+    """Review B2: the closing summary echoed a schema-valid,
+    credential-bearing URL PATH to stdout -- llm.base_url may carry a path,
+    ocr.url must, and the summary printed the site's values whole and kept
+    them in summary.json. Every URL the summary keeps or prints now goes
+    through url_origin_only, the one function: the site's five URL fields
+    and the closing line's public_url. The full values stay in site.json."""
+    run, _, work = runtime
+    marker = "ZZSECRETCANARY"
+    payload = work / "payload"; payload.mkdir()
+    (payload / "release.json").write_text(json.dumps(_release()))
+    (payload / "chart.tgz").write_bytes(b"synthetic chart")
+    site = _site()
+    site["public_url"] = "https://legal.example:8443/"
+    site["llm"]["base_url"] = f"https://u:{marker}@llm.example/{marker}/v1"
+    site["ocr"]["url"] = f"https://ocr.example/{marker}/v1/chat/completions"
+    site.setdefault("corpus", {})["vectors_url"] = f"https://vectors.example/{marker}/vectors.json"
+    site.setdefault("backup", {})["offbox_url"] = f"https://backup.example/{marker}/archives"
+    site.setdefault("tls", {})["acme_server"] = f"https://eab:{marker}@acme.example/{marker}/directory?token={marker}"
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "public-check.json").write_text(json.dumps({"status": "passed"}))
+    (work / "network-check.json").write_text(json.dumps({"status": "passed"}))
+    for checks in ([{"name": "operator-login", "status": "passed"}],
+                   [{"name": "operator-login", "status": "passed"}, {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-unreachable"}]):
+        (work / "verification.json").write_text(json.dumps({"status": "passed", "checks": checks, "endpoints": {"ocr": "unreachable"}}))
+        result = run('GSJ_PAYLOAD="$TEST_WORK/payload"; OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; VERSION=v1.2.3\ninstallation_summary\n')
+        assert result.returncode == 0, result.stderr
+        everything = result.stdout + result.stderr + (work / "summary.json").read_text()
+        assert marker not in everything, everything
+        summary = json.loads((work / "summary.json").read_text())
+        assert json.loads(result.stdout) == summary
+        assert summary["public_url"] == "https://legal.example:8443"
+        assert summary["settings"]["llm"]["base_url"] == "https://llm.example"
+        assert summary["settings"]["ocr"]["url"] == "https://ocr.example"
+        assert summary["settings"]["corpus"]["vectors_url"] == "https://vectors.example"
+        assert summary["settings"]["backup"]["offbox_url"] == "https://backup.example"
+        assert summary["settings"]["tls"]["acme_server"] == "https://acme.example"
+        assert "at https://legal.example:8443." in result.stderr
+    assert "PARTIAL" in result.stderr                       # the second run took the partial line
+    # the schema's URL fields are exactly the six the summary routes, plus
+    # llm.allowed_origins, which the schema itself holds to scheme://host
+    schema = json.loads((INSTALLER / "site.schema.json").read_text())
+    urlish = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            if "http" in str(node.get("pattern", "")):
+                urlish.append(".".join(path))
+            for key, value in node.items():
+                if key in ("properties", "items"):
+                    walk(value, path)
+                elif isinstance(value, dict):
+                    walk(value, path + [key])
+    walk(schema, [])
+    assert sorted(urlish) == sorted(["public_url", "llm.base_url", "llm.allowed_origins", "ocr.url",
+                                     "tls.acme_server", "backup.offbox_url", "corpus.vectors_url"]), urlish
+    origins = schema["properties"]["llm"]["properties"]["allowed_origins"]["items"]["pattern"]
+    assert "@" not in origins.replace("[^/@?#:", "").replace("[^/@?#", "") and origins.endswith("*$(?![\\s\\S])")
+
+
+def test_no_printed_url_bypasses_url_origin_only():
+    """The bypass test [review B2]: in every shell file of the installer,
+    the text a line prints or records -- what follows `log`, `fail`,
+    `printf`, `echo`, the refusal wrappers (any *fail*, lease_still_live)
+    and an assignment later printed (RECOVERY_HINT, note, hint, found, next,
+    fresh, resume, message, line) -- that names a URL (the site's URL
+    fields through `j` or `jq`, or a variable named url / base / *url /
+    *_server / URL) must wrap it in url_origin_only, immediately. A line
+    continued with a backslash is scanned whole; a printf piped into `tee`
+    prints, one piped into a filter derives. A new print that bypasses the
+    function fails here by file and line; the summary's jq is held by the
+    canary test above to its six --arg origins."""
+    urlish = re.compile(r"\$\(j '?\.?[a-z_.]*(url|base_url|acme_server|offbox_url|vectors_url)\b"
+                        r"|\$\(jq [^)]*\.(public_url|base_url|url|acme_server|vectors_url|offbox_url)\b"
+                        r"|\$\{?([A-Za-z_]*url|URL|base|[a-z_]*_server)\b")
+    sinks = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still_live) ['\"]"
+                       r"|\b(RECOVERY_HINT|note|hint|found|next|fresh|resume|message|line)=)")
+    hits = []
+    for path in sorted(INSTALLER.glob("*.sh")):
+        joined = path.read_text().replace("\\\n", " ")
+        for n, line in enumerate(joined.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            for sink in sinks.finditer(line):
+                printed = line[sink.start():]
+                if printed.startswith("printf") and "|" in printed and "| tee" not in printed:
+                    continue                                   # a printf piped into a filter derives, it does not print
+                for found in urlish.finditer(printed):
+                    before = printed[:found.start()]
+                    if not (before.endswith('url_origin_only "') or before.endswith('url_origin_only "$(')):
+                        hits.append(f"{path.name}:{n}: {found.group(0)}")
+    assert hits == [], hits
 
 
 # --- review finding M7: the guide names the key file the release carries ---

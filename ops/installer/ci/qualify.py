@@ -535,6 +535,35 @@ def qualify(args):
     require(report["status"] == "passed", "qualification did not pass every required phase")
 
 
+def check_initializer_qualification(directory, manifest):
+    """The initializer qualification (ci/qualify-initializer.py) beside the
+    release output: passed, run on the manifest's own web and chroma images by
+    digest, and the (initialize.py, corpus.py) pair it measured inside the
+    image registered in startup-runtime-preflight.py. Registering a pair
+    records a claim; this report is what backs it."""
+    import importlib.util
+    path = directory / "initializer-qualification.json"
+    require(path.is_file(), "the initializer qualification report is missing (ci/qualify-initializer.py)")
+    report = json.loads(path.read_bytes())
+    require(report.get("schema") == "gsj.initializer-qualification/1" and report.get("status") == "passed",
+            "the initializer qualification did not pass")
+    for name in ("web", "chroma"):
+        image = manifest["images"][name]
+        ran = (report.get("images") or {}).get(name) or {}
+        require(ran.get("digest") == f"{image['repository']}@{image['digest']}" and ran.get("local") is False,
+                f"the initializer qualification did not run on the release's {name} image by digest")
+    pair = report.get("pair") or {}
+    spec = importlib.util.spec_from_file_location("gsj_startup_runtime_preflight", ROOT / "ops/installer/startup-runtime-preflight.py")
+    registry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(registry)
+    require(pair.get("registered") is True
+            and (pair.get("initialize_sha256"), pair.get("corpus_sha256")) in registry.QUALIFIED_SOURCE_RUNTIMES,
+            "the initializer pair the qualification measured is not a registered runtime")
+    cases = report.get("cases") or {}
+    require(all(isinstance(cases.get(name), dict) and cases[name].get("status") == "passed"
+                for name in ("import", "readback", "core", "block")), "an initializer qualification case did not pass")
+
+
 def gate(directory, reports):
     descriptor = bundle(directory)
     require(descriptor.get("qualification") is False, "qualification-only artifact cannot be publicly released")
@@ -549,6 +578,7 @@ def gate(directory, reports):
                 "upgrade": {"populated-source-created", "full-populated-source-to-target-upgrade", "source-backup-and-preservation",
                             "selected-version-repeat-converges", "hard-restart-cookie-and-attempt", "fresh-restore-to-target-acceptance"}}
     require(len(reports) == 2, "both installer qualification reports are required")
+    check_initializer_qualification(directory, manifest)
     seen = set()
     for path in reports:
         report = json.loads(path.read_bytes())

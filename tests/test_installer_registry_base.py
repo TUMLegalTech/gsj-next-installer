@@ -698,3 +698,27 @@ def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(run
     assert "did not finish pulling" in line and "PodScheduled: Unschedulable" in line and "pull-probe-status.json" in line
     assert marker not in result.stdout + result.stderr
     assert marker in (work / "pull-probe-status.json").read_text()
+
+
+def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, tmp_path):
+    """review sweep B2: the deadline refusal joined every False condition's
+    MESSAGE -- the scheduler's free text (a taint's key and value, a node's
+    name). It now names the conditions' reasons (the API's enum words) and
+    keeps the Pod's status in the state directory."""
+    run, _, work = runtime
+    marker = "ZZSECRET-CANARY"
+    waiting = {"waiting": {"reason": "ContainerCreating"}}
+    status = json.loads(_statuses([waiting] * 6))
+    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable" + "ZZSECRETCANARY",
+                                       "message": "0/3 nodes are available: taint team=" + marker}]
+    (work / "status.json").write_text(json.dumps(status))
+    release = _public_release(); payload = _payload(tmp_path, release); site = _site()
+    site["registry"].update(base=BASE, pull_secret="corp-pull"); site.setdefault("deadlines", {})["dependencies_seconds"] = 10
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    result = run(PROBE_PRELUDE.format(payload=payload) + "relocated_images_probe")
+    assert result.returncode != 0
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "did not finish pulling" in line and "PodScheduled: other" in line and "ZZSECRETCANARY" not in result.stderr and "pull-probe-status.json" in line
+    assert marker not in result.stdout + result.stderr
+    assert marker in (work / "pull-probe-status.json").read_text()
