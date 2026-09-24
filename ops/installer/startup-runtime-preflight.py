@@ -96,16 +96,35 @@ QUALIFIED_SOURCE_RUNTIMES = {
      'c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8'),
     # initialize.py names what it established instead of the budget: a
     # restart repeats the recorded deterministic reason, a deterministic
-    # shard failure surfaces as itself, and a deadline spent waiting for
-    # Chroma is `chroma-unavailable` (the product's message pass; no
-    # receipt, checkpoint, identity or shard format changed, and the
-    # signatures this preflight pins are the same). corpus.py is
-    # BYTE-IDENTICAL to the pair above. Added, never swapped: the pair above
-    # is what the standing rollout target and the reference deployment run,
-    # and this one is what the next product release ships. The registration
-    # is checked against the PIN by tests/test_web_pin.py, so a pin bump to a
-    # product whose pair is missing here fails the gate by name.
-    ('4de81568c19676cb31d2ac31163f135e8be8b02b58f1ee5f2a965f1e155fe35d',
+    # shard failure surfaces as itself (one import attempt, a global
+    # terminal checkpoint, the cause named again on the init container's
+    # restart -- a BEHAVIOURAL change, measured; registering it here records
+    # a claim, only a run against the released images qualifies it), a
+    # deadline spent waiting for Chroma is `chroma-unavailable`, and a shard
+    # whose released vector block, or whose source rows as the parser
+    # derives them, disagree with the manifest INSIDE the import
+    # (vector_records, read_shard_vectors: `source-verification-failed`) is
+    # terminal at once too -- the volume does not change under a running
+    # initializer (every block is published atomically, the vectors
+    # manifest last); the copied shard's directory check before the import
+    # keeps its restart semantics. corpus.py is BYTE-IDENTICAL to the pair
+    # above. An intermediate message-pass initializer was registered and
+    # withdrawn before any deployment ran it. This pair is what the next
+    # product release ships. QUALIFICATION: ci/qualify-initializer.py, run
+    # against the RELEASED images, backs it -- the released vectors
+    # imported and read back from SQLite and Chroma with matching
+    # identities and no re-embedding, then two deliberate deterministic
+    # shard failures (a row whose parse disagrees with the manifest:
+    # core-mismatch; a released block whose ids disagree:
+    # source-verification-failed), each one import attempt, a terminal
+    # checkpoint, and the same cause on the restart; its report names the
+    # pair it measured inside the image and the release gate requires it
+    # (README, the release step by step: before any deployment that runs
+    # this initializer is upgraded, and before the installer is published).
+    # The registration is checked against the PIN by tests/test_web_pin.py,
+    # so a pin bump to a product whose pair is missing here fails the gate
+    # by name.
+    ('9c8426dbcafc0916e180f4f06d94803726ce2a06882f66eb2d98bdaa60ac9487',
      'c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8'),
 }
 

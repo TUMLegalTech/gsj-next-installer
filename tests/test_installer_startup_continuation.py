@@ -453,16 +453,40 @@ def test_cli_refuses_incompatible_continuation_modes_before_bootstrap(shell, arg
     assert not (m['state'] / 'bootstrap-called').exists()
 
 
-def test_cli_passes_exact_named_continuation_to_repair(shell):
-    m = shell; (m['payload'] / 'helpers').mkdir()
-    for name in ('startup-recovery.sh', 'verification-cleanup.sh'): (m['payload'] / 'helpers' / name).write_text('')
-    result = m['run']('''bootstrap() { :; }; install_exit_traps() { :; }; configure_interaction() { :; }; load_site() { :; }
+def _fake_helm(m, version):
+    """The continuation renders the failed Helm target offline, which only Helm 4
+    does: the CLI wiring below is proven under a Helm 4, and a Helm 3 is refused
+    by name before the repair (the review's early refusal), whatever helm the
+    box running the suite carries."""
+    binpath = m['tmp'] / 'helm-bin'; binpath.mkdir(exist_ok=True)
+    (binpath / 'helm').write_text('#!/bin/sh\n[ "$1" = version ] && { echo ' + version + '; exit 0; }\nexit 1\n')
+    (binpath / 'helm').chmod(0o755)
+    return f'export PATH={shlex.quote(str(binpath))}:$PATH\n'
+
+
+CLI_CONTINUATION = '''bootstrap() { :; }; install_exit_traps() { :; }; configure_interaction() { :; }; load_site() { :; }
 inspect_cluster() { printf '{}'; }; preflight() { :; }
 repair_operation() { jq -n --arg target "$CONTINUE_HELM_INSTALLER" --arg previous "$CONTINUE_FROM_PROGRAM" --arg op "$RESUME_ID" '{target:$target,previous:$previous,operation:$op}' > "$STATE_DIR/selected.json"; }
 main repair --operation aaaaaaaaaaaaaaaaaaaaaaaa --continue-helm-installer '/protected/signed target/gsj-install.sh' --continue-from-program '/protected/prior program/gsj-install.sh' --non-interactive
-''')
+'''
+
+
+def test_cli_passes_exact_named_continuation_to_repair(shell):
+    m = shell; (m['payload'] / 'helpers').mkdir()
+    for name in ('startup-recovery.sh', 'verification-cleanup.sh'): (m['payload'] / 'helpers' / name).write_text('')
+    result = m['run'](_fake_helm(m, 'v4.2.2+gb05881c') + CLI_CONTINUATION)
     assert result.returncode == 0, result.stderr
     assert json.loads((m['state'] / 'selected.json').read_text()) == {'target': '/protected/signed target/gsj-install.sh', 'previous': '/protected/prior program/gsj-install.sh', 'operation': OP}
+
+
+def test_cli_refuses_the_continuation_on_helm_3_before_the_repair(shell):
+    m = shell; (m['payload'] / 'helpers').mkdir()
+    for name in ('startup-recovery.sh', 'verification-cleanup.sh'): (m['payload'] / 'helpers' / name).write_text('')
+    result = m['run'](_fake_helm(m, 'v3.22.0+g144ca65') + CLI_CONTINUATION)
+    assert result.returncode == 1, result.stderr
+    line = result.stderr.strip().splitlines()[-1]
+    assert line.startswith('GSJ: ') and '--continue-helm-installer' in line and 'Helm 4' in line and '--fetch-tools' in line, line
+    assert not (m['state'] / 'selected.json').exists()          # repair_operation never ran
 
 
 @pytest.mark.parametrize('tamper', [False, True])

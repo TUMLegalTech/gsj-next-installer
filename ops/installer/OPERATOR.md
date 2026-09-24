@@ -554,16 +554,21 @@ anything: the release ships none of them, and `--fetch-tools` equips the
 *installer* for one run, not the blocks you paste into your own shell — steps 2
 to 7 use your own `jq` and `kubectl`.
 
-Helm 3.13 installs, upgrades and removes. **Helm 4 is required by two verbs
-only: `addon-repair`, and `repair --operation` of a *restore* that stopped at
-its application Helm revision** — recovery verbs you reach when something has
-already gone wrong. Each refuses a Helm 3 in its first seconds, before it
-reads the cluster and before it takes the Lease, naming the verb, the Helm it
-found and `--fetch-tools`. `install`, `upgrade`, `upgrade --to`, `resume`,
-`repair` of an install or upgrade, `backup`, `backup-repair`, `restore`,
-`restore-repair`, `sweep` and `abandon` run on Helm 3.13 and later. You do
-not need Helm 4 today; know that you will need it for those two, and that on
-an air-gapped host `--fetch-tools` cannot fetch it.
+Helm 3.13 installs, upgrades and removes. **Helm 4 is required by four
+recovery paths only: `addon-repair`; `repair --operation` of a *restore* that
+stopped at its application Helm revision (status `applying`); the
+startup-source recovery — `repair --operation` with `--source-installer`, or
+of an operation whose record carries a startup source, the `resume` of that
+recovery and its `backup-repair` (a backup round of it reads the backup and
+does not); and the startup continuation, `repair --operation
+--continue-helm-installer`** — paths you reach when something has already
+gone wrong. Each refuses a Helm 3 in its first seconds, before it reads the
+cluster and before it takes or renews the Lease, naming the path, the Helm
+it found and `--fetch-tools`. `install`, `upgrade`, `upgrade --to`, `resume`
+and `repair` outside those recovery paths, `backup`, `backup-repair`,
+`restore`, `restore-repair`, `sweep` and `abandon` run on Helm 3.13 and
+later. You do not need Helm 4 today; know that you will need it for those
+four, and that on an air-gapped host `--fetch-tools` cannot fetch it.
 
 **[if]** this machine reaches the internet only through a proxy. The installer
 has no proxy setting of its own: it downloads with `curl`, and `curl` takes the
@@ -1460,36 +1465,44 @@ policy matching nothing — silently. The installer now checks the server versio
 in its preflight and refuses there, before it writes anything to your cluster;
 the chart's `kubeVersion` is the second gate behind it.
 
-**Helm 4 is required by two verbs, and only those: `addon-repair` (the
-managed add-on repair/rollback path) and `repair --operation` of a restore
-that stopped at its application Helm revision (the restore's evidence is
-re-proven offline).** Both serialize a release with no cluster at all
-(`KUBECONFIG=/dev/null helm install --dry-run=client`), which no Helm 3 can
-do — Helm 3 has no `--kube-version` on `install` to suppress the discovery,
-and it fails with `Kubernetes cluster unreachable`. Every other verb — an
-ordinary install and upgrade, `upgrade --to`, `resume`, `repair` of an install
-or upgrade, `backup`, `backup-repair`, `restore`, `restore-repair`, `sweep`,
-`abandon` — needs only the floor above. On Helm 3 the two verbs refuse in
-their first seconds, after the site file is read and before the cluster is
-read or the Lease taken, naming the verb, the Helm found and `--fetch-tools`
-(`GSJ: addon-repair serializes a release without contacting the cluster,
-which only Helm 4 can do (found helm 3.22.0 at /usr/local/bin/helm). Install
-Helm 4 alongside, or re-run this command with --fetch-tools …`); nothing has
-been written when they do.
+**Helm 4 is required by four recovery paths, and only those: `addon-repair`
+(the managed add-on repair/rollback path); `repair --operation` of a restore
+that stopped at its application Helm revision, status `applying` (the
+restore's evidence is re-proven offline; every other restore phase is refused
+or routed elsewhere without rendering); the startup-source repair — `repair
+--operation` with `--source-installer`, or of an operation whose record
+carries a startup source, the `resume` of that recovery at the phases that
+re-apply or re-enter the repair, and its `backup-repair` (the signed
+predecessor is rendered offline; a backup round of that recovery reads the
+backup instead and runs on Helm 3); and the startup
+continuation, `repair --operation --continue-helm-installer` (the failed
+Helm target is rendered offline).** All four serialize a release with no
+cluster at all (`KUBECONFIG=/dev/null helm install --dry-run=client`), which
+no Helm 3 can do — Helm 3 has no `--kube-version` on `install` to suppress
+the discovery, and it fails with `Kubernetes cluster unreachable`. Every
+other verb — an ordinary install and upgrade, `upgrade --to`, `resume` and
+`repair` outside those recovery paths, `backup`, `backup-repair`, `restore`,
+`restore-repair`, `sweep`, `abandon` — needs only the floor above. On Helm 3
+the four paths refuse in their first seconds, after the site file is read
+and before the cluster is read or the Lease taken or renewed, naming the
+path, the Helm found and `--fetch-tools` (`GSJ: addon-repair serializes a
+release without contacting the cluster, which only Helm 4 can do (found helm
+3.22.0 at /usr/local/bin/helm). Install Helm 4 alongside, or re-run this
+command with --fetch-tools …`); nothing has been written when they do.
 
 **`--fetch-tools`** — accepted by every command but `init` — restores the old behaviour:
 the installer downloads this release's own checksum-pinned Helm, kubectl and jq
 into a private directory for that run and uses those instead. Use it on a box
 whose clients are too old to upgrade, on an air-gapped host that already has
-the cache populated, or to get Helm 4 for the two verbs above. The pinned
+the cache populated, or to get Helm 4 for the four paths above. The pinned
 versions and their SHA256s are in the release you already hold —
 `payload release.json | jq .clients` — re-define the two-line `payload()` helper
 from "Before you start" in whatever shell you are in; it does not survive a new
 one. **Read them before you let `--fetch-tools` run:** its kubectl is
 pinned for the release, not for your cluster, and it can sit well outside the
 +/-1 window the kubectl row above makes a rule. If it does, upgrade your own
-kubectl rather than fetching that one, and reserve `--fetch-tools` for the two
-verbs that genuinely require Helm 4. The download happens
+kubectl rather than fetching that one, and reserve `--fetch-tools` for the
+four recovery paths that genuinely require Helm 4. The download happens
 before the site file is read, so a proxy or custom CA needed for it must
 already be available to `curl`.
 

@@ -60,16 +60,20 @@ def engineered_helm_version():
 
 
 def helm_version_found():
-    """The Helm on PATH, as `helm version --short` reports it (vX.Y.Z), or
-    None when there is none or it reports no version."""
+    """The Helm on PATH, as `helm version --short` reports it: the exact
+    RELEASE version (vX.Y.Z, with or without Helm's `+g<commit>` build
+    metadata), or the raw first token when it reports anything else -- a
+    pre-release such as v4.2.2-rc.1+g1234567 is not v4.2.2 and is named as
+    what it is (review finding); None when there is no helm or no output."""
     if shutil.which("helm") is None:
         return None
     try:
         out = subprocess.run(["helm", "version", "--short"], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    match = re.match(r"v?(\d+\.\d+\.\d+)", out.strip())
-    return "v" + match.group(1) if match else None
+    token = out.strip().split()[0] if out.strip() else ""
+    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)(\+g[0-9a-f]+)?", token)
+    return "v" + match.group(1) if match else (token or None)
 CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem")
 
 

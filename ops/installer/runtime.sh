@@ -17,13 +17,31 @@ sha_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d ' 
 atomic() { local dst=$1; cat > "$dst.pending.$$"; chmod 600 "$dst.pending.$$"; sync "$dst.pending.$$"; mv -f "$dst.pending.$$" "$dst"; sync "$(dirname "$dst")"; }
 url_origin() { local rest=${1#*://}; printf '%s://%s' "${1%%://*}" "${rest%%/*}"; }
 url_origin_only() {
- # scheme://host[:port] of a URL, the path AND any userinfo dropped: a
- # credential can sit in either, and a log line names the endpoint, never
- # what it carries [review B2]. Not a URL: printed as it is.
- local rest
+ # scheme://host[:port] of a URL, the path, query, fragment AND any userinfo
+ # dropped: a credential can sit in any of them, and a log line or a record
+ # names the endpoint, never what it carries [review B2]. Not a URL: printed
+ # as it is (no scheme). A URL whose authority is not a host and a numeric
+ # port -- a password with an unencoded "/" cut the authority short, a
+ # bracketless IPv6 -- is named by the fixed words below, never repeated.
+ local rest authority
  [[ $1 == *://* ]] || { printf '%s' "$1"; return; }
- rest=${1#*://}; rest=${rest%%/*}; rest=${rest##*@}
- printf '%s://%s' "${1%%://*}" "$rest"
+ rest=${1#*://}; authority=${rest%%[/?#]*}; authority=${authority##*@}
+ if [[ $authority =~ ^([A-Za-z0-9._~%-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]]; then
+   printf '%s://%s' "${1%%://*}" "$authority"
+ else
+   printf '(not a valid http(s) address)'
+ fi
+}
+known_word() {
+ # A word the API defines -- a Pod phase, a container waiting reason, a
+ # condition type or reason, a PersistentVolume phase -- is repeated only
+ # when it is one of the values this installer knows: the API does not
+ # constrain a reason string, so anything else (a crafted status, a value a
+ # newer API adds) becomes the fixed word "other" [review sweep B2,
+ # review sweep B2]. Usage: known_word VALUE KNOWN...
+ local value=$1 word; shift
+ for word in "$@"; do [[ $value == "$word" ]] && { printf '%s' "$value"; return; }; done
+ printf 'other'
 }
 validator_words() {
  # validate.jq's stderr, made printable [review B2]. The validator's OWN
@@ -328,22 +346,58 @@ require_offline_render() {
 helm_verb_preflight() {
  # THE HELM 4 VERBS, refused in the first seconds [review B3] -- after the
  # clients are known and the site is read, before the cluster is read and
- # before the Lease. Two verbs reach the offline render above: addon-repair
- # always (repair_managed_addon), and repair of a RESTORE (its application
- # Helm revision is re-proven offline in restore_application_evidence).
- # Every other verb -- install, upgrade, upgrade --to, resume, repair of an
- # install or upgrade, backup, backup-repair, restore, restore-repair,
- # sweep, abandon, the credential/tls/lease repairs, inspect -- runs on the
- # Helm 3.13 floor. Before this, a Helm 3 operator was refused AT the step:
- # after the site was read, the cluster inspected and, for the restore,
- # most of its evidence re-read. require_offline_render still guards the
- # two sites themselves.
- local verb=''
+ # before the Lease. Four paths reach the offline render above (the sites of
+ # require_offline_render, all four): addon-repair always
+ # (repair_managed_addon); repair of a RESTORE stopped at `applying` -- the
+ # one restore phase whose application Helm revision is re-proven offline
+ # (restore_application_evidence; every other restore phase is refused or
+ # routed elsewhere by restore_application_repair without rendering); the
+ # STARTUP-SOURCE repair -- repair with --source-installer, or of an
+ # operation whose record carries `startup_source`, and its resumed
+ # recovery, resume at the two phases that reach helm_apply (owned,
+ # backup-verified): startup_source_control renders the signed predecessor;
+ # and the STARTUP CONTINUATION, repair --continue-helm-installer:
+ # startup_helm_failed_target renders the failed target. Every other verb
+ # -- install, upgrade, upgrade --to, resume and repair outside those
+ # recovery paths, backup, backup-repair, restore, restore-repair, sweep,
+ # abandon, the credential/tls/lease repairs, inspect -- runs on the Helm
+ # 3.13 floor. Before this, a Helm 3 operator was refused AT the step:
+ # after the site was read, the cluster inspected (three reads for the
+ # source proof, two for the continuation), the Lease renewed by a
+ # same-target repair, and for the restore most of its evidence re-read.
+ # require_offline_render still guards the four sites themselves.
+ local verb='' record="${STATE_DIR:-}/operation.json" kind='' status='' recorded_source=false backup_round=0
+ if [[ -f $record ]]; then
+   kind=$(jq -r '.kind // ""' "$record" 2>/dev/null || true)
+   status=$(jq -r '.status // ""' "$record" 2>/dev/null || true)
+   backup_round=$(jq -r '.backup_round // 0' "$record" 2>/dev/null || true)
+   jq -e '.startup_source != null' "$record" >/dev/null 2>&1 && recorded_source=true
+ fi
+ # A recorded startup source renders in read_repair_backup_source and in
+ # helm_apply -- unless a backup round is selected or recorded, which reads
+ # the backup source instead (read_backup_source) and never renders.
+ local source_path=false
+ if $recorded_source && [[ -z ${BACKUP_ROUND:-} && $backup_round == 0 ]]; then source_path=true; fi
  case $COMMAND in
    addon-repair) verb=addon-repair;;
    repair)
-     if [[ -f ${STATE_DIR:-}/operation.json ]] && jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null 2>&1; then
-       verb='repair of a restore (its application Helm revision is re-proven offline)'
+     if [[ $kind == restore ]]; then
+       [[ $status != applying ]] || verb='repair of a restore stopped at its application (its Helm revision is re-proven offline)'
+     elif [[ -n ${CONTINUE_HELM_INSTALLER:-} ]]; then
+       verb='repair --continue-helm-installer (the startup continuation re-proves the failed Helm target offline)'
+     elif [[ -n ${SOURCE_INSTALLER:-} ]] || $source_path; then
+       verb='repair with a startup source (--source-installer, or a recorded one: the startup-source proof renders the signed predecessor offline)'
+     fi;;
+   resume)
+     # the three resume phases that reach the render: owned and
+     # backup-verified through helm_apply, repair-prepared through
+     # repair_operation (the repair transition re-reads the source)
+     if $source_path && [[ $kind != restore && ( $status == owned || $status == backup-verified || $status == repair-prepared ) ]]; then
+       verb='resume of a startup-source recovery (the startup-source proof renders the signed predecessor offline)'
+     fi;;
+   backup-repair)
+     if $source_path && [[ $kind != restore ]]; then
+       verb='backup-repair of a startup-source recovery (the startup-source proof renders the signed predecessor offline)'
      fi;;
  esac
  [[ -n $verb ]] || return 0
@@ -1540,7 +1594,7 @@ stage_vectors() {
    # A transport failure returns curl's own rc, which errexit would turn into a
    # bare non-zero exit naming nothing. Every leg here ends in a GSJ: line.
    rc=0; fetch_public "$url" "$staging/vectors.json" "$expected" || rc=$?
-   (( rc == 0 )) || fail "the released vectors manifest could not be acquired from $url (transport exit $rc)"
+   (( rc == 0 )) || fail "the released vectors manifest could not be acquired from $(url_origin_only "$url") (transport exit $rc)"
  else
    path=$(resolve_file "$path"); private_file "$path"
    [[ $(sha_file "$path") == "$expected" ]] || fail 'staged vectors manifest does not match corpus.vectors_sha256'
@@ -1589,7 +1643,7 @@ stage_vectors() {
      mkdir -p "$holder"; chmod 700 "$holder"
      log "Acquiring released vector block $name ($((shard_bytes / 1048576)) MiB)"
      rc=0; fetch_public "$base/$name" "$holder/$name" "$shard_sha" || rc=$?
-     (( rc == 0 )) || fail "the released vector block $name could not be acquired from $base (transport exit $rc)"
+     (( rc == 0 )) || fail "the released vector block $name could not be acquired from $(url_origin_only "$base") (transport exit $rc)"
    else
      holder=$base
      [[ -f "$holder/$name" && ! -L "$holder/$name" ]] || fail "the vectors manifest names $name, which is not a plain file beside the staged manifest"
@@ -2439,9 +2493,15 @@ PY
      | ([(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | (.reason // "Unschedulable")] | first // "") as $sched
      | if $pull != "" then "pull " + $pull elif $sched != "" then "sched " + $sched else "wait " + (.status.phase // "unknown") end end' "$STATE_DIR/storage-check-pod.json" 2>/dev/null || true)
    [[ -n $never || $phase == Succeeded || $phase == Failed ]] || never="wait ${phase:-unknown}"
-   # the reason and the phase are the API's enum words; the message is never
-   # read here, and anything beyond letters is not repeated [review sweep B2]
-   never=$(printf '%s' "$never" | tr -cd 'A-Za-z0-9 ' | awk '{print $1, $2}')
+   # the reason and the phase are the API's words; the message is never read
+   # here, and only a value this installer KNOWS is repeated -- any other
+   # reason is "other" [review sweep B2]
+   case ${never%% *} in
+     '') ;;                                        # the Pod ended between the last poll and the snapshot: the phase is the verdict
+     pull) never="pull $(known_word "${never#* }" ErrImagePull ImagePullBackOff ErrImageNeverPull ImageInspectError InvalidImageName RegistryUnavailable)";;
+     sched) never="sched $(known_word "${never#* }" Unschedulable SchedulerError)";;
+     *) never="wait $(known_word "${never#* }" Pending Running Succeeded Failed Unknown unknown)";;
+   esac
  fi
  # The Pod's phase is the verdict (the check exits 0 only when every assert
  # held); the log carries its measurements. A log that could not be read is
@@ -2479,7 +2539,7 @@ PY
    elif ! $logs_read; then note=" The storage check itself passed (its Pod ended Succeeded), though its measurements could not be read (kubectl logs failed)."
    fi
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-   phase=$(printf '%s' "$phase" | awk '{print $1}' | tr -cd 'A-Za-z' | cut -c1-24)   # an enum word, nothing beyond letters is repeated [review sweep B2]
+   [[ -z $phase ]] || phase=$(known_word "$phase" Pending Available Bound Released Failed)   # a phase this installer knows, or "other"; unreadable stays unknown [review sweep B2]
    # After the backup a check whose Pod ended Failed (it started, and its own
    # asserts did not hold) is the backend's to correct, and resume will not
    # repeat the check: both refusals say so. A Pod that never ran is not that.
@@ -2949,10 +3009,17 @@ relocated_images_probe() {
    fi
    if (( spent >= deadline )); then
      RECOVERY_HINT="resume --operation $OPERATION once the registry answers, or repair --operation $OPERATION --config $CONFIG --non-interactive after raising deadlines.dependencies_seconds"
-     # the conditions' REASONS (the API's enum words); their messages are the
-     # scheduler's free text and are kept, never repeated [review sweep B2]
+     # the conditions' types and REASONS, each repeated only when it is a
+     # value this installer knows (the API does not constrain a reason
+     # string); their messages are the scheduler's free text and are kept,
+     # never repeated [review sweep B2]
      printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
-     fail "the node did not finish pulling this release's images from $where within deadlines.dependencies_seconds ($deadline s): $(jq -r '[(.status.conditions // [])[]|select(.status=="False")|.type+": "+((.reason // "unknown")|gsub("[^A-Za-z0-9]";""))]|join("; ")' <<< "$status"); the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
+     local conditions='' ctype creason
+     while IFS=$'\t' read -r ctype creason; do
+       [[ -n $ctype ]] || continue
+       conditions+="${conditions:+; }$(known_word "$ctype" PodScheduled Initialized ContainersReady Ready PodReadyToStartContainers DisruptionTarget): $(known_word "$creason" Unschedulable SchedulerError ContainersNotReady ContainersNotInitialized PodCompleted PodFailed ReadinessGatesNotReady unknown)"
+     done < <(jq -r '(.status.conditions // [])[]|select(.status=="False")|[.type, (.reason // "unknown")]|@tsv' <<< "$status")
+     fail "the node did not finish pulling this release's images from $where within deadlines.dependencies_seconds ($deadline s): $conditions; the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
    fi
    sleep 5; spent=$(( spent + 5 ))
  done
@@ -3974,9 +4041,9 @@ except OSError: sys.exit(73)
 try: tls.wrap_socket(raw, server_hostname=u.hostname).close()
 except OSError as e: print(getattr(e,"verify_message",None) or getattr(e,"reason",None) or type(e).__name__); sys.exit(74)' "$staged") || rc=$?
  (( rc != 0 )) || return 0
- if (( rc == 73 )); then found="cannot reach $url through $route (origin-unreachable); the tools-side public HTTPS check does not prove the Pod path"
+ if (( rc == 73 )); then found="cannot reach $(url_origin_only "$url") through $route (origin-unreachable); the tools-side public HTTPS check does not prove the Pod path"
  elif (( rc == 74 )); then
-   found="reached $url through $route, but the TLS handshake failed or the certificate did not pass strict verification for its hostname against verification.ca_file, or the system trust store when that is empty (${reason:+$reason; }origin-tls-failed)"
+   found="reached $(url_origin_only "$url") through $route, but the TLS handshake failed or the certificate did not pass strict verification for its hostname against verification.ca_file, or the system trust store when that is empty (${reason:+$reason; }origin-tls-failed)"
    # tls-repair reissues only the managed CA's signing extensions and keeps the
    # served certificate: name it for those refusals alone, and never again for
    # the CA it produced (a host OpenSSL laxer than the Pod's would loop).
@@ -4009,7 +4076,7 @@ except OSError as e: print(getattr(e,"verify_message",None) or getattr(e,"reason
      # Certificate and trust bytes are not saved configuration: resume
      # re-stages the trust file and dials the served certificate again.
      next="No installer command replaces this certificate: correct it in TLS Secret $(j .tls.secret) or the contents of verification.ca_file at their source, keeping the configured paths, then $resume"
-     RECOVERY_HINT="$resume once the certificate served for $url passes strict verification from the Pod; otherwise keep operation $OPERATION retained and $fresh"
+     RECOVERY_HINT="$resume once the certificate served for $(url_origin_only "$url") passes strict verification from the Pod; otherwise keep operation $OPERATION retained and $fresh"
    fi
    fail "the application Pod $found. A continued operation keeps its exact saved configuration, so no command corrects its verification route. $next; otherwise keep operation $OPERATION retained and $fresh. No verifier was started"
  fi
@@ -4021,7 +4088,7 @@ except OSError as e: print(getattr(e,"verify_message",None) or getattr(e,"reason
    RECOVERY_HINT="$ca_repair, then resume --operation $OPERATION; $wait"
    fail "the application Pod $found. tls-repair reissues the managed local CA's signing extensions under its existing key, subject and serial, and keeps the served certificate. No verifier was started"
  fi
- RECOVERY_HINT="resume --operation $OPERATION once the certificate served for $url passes strict verification from the Pod"
+ RECOVERY_HINT="resume --operation $OPERATION once the certificate served for $(url_origin_only "$url") passes strict verification from the Pod"
  fail "the application Pod $found. No installer command replaces this certificate: correct it in TLS Secret $(j .tls.secret) or the contents of verification.ca_file at their source, keeping the configured paths, or, if the route reaches another endpoint, correct verification.connect_host/connect_port; then resume. No verifier was started"
 }
 verification_bot_terminal() {
@@ -4153,9 +4220,17 @@ installation_summary() {
  # The install summary: URL, operator login, redacted settings, identities,
  # corpus status, verification results and where the full records live.
  local summary="$STATE_DIR/summary.json"
- jq -n --slurpfile site "$SITE" --slurpfile release "$GSJ_PAYLOAD/release.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg chart "$(sha_file "$GSJ_PAYLOAD/chart.tgz")" --arg operation "$OPERATION" --arg record "$STATE_DIR/installed.json" --arg report "$STATE_DIR/verification.json" '
+ # Every URL the summary keeps or prints -- the site's six URL fields
+ # (public_url, llm.base_url, ocr.url, corpus.vectors_url,
+ # backup.offbox_url, tls.acme_server; llm.allowed_origins are origins by
+ # schema) -- goes through url_origin_only, the one function: the origin,
+ # never a path, query or userinfo (a path segment is schema-valid and can
+ # carry a credential). The full values stay in site.json beside it
+ # [review B2].
+ jq -n --slurpfile site "$SITE" --slurpfile release "$GSJ_PAYLOAD/release.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg chart "$(sha_file "$GSJ_PAYLOAD/chart.tgz")" --arg operation "$OPERATION" --arg record "$STATE_DIR/installed.json" --arg report "$STATE_DIR/verification.json" \
+   --arg public_url "$(url_origin_only "$(j '.public_url // ""')")" --arg llm_url "$(url_origin_only "$(j '.llm.base_url // ""')")" --arg ocr_url "$(url_origin_only "$(j '.ocr.url // ""')")" --arg vectors_url "$(url_origin_only "$(j '.corpus.vectors_url // ""')")" --arg offbox_url "$(url_origin_only "$(j '.backup.offbox_url // ""')")" --arg acme_server "$(url_origin_only "$(j '.tls.acme_server // ""')")" '
    $site[0] as $s | $release[0] as $r | $verification[0] as $v |
-   {format:"gsj.install-summary/1",status:"complete",operation:$operation,public_url:$s.public_url,operator_login:$s.operator.login,
+   {format:"gsj.install-summary/1",status:"complete",operation:$operation,public_url:$public_url,operator_login:$s.operator.login,
     release:{identity:$r.identity,version:$r.version},
     fingerprints:{chart_sha256:$chart,core:$r.core,model:$r.model,corpus:$r.corpus.fingerprint,corpus_manifest_sha256:$r.corpus.manifest_sha256},
     corpus:{rows:$r.corpus.rows,vectors:$r.corpus.chunks,status:(if any($v.checks[]?;.name=="mcp-tools-corpus-schema" and .status=="passed") then "verified" else "unverified" end)},
@@ -4165,7 +4240,9 @@ installation_summary() {
                   public_https:$public[0].status,networkpolicy:$network[0].status}
                  + (if $v.ocr_http_status != null then {ocr_http_status:$v.ocr_http_status} else {} end)),
     settings:(reduce (["operator","password_file"],["llm","credential","file"],["ocr","credential","file"],["registry","config_file"],["tls","private_key_file"],["trust","proxy_file"],["backup","passphrase_file"],["backup","auth_header_file"],["delivery","auth_header_file"]) as $p
-      ($s; if (getpath($p)//"")!="" then setpath($p;"(protected file)") else . end)),
+      ($s; if (getpath($p)//"")!="" then setpath($p;"(protected file)") else . end)
+      | reduce ([["public_url"],$public_url],[["llm","base_url"],$llm_url],[["ocr","url"],$ocr_url],[["corpus","vectors_url"],$vectors_url],[["backup","offbox_url"],$offbox_url],[["tls","acme_server"],$acme_server]) as $u
+      (.; if (getpath($u[0])//"")!="" then setpath($u[0];$u[1]) else . end)),
     installed_record:$record,verification_report:$report}' | atomic "$summary"
  cat "$summary"
  if [[ $(jq -r .verification.coverage "$summary") == partial ]]; then
@@ -4177,7 +4254,7 @@ installation_summary() {
    # is configured but did not answer, refused the request or could not read
    # the test page must not be met with "set it": the operator would edit a
    # site value that was right.
-   log "GSJ installation complete, verification PARTIAL: $VERSION at $(j .public_url). $(jq -r '"\(.verification.checks_passed) of \(.verification.checks) application checks ran and passed; \(.verification.checks_skipped) skipped: " + ([.verification.skipped[]|"\(.name) (\(.reason))"]|join(", "))' "$summary"). $(jq -r '(.verification.skipped|map(.reason)|unique) as $r
+   log "GSJ installation complete, verification PARTIAL: $VERSION at $(url_origin_only "$(j .public_url)"). $(jq -r '"\(.verification.checks_passed) of \(.verification.checks) application checks ran and passed; \(.verification.checks_skipped) skipped: " + ([.verification.skipped[]|"\(.name) (\(.reason))"]|join(", "))' "$summary"). $(jq -r '(.verification.skipped|map(.reason)|unique) as $r
      | ([$r[]|select(startswith("llm-"))]|first // "") as $llm
      | ([$r[]|select(startswith("ocr-"))]|first // "") as $ocr
      | ([ (if $llm == "llm-absent" then "Until an LLM endpoint is set, the two agent checks stay skipped (the site sets no LLM endpoint): set llm.base_url and llm.model in the site file (an LLM chosen per case under Einstellungen serves that case, but the acceptance probes only the site endpoint)"
@@ -4191,7 +4268,7 @@ installation_summary() {
            elif $ocr != "" then "Until the OCR endpoint reads images, the scanned-page check stays skipped (" + $ocr + ")" else empty end) ]
         | join(". ")) + ". Then run install again with the site file: the acceptance then exercises what answers."' "$summary") Summary: $summary"
  else
-   log "Complete GSJ installation verified: $VERSION at $(j .public_url). Summary: $summary"
+   log "Complete GSJ installation verified: $VERSION at $(url_origin_only "$(j .public_url)"). Summary: $summary"
  fi
 }
 verify_target() {

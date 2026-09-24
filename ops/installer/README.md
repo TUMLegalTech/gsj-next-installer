@@ -419,11 +419,32 @@ no private input.
    hold (the paragraph on the binding, above).
 4. **Build, sign, verify** (below), with the private key outside every
    repository.
-5. **Staging** (`ci/stage.py`): the exact signed files — `gsj-install.sh`,
+5. **Initializer qualification** against the released images, before the
+   staging and the cluster qualification, before any deployment that runs
+   this initializer is upgraded and before the installer is published:
+   `python3 -B ops/installer/ci/qualify-initializer.py --release /release-inputs/release.json --report /release-output/initializer-qualification.json`.
+   It runs the release's web image (the initializer's own code, library and
+   model) against the release's Chroma image through Docker, on a synthetic
+   corpus and vector sidecar the image's own generator builds, and passes
+   only when all four hold: the released vectors are imported
+   (`corpus-vector-source` says `released`, nothing is embedded); SQLite and
+   Chroma read back with matching identities (rows, vectors, the sidecar's
+   own values, `current.json`); a deliberate deterministic shard failure
+   (a manifest row whose parse disagrees: `core-mismatch`) makes ONE import
+   attempt, persists a terminal checkpoint and names that cause again on
+   the init container's restart; and the same for a released block whose
+   ids disagree (`source-verification-failed`). The initializer pair it
+   proves is the one registered in `startup-runtime-preflight.py`
+   (`QUALIFIED_SOURCE_RUNTIMES`): registering a pair there records a claim,
+   this run is what backs it: the report names the initializer pair it
+   measured inside the image and the images by digest, and the gate
+   (`ci/qualify.py gate`, step 7) requires it beside the two cluster
+   reports. A run whose report is not `passed` stops the release here.
+6. **Staging** (`ci/stage.py`): the exact signed files — `gsj-install.sh`,
    `installer-descriptor.sig`, then `installer-descriptor.json` last — are
    created, create-only, at the version URL below `release_base_url` and read
    back; its receipt (`staging.json`) is what qualification checks.
-6. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
+7. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
    and populated upgrade/restore): the populated upgrade acquires the
    candidate from the staged version URL and holds the read-back receipt to
    the staged bytes; the gate (`ci/qualify.py gate`) then requires every
@@ -436,7 +457,7 @@ no private input.
    site file, and a second run over the first run's state (its namespace
    already deleted by the harness) stops at verification with *"verification
    ownership ledger is missing after launch"*.
-7. **Publication**: the release assets (below) — `verify-release.sh`, the
+8. **Publication**: the release assets (below) — `verify-release.sh`, the
    public key, the descriptor, its signature and the installer — after the
    gate has passed for these exact signed bytes.
 

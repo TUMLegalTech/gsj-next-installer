@@ -359,8 +359,10 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
 def test_a_crafted_reason_or_phase_is_cut_to_its_enum_word(tmp_path):
     """review sweep B2: the never-ran refusal printed the Pod's waiting
     reason, its PodScheduled reason or its phase -- enum words from the API,
-    but taken as they came. Anything beyond letters and digits is stripped, so
-    a crafted status cannot carry text into the refusal."""
+    but taken as they came. The review's minor: stripping to
+    letters and digits still let an arbitrary alphanumeric reason through
+    (UnschedulableZZSECRETCANARY); a reason is now mapped to the closed set
+    of values this installer knows, and anything else is the word "other"."""
     marker = "ZZSECRET-CANARY"
     crafted = {"status": {"phase": "Pending",
                "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable " + marker + "\nGSJ: forged",
@@ -369,8 +371,47 @@ def test_a_crafted_reason_or_phase_is_cut_to_its_enum_word(tmp_path):
     assert result.returncode == 1
     message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
     assert marker not in result.stderr and "forged" not in result.stderr
-    assert "(Unschedulable" in message and "was not tested" in message
+    assert "(other)" in message and "was not tested" in message, message
     crafted = {"status": {"phase": "Pending " + marker, "conditions": [{"type": "PodScheduled", "status": "True"}]}}
     second = tmp_path / "second"; second.mkdir()
     result, _ = _run_never_ran(second, status_json=crafted)
     assert result.returncode == 1 and marker not in result.stderr
+    assert "phase other" in [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    # an alphanumeric reason survives letters-and-digits stripping; it does not survive the closed set
+    crafted = {"status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable" + marker.replace("-", "")}]}}
+    third = tmp_path / "third"; third.mkdir()
+    result, _ = _run_never_ran(third, status_json=crafted)
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert result.returncode == 1 and marker.replace("-", "") not in result.stderr and "(other)" in message, message
+    # the known value itself is repeated
+    crafted = {"status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}]}}
+    fourth = tmp_path / "fourth"; fourth.mkdir()
+    result, _ = _run_never_ran(fourth, status_json=crafted)
+    assert "(Unschedulable)" in [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+
+
+@pytest.mark.parametrize("ended", ["Succeeded", "Failed"])
+def test_a_check_that_ended_between_the_last_poll_and_the_snapshot_keeps_its_verdict(tmp_path, ended):
+    """The audit's regression: the poll can run out while the Pod finishes
+    during its last sleep; the snapshot's phase is then the verdict and the
+    never-ran reason stays EMPTY. Mapping that empty value to the closed set
+    turned it into "wait other" -- a passed check was refused as untested,
+    and after the backup a failed check was reported as untested too."""
+    result, _ = _run_never_ran(tmp_path, status_json={"status": {"phase": ended}}, poll_phase="Running")
+    assert "phase other" not in result.stderr and "was not tested" not in result.stderr, result.stderr
+    if ended == "Succeeded":
+        assert result.returncode == 0 and "Storage passed" in result.stderr, result.stderr
+    else:
+        assert result.returncode == 1 and "qualification failed" in result.stderr, result.stderr
+
+
+def test_a_crafted_volume_phase_is_the_word_other(tmp_path):
+    """The closed set at the PersistentVolume site: a phase the installer
+    does not know is "other"; an unreadable phase stays "unknown"."""
+    marker = "ZZSECRETCANARY"
+    result, _ = _run(tmp_path, pv_phase="Released" + marker)
+    message = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
+    assert marker not in result.stderr and "(phase other)" in message, message
+    second = tmp_path / "second"; second.mkdir()
+    result, _ = _run(second, pv_phase="")
+    assert "(phase unknown)" in [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][0]
