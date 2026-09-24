@@ -6,11 +6,11 @@ unchanged and writes ONE report to send back.
 These tests drive the REAL entry point (`bash gsj-install.sh init`) of a real
 installer: the branch's runtime.sh over a synthetic signed payload, on a
 HERMETIC PATH (the precedent is test_installer_clients._tools) that holds the
-real utilities, a recording kubectl that refuses every mutating verb, a fake
-curl that serves a release directory from a map, a fake helm, and a uname
-and df that make the box a synthetic Linux machine wherever the tests run.
-No cluster, no network, no credential, and an environment built from
-nothing.
+real utilities, a recording kubectl that refuses every mutating verb, a
+recording helm that answers only `version`, a fake curl that serves a release
+directory from a map, and a uname, df, id and date that make the box a
+synthetic Linux machine wherever the tests run. No cluster, no network, no
+credential, and an environment built from nothing.
 """
 import base64
 import hashlib
@@ -38,20 +38,22 @@ COMPANIONS = ("verify-release.sh", "release.pem", "installer-descriptor.json", "
 # What bootstrap(), init and inspect_cluster need from the box, symlinked from
 # the system directories; nothing else is reachable. `jq` is real (inspect
 # runs it); openssl is wrapped like the clients tests do.
-UTILITIES = ("bash", "tar", "gzip", "base64", "awk", "cut", "mktemp", "date", "sync", "sed", "head", "tail", "tr",
-             "cat", "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "ln", "stat", "id", "getconf",
-             "dirname", "basename", "grep", "wc", "sort", "sysctl", "env", "readlink", "perl")
+UTILITIES = ("bash", "tar", "gzip", "base64", "awk", "cut", "mktemp", "sync", "sed", "head", "tail", "tr",
+             "cat", "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "ln", "stat", "getconf",
+             "dirname", "basename", "grep", "wc", "sort", "sysctl", "env", "readlink", "perl", "sleep")
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # Every diagnostic bash or a tool prints when a script walks into a trap; no
 # run may carry one, whatever it reports.
-BASH_TRAPS = ("command not found", "unbound variable", "cannot overwrite", ": line ", "syntax error", "No such file or directory")
+BASH_TRAPS = ("command not found", "unbound variable", "cannot overwrite", ": line ", "syntax error", "No such file or directory", "Permission denied")
 
 FAKE_KUBECTL = '''#!/usr/bin/env python3
 """The RECORDING kubectl: every argv is appended to TEST_KUBE_LOG; the four
 read-only verbs init and inspect use are answered; ANY other verb exits 99
 with a marker, which the read-only proof asserts never happened. Every
-diagnostic carries the canary the way a real kubectl quotes its kubeconfig."""
+diagnostic carries the canary the way a real kubectl quotes its kubeconfig.
+TEST_KUBECTL_BROKEN=1 makes it a binary that cannot run at all."""
 import json, os, sys
+if os.environ.get("TEST_KUBECTL_BROKEN") == "1": sys.exit(126)
 a = sys.argv[1:]
 with open(os.environ["TEST_KUBE_LOG"], "a") as log: log.write(json.dumps(a) + "\\n")
 canary = os.environ.get("TEST_CANARY", "") + " " + os.environ.get("KUBECONFIG", "")
@@ -70,6 +72,8 @@ if verbs[:2] == ["config", "current-context"]:
     print(ctx)
 elif verbs[:1] == ["version"]:
     if "--client" in a: print(json.dumps(client, indent=2))
+    elif os.environ.get("TEST_KUBE_PLUGIN") == "1":
+        print(json.dumps(client, indent=2)); print("Unable to connect to the server: getting credentials: exec plugin " + canary, file=sys.stderr); sys.exit(1)
     elif server: print(json.dumps({**client, "serverVersion": {"major": "1", "minor": server.split(".")[1], "gitVersion": server}}, indent=2))
     else:
         print(json.dumps(client, indent=2)); print("The connection to the server " + canary + " was refused", file=sys.stderr); sys.exit(1)
@@ -83,13 +87,27 @@ else:
     print("MUTATION-REFUSED " + json.dumps(a), file=sys.stderr); sys.exit(99)
 '''
 
+FAKE_HELM = '''#!/usr/bin/env python3
+"""The RECORDING helm: argv logged to TEST_HELM_LOG; only `version` answers."""
+import json, os, sys
+a = sys.argv[1:]
+with open(os.environ["TEST_HELM_LOG"], "a") as log: log.write(json.dumps(a) + "\\n")
+if a[:1] == ["version"]: print("v" + os.environ["TEST_HELM_VERSION"] + "+gdeadbee"); sys.exit(0)
+print("MUTATION-REFUSED helm " + json.dumps(a), file=sys.stderr); sys.exit(99)
+'''
+
 FAKE_CURL = '''#!/usr/bin/env python3
 """A fake curl. A reachability probe (--write-out, --output /dev/null) answers
 200 (401 for ghcr); a download (-o FILE) copies the asset named by the URL's
 last segment from TEST_CURL_MAP, or answers 404 (rc 22) when the map has no
 such name. TEST_CURL_OFFLINE=1 makes every request fail like a box without a
 network -- code 000 on stdout, a canary on stderr, the way a proxy's error
-page would ride. Every argv is logged."""
+page would ride. TEST_CURL_PROXY=407 answers like a proxy that wants
+credentials (http_code 000, http_connect 407, rc 22 for downloads).
+TEST_CURL_REDIRECT_HTTP=1 answers like an origin redirecting to plain HTTP
+(rc 1, code 302). TEST_CURL_PLANT=DIR writes a file at DIR/NAME just before
+serving NAME. Every argv is logged. The write-out is '%{http_code}
+%{http_connect}' as init asks for it."""
 import json, os, pathlib, shutil, sys
 a = sys.argv[1:]
 with open(os.environ["TEST_CURL_LOG"], "a") as log: log.write(json.dumps(a) + "\\n")
@@ -97,33 +115,42 @@ canary = os.environ.get("TEST_CANARY", "")
 if a[:1] == ["--version"] or a[:2] == ["-q", "--version"]: print("curl 8.0.0 (synthetic)"); sys.exit(0)
 url = next((v for v in a if v.startswith("http")), "")
 offline = os.environ.get("TEST_CURL_OFFLINE") == "1"
+proxy = os.environ.get("TEST_CURL_PROXY", "")
 if "-o" in a and "--write-out" in a:
     out = a[a.index("-o") + 1]
-    if offline: sys.stdout.write("000"); print("curl: (6) Could not resolve host: " + canary, file=sys.stderr); sys.exit(6)
+    if offline: sys.stdout.write("000 000"); print("curl: (6) Could not resolve host: " + canary, file=sys.stderr); sys.exit(6)
+    if proxy: sys.stdout.write("000 " + proxy); print("curl: (22) The requested URL returned error: 407 " + canary, file=sys.stderr); sys.exit(22)
+    if os.environ.get("TEST_CURL_REDIRECT_HTTP") == "1": sys.stdout.write("302 000"); print("curl: (1) Protocol http not supported " + canary, file=sys.stderr); sys.exit(1)
     lookup = json.loads(pathlib.Path(os.environ["TEST_CURL_MAP"]).read_text())
     name = url.rsplit("/", 1)[-1]
     if name not in lookup or not url.startswith(os.environ["TEST_CURL_BASE"] + "/"):
-        sys.stdout.write("404"); print("curl: (22) The requested URL returned error: 404 " + canary, file=sys.stderr); sys.exit(22)
-    shutil.copyfile(lookup[name], out); sys.stdout.write("200"); sys.exit(0)
+        sys.stdout.write("404 000"); print("curl: (22) The requested URL returned error: 404 " + canary, file=sys.stderr); sys.exit(22)
+    plant = os.environ.get("TEST_CURL_PLANT", "")
+    if plant:
+        target = pathlib.Path(plant) / name
+        if os.environ.get("TEST_CURL_PLANT_LINK"): target.symlink_to(os.environ["TEST_CURL_PLANT_LINK"])
+        else: target.write_text("operator's own copy of " + name)
+    shutil.copyfile(lookup[name], out); sys.stdout.write("200 000"); sys.exit(0)
 if "--write-out" in a:
-    if offline: sys.stdout.write("000"); print("curl: (7) Failed to connect " + canary, file=sys.stderr); sys.exit(7)
-    sys.stdout.write("401" if "ghcr" in url else "200"); sys.exit(0)
+    if offline: sys.stdout.write("000 000"); print("curl: (7) Failed to connect " + canary, file=sys.stderr); sys.exit(7)
+    if proxy: sys.stdout.write("000 " + proxy); print("curl: (56) Received HTTP code 407 from proxy " + canary, file=sys.stderr); sys.exit(56)
+    sys.stdout.write(("401" if "ghcr" in url else "200") + " 000"); sys.exit(0)
 print("unexpected curl invocation " + canary, file=sys.stderr); sys.exit(97)
 '''
 
 FAKE_DF = '''#!/usr/bin/env python3
 """A fake `df -Pk PATH...`: one row per existing path, its device and free
-KiB from TEST_DF (a JSON list of {prefix, device, free_kib}, longest prefix
-wins; the default is one big root filesystem)."""
+KiB from TEST_DF (a JSON list of {prefix, device, free_kib, mount}, longest
+prefix wins; the default is one big root filesystem)."""
 import json, os, sys
 paths = [p for p in sys.argv[1:] if not p.startswith("-")]
-table = json.loads(os.environ.get("TEST_DF", "[]")) + [{"prefix": "/", "device": "/dev/synthetic-root", "free_kib": 600000000}]
+table = json.loads(os.environ.get("TEST_DF", "[]")) + [{"prefix": "/", "device": "/dev/synthetic-root", "free_kib": 600000000, "mount": "/"}]
 print("Filesystem 1024-blocks Used Available Capacity Mounted on")
 rc = 0
 for p in paths:
     if not os.path.exists(p): print("df: " + p + ": No such file or directory", file=sys.stderr); rc = 1; continue
     row = max((t for t in table if os.path.realpath(p).startswith(t["prefix"])), key=lambda t: len(t["prefix"]))
-    print(row["device"], 900000000, 300000000, row["free_kib"], "34%", row["prefix"])
+    print(row["device"], 900000000, 300000000, row["free_kib"], "34%", row.get("mount", row["prefix"]))
 sys.exit(rc)
 '''
 
@@ -158,11 +185,14 @@ def _installer(directory, keypair, *, base=BASE, version=VERSION, identity=IDENT
     assets = directory / "assets"
     assets.mkdir(exist_ok=True)
     (assets / "installer-descriptor.json").write_bytes(descriptor)
-    subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(private), "-out", str(assets / "installer-descriptor.sig"),
-                    str(assets / "installer-descriptor.json")], check=True, capture_output=True)
+    _sign(private, assets / "installer-descriptor.json", assets / "installer-descriptor.sig")
     (assets / "release.pem").write_bytes(pem)
     shutil.copyfile(INSTALLER / "verify-release.sh", assets / "verify-release.sh")
     return path, assets
+
+
+def _sign(private, descriptor, signature):
+    subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(private), "-out", str(signature), str(descriptor)], check=True, capture_output=True)
 
 
 def _other_key(tmp_path, name="other"):
@@ -174,8 +204,8 @@ def _other_key(tmp_path, name="other"):
 
 def _sandbox(tmp_path, **versions):
     """The hermetic PATH: real utilities, the real jq, an openssl wrapper, the
-    recording kubectl, the fake curl, df and uname, and a version-only helm. A
-    tool mapped to None is absent. Returns the directory's path (a string)."""
+    recording kubectl and helm, the fake curl, df, uname, id and date. A tool
+    mapped to None is absent. Returns the directory's path (a string)."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     for utility in UTILITIES:
@@ -183,8 +213,12 @@ def _sandbox(tmp_path, **versions):
         if found and not (bindir / utility).exists():
             (bindir / utility).symlink_to(found)
     (bindir / "python3").symlink_to(sys.executable)
-    (bindir / "uname").write_text('#!/bin/sh\ncase "$*" in -s) echo Linux;; -m) echo x86_64;; -sr) echo "Linux 6.1.0-synthetic";; *) echo Linux;; esac\n')
-    (bindir / "uname").chmod(0o755)
+    real = {name: shutil.which(name, path=SYSTEM_PATH) for name in ("uname", "id", "date")}
+    (bindir / "uname").write_text('#!/bin/sh\ncase "$*" in -s) echo "${TEST_UNAME_S:-Linux}";; -m) echo x86_64;; -sr) echo "${TEST_UNAME_S:-Linux} 6.1.0-synthetic";; *) echo "${TEST_UNAME_S:-Linux}";; esac\n')
+    (bindir / "id").write_text(f'#!/bin/sh\nif [ "$1" = -u ] && [ -n "${{TEST_UID:-}}" ]; then echo "$TEST_UID"; else exec {real["id"]} "$@"; fi\n')
+    (bindir / "date").write_text(f'#!/bin/sh\nif [ "$*" = "-u +%Y%m%dT%H%M%SZ" ] && [ -n "${{TEST_DATE_STAMP:-}}" ]; then echo "$TEST_DATE_STAMP"; else exec {real["date"]} "$@"; fi\n')
+    for name in ("uname", "id", "date"):
+        (bindir / name).chmod(0o755)
     versions.setdefault("jq", "real")
     versions.setdefault("helm", "4.2.2")
     versions.setdefault("kubectl", "1.35.8")
@@ -202,7 +236,7 @@ def _sandbox(tmp_path, **versions):
         elif tool == "openssl":
             target.write_text(f'#!/bin/sh\nif [ "${{1:-}}" = version ]; then printf "%s\\n" \'{version}\'; else exec {real_openssl} "$@"; fi\n')
         elif tool == "helm":
-            target.write_text(f'#!/bin/sh\nif [ "${{1:-}}" = version ]; then printf "v%s+gdeadbee\\n" \'{version}\'; else echo "MUTATION-REFUSED helm $*" >&2; exit 99; fi\n')
+            target.write_text(FAKE_HELM)
         elif tool == "kubectl":
             target.write_text(FAKE_KUBECTL)
         elif tool == "curl":
@@ -225,24 +259,25 @@ class Box:
         self.tmpdir = tmp_path / "tmp"
         self.tmpdir.mkdir()
         self.kube_log = tmp_path / "kubectl.log"
+        self.helm_log = tmp_path / "helm.log"
         self.curl_log = tmp_path / "curl.log"
         self.curl_map = tmp_path / "curl-map.json"
         self.serve(self.assets)
         self.path = _sandbox(tmp_path, **tools)
         self.env = {"PATH": self.path, "HOME": str(self.home), "TMPDIR": str(self.tmpdir), "XDG_CACHE_HOME": str(tmp_path / "cache"),
                     "LANG": "C", "KUBECONFIG": str(tmp_path / (CANARY + "-kubeconfig")), "TEST_CANARY": CANARY,
-                    "TEST_KUBE_LOG": str(self.kube_log), "TEST_CURL_LOG": str(self.curl_log), "TEST_CURL_MAP": str(self.curl_map),
-                    "TEST_CURL_BASE": BASE + "/" + VERSION, "TEST_KUBE_CONTEXT": "synthetic-context",
-                    "TEST_KUBE_SERVER": "v1.35.8", "TEST_KUBECTL_VERSION": tools.get("kubectl") or "1.35.8"}
+                    "TEST_KUBE_LOG": str(self.kube_log), "TEST_HELM_LOG": str(self.helm_log), "TEST_CURL_LOG": str(self.curl_log),
+                    "TEST_CURL_MAP": str(self.curl_map), "TEST_CURL_BASE": BASE + "/" + VERSION, "TEST_KUBE_CONTEXT": "synthetic-context",
+                    "TEST_KUBE_SERVER": "v1.35.8", "TEST_KUBECTL_VERSION": tools.get("kubectl") or "1.35.8",
+                    "TEST_HELM_VERSION": tools.get("helm") or "4.2.2"}
 
     def serve(self, assets, names=COMPANIONS):
         self.curl_map.write_text(json.dumps({name: str(assets / name) for name in names}))
 
-    def run(self, *args, cwd=None, relative=False, **extra):
+    def run(self, *args, cwd=None, script=None, **extra):
         env = {**self.env, **extra}
         cwd = str(cwd or self.installer.parent)
-        script = os.path.relpath(self.installer, cwd) if relative else str(self.installer)
-        result = subprocess.run([shutil.which("bash", path=SYSTEM_PATH), script, "init", *args],
+        result = subprocess.run([shutil.which("bash", path=SYSTEM_PATH), script or str(self.installer), "init", *args],
                                 env=env, cwd=cwd, capture_output=True, text=True, timeout=180)
         work = self.home / "gsj-operator"
         result.reports = sorted(work.glob("gsj-init-report-*.json")) if work.is_dir() else []
@@ -252,6 +287,9 @@ class Box:
 
     def kube_calls(self):
         return [json.loads(line) for line in self.kube_log.read_text().splitlines()] if self.kube_log.exists() else []
+
+    def helm_calls(self):
+        return [json.loads(line) for line in self.helm_log.read_text().splitlines()] if self.helm_log.exists() else []
 
     def curl_calls(self):
         return [json.loads(line) for line in self.curl_log.read_text().splitlines()] if self.curl_log.exists() else []
@@ -304,7 +342,7 @@ def _no_leak(box, result):
 
 # --- 1. the rest of its own release ------------------------------------------
 
-def test_missing_companions_are_downloaded_checked_then_saved(tmp_path, keypair):
+def test_missing_companions_are_downloaded_checked_verified_then_saved(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     result = box.run()
     assert result.returncode == 0, result.stderr + result.stdout
@@ -321,7 +359,7 @@ def test_missing_companions_are_downloaded_checked_then_saved(tmp_path, keypair)
             assert "--proto" in call and call[call.index("--proto") + 1] == "=https" and "--connect-timeout" in call and "--max-filesize" in call, call
     report = _report(result)
     assert report["verification"] == {"status": "PASS", "companions_present": 0, "companions_downloaded": 4, "companions_saved": 4,
-                                      "missing": "", "limit": report["verification"]["limit"]}
+                                      "saved_in": str(box.installer.parent), "missing": "", "limit": report["verification"]["limit"]}
     assert "modified installer could skip its own check" in report["verification"]["limit"]
     assert "Verified signed descriptor and exact installer bytes" in result.stdout
     assert report["installer"] == {"name": "gsj-install.sh", "version": VERSION, "identity": IDENTITY,
@@ -343,20 +381,24 @@ def test_present_companions_are_used_and_never_downloaded_again(tmp_path, keypai
     assert report["verification"]["companions_present"] == 4 and report["verification"]["companions_downloaded"] == 0
 
 
-def test_the_key_and_verifier_in_the_guides_trust_folder_are_found(tmp_path, keypair):
-    """The guide's layout: release.pem and verify-release.sh in
-    $HOME/gsj-operator/trust, the descriptor and signature beside the installer."""
+def test_the_key_in_the_guides_trust_folder_is_found_but_a_verifier_there_is_not_read(tmp_path, keypair):
+    """The guide's trust/ lasts across releases: one key serves the line, so it
+    is looked for there; a verifier there may be an older release's, so it is
+    neither executed nor refused -- this release's own is downloaded."""
     box = Box(tmp_path, keypair)
     work = box.home / "gsj-operator"
     work.mkdir(mode=0o700)
     (work / "trust").mkdir(mode=0o700)
-    box.place("release.pem", "verify-release.sh", into=work / "trust")
+    box.place("release.pem", into=work / "trust")
+    (work / "trust" / "verify-release.sh").write_bytes(b"#!/usr/bin/env bash\n# an older release's verifier\n")
     box.place("installer-descriptor.json", "installer-descriptor.sig")
     result = box.run()
     assert result.returncode == 0, result.stderr + result.stdout
-    assert box.downloads() == []
-    assert box.beside() == ["installer-descriptor.json", "installer-descriptor.sig"]
-    assert _report(result)["verification"]["companions_present"] == 4
+    assert [url.rsplit("/", 1)[-1] for url in box.downloads()] == ["verify-release.sh"]
+    assert box.beside() == ["installer-descriptor.json", "installer-descriptor.sig", "verify-release.sh"]
+    report = _report(result)
+    assert report["verification"]["companions_present"] == 3 and report["verification"]["companions_downloaded"] == 1
+    assert (work / "trust" / "verify-release.sh").read_bytes().startswith(b"#!/usr/bin/env bash\n# an older")
 
 
 @pytest.mark.parametrize("foreign", ["installer-descriptor.json", "installer-descriptor.sig", "release.pem", "verify-release.sh", "same-version-other-build"])
@@ -390,6 +432,20 @@ def test_a_companion_from_another_release_is_refused_by_name_never_replaced(tmp_
     _no_leak(box, result)
 
 
+@pytest.mark.parametrize("field", ["version", "releaseId"])
+def test_a_served_descriptor_whose_identity_is_not_a_version_or_identity_is_not_repeated(tmp_path, keypair, field):
+    """The refusal names a foreign version or build only when it has that
+    shape; anything else -- text a hostile origin put there -- is 'unreadable'."""
+    box = Box(tmp_path, keypair)
+    other = json.loads((box.assets / "installer-descriptor.json").read_text())
+    other[field] = "token " + CANARY
+    (box.assets / "installer-descriptor.json").write_bytes(builder.canonical(other))
+    result = box.run()
+    _stop(result, "descriptor published at https://releases.example", "of an unreadable " + ("version" if field == "version" else "identity"))
+    assert box.beside() == []
+    _no_leak(box, result)
+
+
 def test_altered_installer_bytes_fail_verification_and_init_stops_before_inspect(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     # one byte of the runtime changed, the payload intact: exactly what a swapped
@@ -404,13 +460,27 @@ def test_altered_installer_bytes_fail_verification_and_init_stops_before_inspect
     _no_leak(box, result)
 
 
-def test_the_published_verifier_runs_after_the_internal_check_and_prints_its_verdict(tmp_path, keypair):
+def test_the_published_verifier_runs_after_the_internal_check_and_its_own_refusal_stops_init(tmp_path, keypair):
+    """A descriptor with a second installer sha256 line passes init's own
+    reading (the first line) and is refused by verify-release.sh, whose sed
+    demands one unique digest: the verifier is a check of its own, and its
+    refusal stops init before inspect."""
     box = Box(tmp_path, keypair)
     box.place(*COMPANIONS)
     result = box.run()
     assert result.returncode == 0, result.stderr
     assert "Verified signed descriptor and exact installer bytes. The installer was not executed." in result.stdout
-    assert result.stderr.index("init: running " + str(box.installer.parent / "verify-release.sh")) < result.stderr.index("init: running inspect")
+    assert result.stderr.index("init: running the published verify-release.sh") < result.stderr.index("init: running inspect")
+    descriptor = json.loads((box.assets / "installer-descriptor.json").read_text())
+    descriptor["zz"] = {"sha256": "0" * 64}
+    (box.assets / "installer-descriptor.json").write_bytes(builder.canonical(descriptor))
+    _sign(box.keypair[0], box.assets / "installer-descriptor.json", box.assets / "installer-descriptor.sig")
+    again = Box(tmp_path / "again", keypair)
+    again.serve(box.assets)
+    result = again.run()
+    _stop(result, "release verification FAILED: verify-release.sh refused this installer")
+    assert "Descriptor has no unique installer/key digest" in result.stderr          # the published verifier's own line
+    assert again.kube_calls() == [] and again.beside() == []
 
 
 def test_a_wrong_key_published_at_the_origin_is_refused_and_nothing_is_saved(tmp_path, keypair):
@@ -435,6 +505,32 @@ def test_a_verifier_published_at_the_origin_that_is_not_this_releases_is_not_exe
     _no_leak(box, result)
 
 
+def test_an_html_page_in_place_of_a_companion_is_a_failed_download_not_a_foreign_release(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    (box.assets / "verify-release.sh").write_bytes(b"<html><body>Blocked by policy " + CANARY.encode() + b"</body></html>\n")
+    result = box.run()
+    assert result.returncode == 3, result.stderr + result.stdout
+    row = _check(_report(result), "release-verification")
+    assert row["status"] == "UNKNOWN" and "something that is not verify-release.sh" in row["detail"] and "proxy or portal" in row["detail"]
+    assert box.beside() == []
+    _no_leak(box, result)
+
+
+def test_a_present_companion_this_user_cannot_read_is_named_not_called_foreign(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    box.place(*COMPANIONS)
+    os.chmod(box.installer.parent / "release.pem", 0)
+    try:
+        result = box.run()
+    finally:
+        os.chmod(box.installer.parent / "release.pem", 0o644)
+    if os.geteuid() == 0:
+        assert result.returncode == 0                                   # root reads anything
+    else:
+        _stop(result, "release.pem cannot be read by this user", "never replaced")
+        assert "another release" not in result.stderr
+
+
 def test_a_missing_or_libressl_openssl_is_refused_by_bootstrap_before_init_runs(runtime, tmp_path):
     run, state, work = runtime
     for banner in ("LibreSSL 3.3.6", None):
@@ -448,17 +544,18 @@ def test_a_missing_or_libressl_openssl_is_refused_by_bootstrap_before_init_runs(
     assert json.loads(state.read_text())["calls"] == []
 
 
-def test_a_box_without_a_sha256_tool_is_refused_by_name_before_any_verb(runtime, tmp_path):
-    """Before: `shasum: command not found` and then 'embedded payload integrity
-    failed' -- a box without the tool was told its installer was corrupt."""
+def test_a_box_without_a_sha256_tool_is_named_for_init_and_unchanged_for_every_other_verb(runtime, tmp_path):
+    """init names the missing tool; every other verb keeps its refusal as it
+    was (the payload check, which blames the payload)."""
     run, _, _ = runtime
     path = _tools(tmp_path / "tools", **FLOORS)
     for name in ("sha256sum", "shasum"):
         (Path(path) / name).unlink(missing_ok=True)
-    result = run("COMMAND=install; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
+    result = run("COMMAND=init; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
     assert result.returncode != 0 and "REACHED" not in result.stdout
-    assert "bootstrap utility required: sha256sum or shasum" in result.stderr
-    assert "integrity" not in result.stderr
+    assert "bootstrap utility required: sha256sum or shasum" in result.stderr and "integrity" not in result.stderr
+    other = run("COMMAND=install; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
+    assert other.returncode != 0 and "sha256sum or shasum" not in other.stderr
 
 
 def test_bootstrap_skips_only_the_client_refusal_for_init(runtime, tmp_path):
@@ -491,7 +588,7 @@ def test_several_missing_tools_are_all_named_in_one_run(tmp_path, keypair):
     for tool in ("helm", "kubectl", "jq"):
         row = _check(report, tool)
         assert row["status"] == "FAIL" and f"requires {tool} >= {FLOORS[tool]}" in row["detail"] and "none on PATH" in row["detail"], row
-        assert "--fetch-tools" in row["fix"] and "linux/amd64" in row["fix"], row
+        assert "any other command accepts --fetch-tools" in row["fix"] and f"pins a {tool} for linux/amd64" in row["fix"], row
         assert f"FAIL    {tool}" in result.stdout
     assert _check(report, "openssl")["status"] == "PASS" and "--fetch-tools does not supply OpenSSL" in _check(report, "openssl")["detail"]
     assert _check(report, "cluster")["status"] == "UNKNOWN"
@@ -500,6 +597,18 @@ def test_several_missing_tools_are_all_named_in_one_run(tmp_path, keypair):
     assert "Fix before an install:" in result.stdout
     assert report["summary"]["ready"] is False and report["summary"]["fail"] >= 3
     _no_leak(box, result)
+
+
+def test_the_fetch_tools_advice_says_what_this_release_pins_for_this_platform(tmp_path, keypair):
+    box = Box(tmp_path, keypair, helm=None, jq=None)
+    clients = {"helm": {"linux/arm64": {"url": "https://example.test/helm", "sha256": "a" * 64}},
+               "kubectl": {"linux/amd64": {"url": "https://example.test/kubectl", "sha256": "a" * 64}},
+               "jq": {"linux/amd64": {"url": "https://example.test/jq", "sha256": "a" * 64}}}
+    box.installer, box.assets = _installer(tmp_path / "release", keypair, clients=clients)
+    box.serve(box.assets)
+    report = _report(box.run())
+    assert "--fetch-tools cannot help here: this release pins no helm for linux/amd64" in _check(report, "helm")["fix"]
+    assert "any other command accepts --fetch-tools (this release pins a jq for linux/amd64" in _check(report, "jq")["fix"]
 
 
 def test_a_too_old_client_is_named_with_floor_and_finding(tmp_path, keypair):
@@ -517,6 +626,15 @@ def test_a_client_that_reports_no_version_is_named(tmp_path, keypair):
     assert result.returncode == 3
     row = _check(_report(result), "helm")
     assert row["status"] == "FAIL" and "did not report a version" in row["detail"]
+
+
+def test_a_kubectl_that_cannot_run_is_named_and_the_cluster_row_does_not_blame_the_kubeconfig(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_KUBECTL_BROKEN="1")
+    assert result.returncode == 3
+    report = _report(result)
+    assert "did not report a version" in _check(report, "kubectl")["detail"]
+    assert _check(report, "cluster")["status"] == "UNKNOWN" and "kubectl did not report a version" in _check(report, "cluster")["detail"]
 
 
 # --- 3. what it can reach ---------------------------------------------------------
@@ -555,6 +673,15 @@ def test_an_unreachable_api_server_is_a_finding_and_inspect_is_not_attempted(tmp
     _no_leak(box, result)
 
 
+def test_a_credential_plugin_that_did_not_finish_is_named_without_its_words(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_KUBE_PLUGIN="1")
+    assert result.returncode == 3
+    row = _check(_report(result), "cluster")
+    assert row["status"] == "FAIL" and "credential plugin" in row["detail"] and "by hand" in row["fix"]
+    _no_leak(box, result)
+
+
 def test_no_kubeconfig_context_is_a_finding_that_must_be_fixed(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     result = box.run(TEST_KUBE_CONTEXT="")
@@ -573,12 +700,16 @@ def test_a_server_below_the_floor_is_named(tmp_path, keypair):
     assert row["status"] == "FAIL" and "below the floor 1.27" in row["detail"]
 
 
-def test_kubectl_skew_beyond_one_minor_is_named_with_both_versions(tmp_path, keypair):
-    box = Box(tmp_path, keypair, kubectl="1.24.0")
+@pytest.mark.parametrize("client", ["1.24.0", "1.23.0"])
+def test_kubectl_skew_beyond_one_minor_is_named_with_both_versions_even_below_the_floor(tmp_path, keypair, client):
+    box = Box(tmp_path, keypair, kubectl=client)
     result = box.run(TEST_KUBE_SERVER="v1.36.4+k3s1")
     assert result.returncode == 3
-    row = _check(_report(result), "kubectl-skew")
-    assert row["status"] == "FAIL" and "1.24.0" in row["detail"] and "1.36.4" in row["detail"]
+    report = _report(result)
+    row = _check(report, "kubectl-skew")
+    assert row["status"] == "FAIL" and client in row["detail"] and "1.36.4" in row["detail"]
+    if client == "1.23.0":
+        assert _check(report, "kubectl")["status"] == "FAIL" and _check(report, "inspect")["status"] == "UNKNOWN"
 
 
 def test_without_a_network_the_report_still_comes_from_local_files(tmp_path, keypair):
@@ -602,6 +733,27 @@ def test_without_a_network_the_report_still_comes_from_local_files(tmp_path, key
     _no_leak(box, result)
 
 
+def test_a_proxy_that_wants_credentials_is_named_as_the_proxy_not_as_no_egress(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_CURL_PROXY="407", HTTPS_PROXY=f"http://u:{CANARY}@proxy.example:3128")
+    assert result.returncode == 3, result.stderr + result.stdout
+    report = _report(result)
+    row = _check(report, "release-verification")
+    assert row["status"] == "UNKNOWN" and "the proxy this machine uses answered HTTP 407" in row["detail"] and "does not publish" not in row["detail"]
+    assert "proxy answered HTTP 407" in _check(report, "egress-github")["found"] and _check(report, "egress-ghcr")["status"] == "FAIL"
+    assert report["summary"]["egress"] == "partial" and "No internet" not in result.stdout
+    _no_leak(box, result)
+
+
+def test_a_redirect_to_plain_http_is_named_as_refused_not_as_a_failed_download(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_CURL_REDIRECT_HTTP="1")
+    assert result.returncode == 3
+    row = _check(_report(result), "release-verification")
+    assert "redirected to a location that is not HTTPS (HTTP 302)" in row["detail"]
+    assert box.beside() == []
+
+
 def test_a_file_the_origin_does_not_publish_is_named_without_the_no_egress_advice(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     box.serve(box.assets, names=("installer-descriptor.json", "installer-descriptor.sig", "release.pem"))
@@ -613,6 +765,7 @@ def test_a_file_the_origin_does_not_publish_is_named_without_the_no_egress_advic
     assert report["verification"]["missing"] == "verify-release.sh"
     assert report["summary"]["egress"] == "full" and "No internet" not in result.stdout
     assert box.beside() == [], "the three good files were saved although the release stays unverified"
+    _no_leak(box, result)
 
 
 def test_a_qualification_build_without_a_release_directory_says_so(tmp_path, keypair):
@@ -641,27 +794,39 @@ def test_the_working_folder_and_its_credentials_folder_are_created_private(tmp_p
     assert result.stdout.count("Send this one file back:") == 1
 
 
+def test_a_box_that_is_not_linux_is_named(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_UNAME_S="Darwin")
+    assert result.returncode == 3
+    report = _report(result)
+    assert _check(report, "os")["status"] == "FAIL" and "run the installer from a Linux machine" in _check(report, "os")["fix"]
+    assert _check(report, "architecture")["status"] == "UNKNOWN"
+
+
 @pytest.mark.parametrize("layout,status", [("same-device-short", "FAIL"), ("split-devices-ok", "PASS"), ("split-devices-short", "FAIL")])
-def test_the_disk_rule_is_stage_vectors_rule(tmp_path, keypair, layout, status):
+def test_the_disk_rule_is_stage_vectors_rule_and_names_mount_points_not_devices(tmp_path, keypair, layout, status):
     """One filesystem holds the blocks and their envelope at once (about
     3.5 GB); two filesystems need about 1.9 GB under TMPDIR and 1.7 GB under
-    the cache."""
+    the cache. df's source column (a remote path, a URL) is never printed."""
     box = Box(tmp_path, keypair)
     cache_root = str(tmp_path / "cache")
     (tmp_path / "cache").mkdir()
     if layout == "same-device-short":
-        table = [{"prefix": "/", "device": "/dev/small", "free_kib": 3000000}]
+        table = [{"prefix": "/", "device": f"nfs01.example:/vol/{CANARY}", "free_kib": 3000000, "mount": "/"}]
     elif layout == "split-devices-ok":
-        table = [{"prefix": cache_root, "device": "/dev/cache", "free_kib": 1800000}, {"prefix": str(box.tmpdir), "device": "/dev/work", "free_kib": 2000000}]
+        table = [{"prefix": cache_root, "device": f"https://u:{CANARY}@dav.example/x", "free_kib": 1800000, "mount": "/cache"},
+                 {"prefix": str(box.tmpdir), "device": "/dev/work", "free_kib": 2000000, "mount": "/work"}]
     else:
-        table = [{"prefix": cache_root, "device": "/dev/cache", "free_kib": 1500000}, {"prefix": str(box.tmpdir), "device": "/dev/work", "free_kib": 2000000}]
+        table = [{"prefix": cache_root, "device": "/dev/cache", "free_kib": 1500000, "mount": "/cache"},
+                 {"prefix": str(box.tmpdir), "device": "/dev/work", "free_kib": 2000000, "mount": "/work"}]
     result = box.run(TEST_DF=json.dumps(table))
     row = _check(_report(result), "disk")
     assert row["status"] == status, row
     if status == "FAIL":
         assert "XDG_CACHE_HOME" in row["fix"] and result.returncode == 3
     if layout.startswith("split"):
-        assert "different filesystems" in row["detail"] and "1.9 GB and 1.7 GB" in row["detail"]
+        assert "different filesystems" in row["detail"] and "1.9 GB and 1.7 GB" in row["detail"] and "/work" in row["found"]
+    _no_leak(box, result)
 
 
 def test_an_existing_plain_folder_of_this_user_is_used_as_it_is(tmp_path, keypair):
@@ -681,35 +846,64 @@ def test_an_existing_plain_folder_of_this_user_is_used_as_it_is(tmp_path, keypai
     assert (work / "site.json").read_text() == "{}"
 
 
-@pytest.mark.parametrize("shape", ["symlink", "file", "world-writable", "credentials-symlink", "credentials-file"])
+def test_the_fix_command_for_the_credentials_folder_is_quoted(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    home = tmp_path / "home dir"
+    home.mkdir(mode=0o700)
+    (home / "gsj-operator").mkdir(mode=0o700)
+    (home / "gsj-operator" / "credentials").mkdir()
+    os.chmod(home / "gsj-operator" / "credentials", 0o750)
+    result = box.run(HOME=str(home))
+    result.reports = sorted((home / "gsj-operator").glob("gsj-init-report-*.json"))
+    row = _check(_report(result), "credentials-folder")
+    assert row["fix"] == "chmod 700 " + str(home / "gsj-operator" / "credentials").replace(" ", "\\ ")
+
+
+@pytest.mark.parametrize("shape", ["symlink", "file", "group-writable", "credentials-symlink", "credentials-file", "other-owner", "other-owner-ancestor-link"])
 def test_a_preseeded_or_symlinked_working_folder_is_refused_before_any_write(tmp_path, keypair, shape):
     """Refused by name BEFORE anything is written anywhere: not into the
-    folder, not through the link, and no companion beside the installer."""
+    folder, not through the link, and no companion beside the installer. The
+    owner rules are exercised with an `id -u` that answers another uid."""
     box = Box(tmp_path, keypair)
     work = box.home / "gsj-operator"
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
+    extra = {}
     if shape == "symlink":
         work.symlink_to(elsewhere)
     elif shape == "file":
         work.write_text("not a folder")
-    elif shape == "world-writable":
+    elif shape == "group-writable":
         work.mkdir()
-        os.chmod(work, 0o777)
+        os.chmod(work, 0o775)
     elif shape == "credentials-symlink":
         work.mkdir(mode=0o700)
         (work / "credentials").symlink_to(elsewhere)
-    else:
+    elif shape == "credentials-file":
         work.mkdir(mode=0o700)
         (work / "credentials").write_text("not a folder")
-    result = box.run()
+    elif shape == "other-owner":
+        work.mkdir(mode=0o700)
+        extra = {"TEST_UID": "4242"}
+    else:
+        real_home = tmp_path / "real-home"
+        real_home.mkdir(mode=0o700)
+        linked = tmp_path / "linked-home"
+        linked.symlink_to(real_home)
+        extra = {"TEST_UID": "4242", "HOME": str(linked)}
+        work = linked / "gsj-operator"
+    result = box.run(**extra)
+    result.reports = sorted(Path(extra.get("HOME", box.home)).glob("gsj-operator/gsj-init-report-*.json"))
     line = _stop(result, "GSJ: refusing", str(work))
-    assert {"symlink": "is a symlink", "file": "is not a directory", "world-writable": "writable by group or others",
-            "credentials-symlink": "credentials: " + str(work / "credentials") + " is a symlink", "credentials-file": "is not a directory"}[shape] in line
+    assert {"symlink": "is a symlink", "file": "is not a directory", "group-writable": "writable by group or others (mode 775); chmod go-w",
+            "credentials-symlink": "credentials: " + str(work / "credentials") + " is a symlink", "credentials-file": "is not a directory",
+            "other-owner": "not by this user (uid 4242)", "other-owner-ancestor-link": "is a symlink owned by uid"}[shape] in line
     assert not list(elsewhere.iterdir()), "init wrote through the link"
     assert box.downloads() == [] and box.beside() == [] and box.kube_calls() == []
     if shape == "file":
         assert work.read_text() == "not a folder"
+    if shape == "other-owner-ancestor-link":
+        assert not list((tmp_path / "real-home").iterdir())
 
 
 def test_home_unset_is_a_named_stop(tmp_path, keypair):
@@ -723,18 +917,25 @@ def test_home_unset_is_a_named_stop(tmp_path, keypair):
         assert trap not in result.stderr, result.stderr
 
 
-def test_two_runs_write_two_reports_and_the_first_is_untouched(tmp_path, keypair):
+def test_two_runs_in_the_same_second_write_two_reports_and_a_link_at_the_next_name_is_skipped(tmp_path, keypair):
     box = Box(tmp_path, keypair)
-    first = box.run()
+    stamp = "20260101T000000Z"
+    first = box.run(TEST_DATE_STAMP=stamp)
     assert first.returncode == 0, first.stderr
     kept = first.reports[0].read_bytes()
-    second = box.run()
+    assert first.reports[0].name == f"gsj-init-report-{stamp}.json"
+    decoy = tmp_path / "decoy.json"
+    decoy.write_text("not a report")
+    (box.home / "gsj-operator" / f"gsj-init-report-{stamp}-2.json").symlink_to(decoy)
+    second = box.run(TEST_DATE_STAMP=stamp)
     assert second.returncode == 0, second.stderr
-    assert len(second.reports) == 2 and first.reports[0].read_bytes() == kept
-    assert all(re.fullmatch(r"gsj-init-report-\d{8}T\d{6}Z(-[2-9])?\.json", p.name) for p in second.reports)
+    names = {p.name for p in second.reports if not p.is_symlink()}
+    assert names == {f"gsj-init-report-{stamp}.json", f"gsj-init-report-{stamp}-3.json"}, names
+    assert (box.home / "gsj-operator" / f"gsj-init-report-{stamp}.json").read_bytes() == kept
+    assert decoy.read_text() == "not a report", "the report was written through the link"
 
 
-def test_an_installer_folder_that_cannot_be_written_still_verifies_from_the_checked_copies(tmp_path, keypair):
+def test_an_installer_folder_that_cannot_be_written_keeps_the_verified_copies_in_the_working_folder(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     os.chmod(box.installer.parent, 0o555)
     try:
@@ -743,11 +944,48 @@ def test_an_installer_folder_that_cannot_be_written_still_verifies_from_the_chec
         os.chmod(box.installer.parent, 0o755)
     assert result.returncode == 0, result.stderr + result.stdout
     report = _report(result)
-    saved = 4 if os.geteuid() == 0 else 0                              # root writes through mode 555
-    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_downloaded"] == 4 and report["verification"]["companions_saved"] == saved
-    if saved == 0:
-        assert "not saved" in result.stderr
+    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_downloaded"] == 4 and report["verification"]["companions_saved"] == 4
+    if os.geteuid() == 0:
+        assert report["verification"]["saved_in"] == str(box.installer.parent)     # root writes through mode 555
+    else:
+        kept = box.home / "gsj-operator" / "releases" / VERSION
+        assert report["verification"]["saved_in"] == str(kept) and str(kept) in _check(report, "release-verification")["detail"]
+        assert sorted(p.name for p in kept.iterdir()) == sorted(COMPANIONS)
+        assert stat.S_IMODE(kept.stat().st_mode) == 0o700
         assert box.beside() == []
+
+
+def test_a_file_that_appears_beside_the_installer_during_the_download_is_never_replaced(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_CURL_PLANT=str(box.installer.parent))
+    assert result.returncode == 0, result.stderr + result.stdout
+    report = _report(result)
+    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_saved"] == 0
+    for name in COMPANIONS:
+        assert (box.installer.parent / name).read_text() == "operator's own copy of " + name
+    assert result.stderr.count("appeared during the download and was not replaced") == 4
+
+
+def test_a_link_that_appears_beside_the_installer_is_never_written_through(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    target = tmp_path / "precious"
+    target.write_text("precious")
+    result = box.run(TEST_CURL_PLANT=str(box.installer.parent), TEST_CURL_PLANT_LINK=str(target))
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert target.read_text() == "precious"
+    assert _report(result)["verification"]["companions_saved"] == 0
+
+
+def test_run_through_a_symlink_beside_the_installer_means_beside_the_file(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    box.place(*COMPANIONS)
+    links = tmp_path / "bin-of-operator"
+    links.mkdir()
+    (links / "gsj-install.sh").symlink_to(box.installer)
+    result = box.run(script=str(links / "gsj-install.sh"), cwd=links)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert box.downloads() == [] and _report(result)["verification"]["companions_present"] == 4
+    assert sorted(p.name for p in links.iterdir()) == ["gsj-install.sh"]
 
 
 # --- the read-only proof and the secrets rule ---------------------------------------
@@ -773,17 +1011,42 @@ def test_init_is_read_only_against_the_cluster(tmp_path, keypair):
     ones; this asserts that never happened AND that every recorded verb is
     one of them -- no create, apply, delete, patch, exec, run, label, scale,
     no Lease, no --raw, no --watch -- even with an operator's exported
-    leftovers that cleanup_exit would otherwise act on. helm answers only
-    `version`; any other helm verb exits 99 too."""
+    leftovers that cleanup_exit would otherwise act on. The process-group
+    leftovers name a sentinel this test owns; it must outlive the run. helm
+    is recorded too and answers only `version --short`."""
     box = Box(tmp_path, keypair)
-    result = box.run(PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true", TRANSFER_HANDBACK_POD="leftover-pod",
-                     RENEWER="1", HELM_PID="1", GSJ_ADDON_COMMAND_PID="1", CONTEXT="c", NAMESPACE="ns", RELEASE="r", SITE="/nonexistent")
+    sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
+    try:
+        result = box.run(PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true", TRANSFER_HANDBACK_POD="leftover-pod",
+                         RENEWER=str(sentinel.pid), HELM_PID=str(sentinel.pid), GSJ_ADDON_COMMAND_PID=str(sentinel.pid),
+                         CONTEXT="c", NAMESPACE="ns", RELEASE="r", SITE="/nonexistent")
+        assert sentinel.poll() is None, "init's exit signalled a process group it did not own"
+    finally:
+        sentinel.kill()
+        sentinel.wait()
     assert result.returncode == 0, result.stderr + result.stdout
     calls = box.kube_calls()
     assert calls, "inspect made no cluster reads at all"
     assert "MUTATION-REFUSED" not in result.stderr
     assert {_verb(call) for call in calls} <= READ_ONLY, sorted({_verb(call) for call in calls})
     assert not any(flag in call for call in calls for flag in ("--watch", "-w", "--raw", "exec", "delete", "replace", "create", "apply", "patch"))
+    assert box.helm_calls() and all(call == ["version", "--short"] for call in box.helm_calls()), box.helm_calls()
+
+
+def test_leftover_variables_never_reach_a_cluster_even_when_init_stops_before_its_own_code(runtime):
+    """A recovery bundle refuses init after the exit trap exists: the unset
+    lives in main, before the trap, so the leftovers are gone by then."""
+    run, state, work = runtime
+    payload = work / "payload"
+    (payload / "helpers").mkdir(parents=True)
+    (payload / "helpers" / "lease-repair-source-release.json").write_text("{}")
+    for name in ("verification-cleanup.sh", "startup-recovery.sh"):
+        (payload / "helpers" / name).write_text("")
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { :; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n',
+                 PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true")
+    assert result.returncode != 0 and "supports only inspect and lease-repair" in result.stderr
+    assert not (work / "init-ran").exists()
+    assert json.loads(state.read_text())["calls"] == [], "the exit trap acted on an exported leftover"
 
 
 def test_no_secret_or_full_url_reaches_any_message_or_the_report(tmp_path, keypair):
@@ -816,7 +1079,7 @@ def test_cdpath_does_not_move_where_beside_the_installer_is(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     decoy = tmp_path / "decoy" / "release"
     decoy.mkdir(parents=True)
-    result = box.run(CDPATH=str(tmp_path / "decoy"), cwd=tmp_path, relative=True)
+    result = box.run(CDPATH=str(tmp_path / "decoy"), cwd=tmp_path, script=os.path.relpath(box.installer, tmp_path))
     assert result.returncode == 0, result.stderr + result.stdout
     assert box.beside() == sorted(COMPANIONS) and not list(decoy.iterdir())
 
@@ -843,7 +1106,7 @@ def test_the_guides_check_table_names_exactly_the_checks_init_writes():
     things: every check name the runtime writes appears in the delimited
     table of OPERATOR.md, and nothing else does."""
     source = (INSTALLER / "runtime.sh").read_text()
-    block = source[source.index("init_box() {"):source.index("init_check_companion() {")]
+    block = source[source.index("init_box() {"):source.index("# ---------------------------------------------------------------- /init --")]
     in_code = set(re.findall(r'init_row ([a-z][a-z0-9-]*) ', block)) | {"helm", "kubectl", "jq", "tar", "gzip", "base64"}
     guide = (INSTALLER / "OPERATOR.md").read_text()
     table = guide[guide.index("<!-- init: checks -->"):guide.index("<!-- /init: checks -->")]

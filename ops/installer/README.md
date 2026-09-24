@@ -31,6 +31,16 @@ refusal happens before the payload is unpacked, so it costs nothing and touches
 nothing. `--fetch-tools`, accepted by every command, restores the download:
 `gsj_client_info` then supplies the pinned URL and SHA256 per tool, and
 verified clients are cached in the runtime's private bin directory. Neither
+
+<!-- init: begin -->
+`init` is the one command that names every missing or too-old client at
+once, in its report, instead of refusing at the first; and the one command
+that refuses `--fetch-tools`, because it downloads nothing but its own
+release's companion files and executes nothing it downloaded except the
+published verifier (see the root README, *`init`: one file, one command,
+one report*).
+<!-- init: end -->
+
 source siblings nor Python/npm/pip/Docker are target prerequisites for an
 existing-cluster installation.
 

@@ -455,30 +455,34 @@ bash gsj-install.sh init
 
 It fetches the four companion files of its own release — `verify-release.sh`,
 `release.pem`, `installer-descriptor.json`, `installer-descriptor.sig` —
-beside itself (files already there, or the key and the verifier in
+beside itself (files already there, or the key alone also in
 `$HOME/gsj-operator/trust/`, are used, never overwritten; one from another
-release is refused by name; a download is checked before it is kept), holds
-its own bytes to the signed descriptor under the key it carries, runs the
-published verifier (a companion `verify-release.sh` only when its bytes are
-this release's), checks every client below against its floor at once and
-says what to install, checks what it can reach (your cluster, named by its
+release is refused by name; every present or downloaded file is copied into
+the run's private work directory and judged there), holds its own bytes to
+the signed descriptor under the key it carries, runs the published verifier
+(a companion `verify-release.sh` only when its bytes are this release's) --
+and only then puts the files it downloaded beside itself (an unverified run
+keeps none) -- checks the three clients below against their floors at once
+and says what to install (bash, curl, tar, gzip, base64, OpenSSL 3 and a
+SHA-256 tool are required before it can run at all, one at a time), checks what it can reach (your cluster, named by its
 context; `github.com` for the corpus; `ghcr.io` for the images), checks the
 disk, the OS and the architecture, creates `$HOME/gsj-operator/` and
-`$HOME/gsj-operator/credentials/` (0700, create-only, refused by name before
-any write when something else is there), runs step 5's `inspect`, and writes
+`$HOME/gsj-operator/credentials/` (0700, create-only; an existing plain
+folder you own that group and others cannot write is used as it is, anything
+else is refused by name before any write), runs step 5's `inspect`, and writes
 one report, `$HOME/gsj-operator/gsj-init-report-<time>.json` — the file to
 send us. Its closing lines say what passed and what to fix; exit 0 is a
 verified release with nothing to fix, 3 a report with something to fix (an
 unverified release included), 1 a refusal it names. It is read-only against
-your cluster — one `kubectl version` and `inspect`'s gets — and it refuses
-`--fetch-tools`. Then continue at **step 3** with the files where `init` left
+your cluster — its own read is one `kubectl version`; `inspect`'s are its
+gets, one more `version` and `top nodes` — and it refuses `--fetch-tools`. Then continue at **step 3** with the files where `init` left
 them (`$INSTALLER` is the file you downloaded). What it checks, and what each
 row settles:
 
 <!-- init: checks -->
 | check | PASS means | FAIL or UNKNOWN means |
 |---|---|---|
-| `release-verification` | this file's SHA-256 and length match the descriptor signed for it, under the key it carries, and the published verifier agreed | UNKNOWN: a companion file could not be obtained — the row names the origin's answer or the missing file; the release is **not verified**, do not install from it. A file that fails a check is a refusal (exit 1), never a row |
+| `release-verification` | this file's SHA-256 and length match the descriptor signed for it, under the key it carries, and the published verifier agreed; the row says where the downloaded files were kept | UNKNOWN: a companion file could not be obtained — the row names the origin's answer, the proxy's, or the missing file; the release is **not verified**, do not install from it, and nothing was saved. A file that fails a check is a refusal (exit 1), never a row |
 | `helm` | at or above the floor (3.13), version and path named | missing, no version, or below the floor; the fix names what to install and whether `--fetch-tools` (the other commands) can supply it |
 | `kubectl` | at or above the floor (1.24) | as for helm |
 | `jq` | at or above the floor (1.6) | as for helm |
@@ -490,13 +494,13 @@ row settles:
 | `gzip` | present | never: refused before `init` ran |
 | `base64` | present | never: refused before `init` ran |
 | `sha256` | `sha256sum` or `shasum` present | never: refused before `init` ran |
-| `cluster` | the context answered and its Kubernetes is 1.27 or newer | no context selected, no answer (unreachable, no such context, refused credentials, or a proxy without `no_proxy`), or below the floor; UNKNOWN when kubectl is missing |
-| `egress-github` | `github.com` answered from this machine | no answer: the corpus cannot be downloaded from here — a proxy, egress, or `corpus.vectors_path` |
-| `egress-ghcr` | `ghcr.io` answered from this machine (which says nothing about your nodes: step 4) | no answer: open the route, or `registry.base` |
-| `disk` | room for the corpus download: about 3.5 GB on the one filesystem holding the cache and `TMPDIR`, or 1.9 GB under `TMPDIR` and 1.7 GB under the cache on two | less than that; UNKNOWN when `df` could not measure it |
+| `cluster` | the context answered and its Kubernetes is 1.27 or newer | no context selected, no answer (unreachable, no such context, refused credentials, a credential plugin that needs a terminal, or a proxy without `no_proxy`), or below the floor; UNKNOWN when kubectl is missing or did not run |
+| `egress-github` | `github.com` answered from this machine | no answer, or a proxy that refused the connection: the corpus cannot be downloaded from here — a proxy, egress, or `corpus.vectors_path` |
+| `egress-ghcr` | `ghcr.io` answered from this machine (which says nothing about your nodes: step 4) | no answer, or a proxy that refused the connection: open the route, or `registry.base` |
+| `disk` | room for the corpus download, named by mount point: about 3.5 GB on the one filesystem holding the cache and `TMPDIR`, or 1.9 GB under `TMPDIR` and 1.7 GB under the cache on two | less than that; UNKNOWN when `df` could not measure it |
 | `os` | Linux | anything else |
-| `architecture` | linux/amd64 or linux/arm64 | never: refused before `init` ran |
-| `working-folder` | `$HOME/gsj-operator` created (mode 700) or an existing plain folder you own | never a row: a symlink, a file, another owner's folder or one writable by group or others is refused before anything is written |
+| `architecture` | linux/amd64 or linux/arm64 | UNKNOWN on a machine that is not Linux (the `os` row); another CPU was refused before `init` ran |
+| `working-folder` | `$HOME/gsj-operator` created (mode 700) or an existing plain folder you own that group and others cannot write | never a row: a symlink, a file, another owner's folder or one writable by group or others (`chmod go-w` it) is refused before anything is written |
 | `credentials-folder` | `$HOME/gsj-operator/credentials` created or existing at mode 700 | existing but readable by group or others — `chmod 700` it; a symlink or a file there is refused |
 | `inspect` | the cluster profile is in the report | UNKNOWN: not run (it needs kubectl and jq at their floors and a cluster that answered) or did not complete |
 | `node-architecture` | every node's architecture is one the release has images for | a node is not; UNKNOWN when there is no profile |
@@ -505,7 +509,10 @@ row settles:
 **What `init` does not answer:** the six questions of step 0. The profile in
 its report (`inspect`) shows your storage classes and ingress classes, which
 feed step 6; the model endpoints, a registry prefix, NetworkPolicy and the
-ingress timeout stay yours to settle before step 7, as step 0 says.
+ingress timeout stay yours to settle as step 0 says — before anything else,
+NetworkPolicy by step 4's probe. A file cut short inside its script part
+fails before `init` can run at all (bash's own error, exit 2): the separate
+verifier is the check for that.
 
 **The honest limit:** `init` proves the installer arrived intact and matches
 its published descriptor; it cannot prove the installer is genuine, because a
@@ -601,13 +608,14 @@ application's own outbound calls are two separate proxies, met in steps 4 and 7.
 ### Step 2 — verify the release you were given
 
 <!-- init: begin -->
-**If you ran `init`**, the four companion files are already beside the
-executable, checked, and the report's `verification.status` says whether the
-release verified. Running the block below by hand, before you execute
-anything, is the stronger check — `init` runs from inside the installer it
-verifies, so a modified installer could skip its own check; the verifier
-cannot be skipped by the file it checks. Do it when that difference matters
-to you; the files `init` fetched are exactly the ones it takes.
+**If you ran `init`** and its `release-verification` row is PASS, the files
+it downloaded are beside the executable (a key it found in `trust/` stays
+there), checked; if the row is UNKNOWN it saved none. Running the block
+below by hand, before you execute anything, is the stronger check — `init`
+runs from inside the installer it verifies, so a modified installer could
+skip its own check; the verifier cannot be skipped by the file it checks. Do
+it when that difference matters to you; the files `init` fetched are exactly
+the ones it takes.
 <!-- init: end -->
 
 You were handed a release — its page, or the five files from it: the
@@ -889,10 +897,10 @@ pull will do.
 against production.
 
 <!-- init: begin -->
-**If you ran `init`**, this step is done: its report carries the same
-profile under `inspect`, and `jq '.inspect | {…}'` over
-`"$HOME"/gsj-operator/gsj-init-report-*.json` answers the same seven rows.
-Run `inspect` again by hand after any change to the cluster.
+**If you ran `init`** and its `inspect` row is PASS, this step is done: its
+report carries the same profile under `inspect`, and `jq '.inspect | {…}'`
+over `"$HOME"/gsj-operator/gsj-init-report-*.json` answers the same seven
+rows. Run `inspect` again by hand after any change to the cluster.
 <!-- init: end -->
 
 ```sh
@@ -1335,8 +1343,8 @@ chmod 500 "$(jq -r .installer.name installer-descriptor.json)"
 
 <!-- init: begin -->
 `bash gsj-install.sh init`, run from a folder holding only the executable,
-fetches those four files for you (it finds a key and verifier already in
-`trust/`), verifies, and writes the one report to send back (step 1 of the
+fetches those four files for you (a key already in `trust/` is found there),
+verifies, and writes the one report to send back (step 1 of the
 walk-through says what it checks). The block above, by hand, stays the
 stronger check: `init` cannot prove the installer is genuine, because a
 modified installer could skip its own check.
@@ -1428,12 +1436,13 @@ this run only.
 ```
 
 <!-- init: begin -->
-`init` has one more: `3` is a report written with something to fix — at
-least one FAIL row, or a release that could not be verified — and the
-closing lines list it and name the file. Its `0` is a verified release with
-nothing to fix, and its `1` the ordinary named refusal (a failed
-verification, a companion file from another release, a working folder it
-refused, `--fetch-tools`), with no report written.
+`init` is the exception to "refuses at the first one": it checks helm,
+kubectl and jq in one run and names every one that is missing or too old,
+with its floor and what was found, and which of them `--fetch-tools` can
+supply for the other commands; the rows for OpenSSL, bash, curl, tar, gzip,
+base64 and the SHA-256 tool record what was found, because a box that lacks
+one of those is refused before `init` can run, one at a time. `init` itself
+refuses `--fetch-tools`, which would download and run three clients.
 <!-- init: end -->
 
 | client | floor | why that number |
@@ -3712,6 +3721,7 @@ from a fixed list, so quote it verbatim when you report it.
 |---|---|---|
 | `0` | the verb finished | — |
 | `1` | a **named refusal**: one line starting `GSJ: `, on stderr | read that line. If an operation was under way the very next line is `Operation ID incomplete; retained state at DIR. Use …` — and the verb it names is the one to run. It is not always `resume` |
+| `3` | `init` only: its report was written and names something to fix — a FAIL row, or a release it could not verify | read its closing lines; send the report |
 | `129`, `130`, `143` | the installer was sent HUP, INT (Ctrl-C) or TERM | nothing is lost: the state directory and the operation's Lease are retained. Wait 180 s for the Lease to go stale, then run the `resume --operation ID` the closing line names |
 | anything else | a child's status passed through unchanged | read the last lines of the log; section 2 lists the ones with a meaning |
 
@@ -3720,13 +3730,12 @@ exactly four arguments), `1` is a release that **failed verification** — do no
 run that installer.
 
 <!-- init: begin -->
-`init` is the exception to "refuses at the first one": it checks all three
-clients, OpenSSL, bash, curl, tar, gzip, base64 and the SHA-256 tool in one
-run and names every one that is missing or too old, with its floor and what
-was found, and which of them `--fetch-tools` can supply for the other
-commands. A missing or LibreSSL `openssl`, and a machine with neither
-`sha256sum` nor `shasum`, are still refused before `init` runs; and `init`
-itself refuses `--fetch-tools`, which would download and run three clients.
+`init` has one more, in the table above: `3` is a report written with
+something to fix — at least one FAIL row, or a release that could not be
+verified — and the closing lines list it and name the file. Its `0` is a
+verified release with nothing to fix, and its `1` the ordinary named refusal
+(a failed verification, a companion file from another release, a working
+folder it refused, `--fetch-tools`), with no report written.
 <!-- init: end -->
 
 ### 2. `command terminated with exit code N` inside the log

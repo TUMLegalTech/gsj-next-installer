@@ -352,7 +352,8 @@ helm_verb_preflight() {
 }
 bootstrap() {
  for utility in bash curl tar gzip base64 openssl awk cut uname mktemp date sync; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
- command -v sha256sum >/dev/null || command -v shasum >/dev/null || fail 'bootstrap utility required: sha256sum or shasum'
+ # init alone names a box without a SHA-256 tool here (the payload check below would blame the payload).
+ [[ ${COMMAND:-} != init ]] || command -v sha256sum >/dev/null || command -v shasum >/dev/null || fail 'bootstrap utility required: sha256sum or shasum'
  openssl_preflight
  # ${FETCH_TOOLS:-false}: main sets it while parsing arguments, but bootstrap
  # must not abort with an unbound variable if it is ever reached without that.
@@ -5455,14 +5456,17 @@ addon_repair_operation() {
 # its own release, verifies itself, checks every tool against its floor at
 # once, checks what it can reach, checks the box, prepares the working folder
 # and runs `inspect` unchanged -- and writes ONE report for the customer to
-# send back. READ-ONLY against every cluster: its only cluster reads are one
-# `kubectl version` and inspect_cluster's gets; it creates, changes and
-# deletes nothing there. It downloads only this release's own four companion
-# files, over HTTPS, and executes nothing it downloaded except the published
-# verifier -- and only a verifier whose bytes are the ones this release was
-# published with (INIT_VERIFIER_SHA256, held to ops/installer/verify-release.sh
-# by a test). Its words never carry a response body, a tool's diagnostic, a
-# kubeconfig's contents, a token or a URL beyond its origin.
+# send back. READ-ONLY against every cluster: its own cluster read is one
+# `kubectl version`; inspect_cluster's are its gets, one more `version` and
+# `top nodes`; it creates, changes and deletes nothing there. It downloads
+# only this release's own four companion files, over HTTPS, and executes
+# nothing it downloaded except the published verifier -- and only a verifier
+# whose bytes are the ones this release was published with
+# (INIT_VERIFIER_SHA256, held to ops/installer/verify-release.sh by a test).
+# Every companion, present or downloaded, is copied into the run's private
+# work directory and judged and used THERE. Its words never carry a response
+# body, a tool's diagnostic, a kubeconfig's contents, a token or a URL beyond
+# its origin.
 #
 # THE HONEST LIMIT: init proves the installer arrived intact and matches its
 # published descriptor. It cannot prove the installer is genuine, because a
@@ -5470,10 +5474,13 @@ addon_repair_operation() {
 # hand BEFORE executing anything, is the stronger check.
 INIT_COMPANIONS=(verify-release.sh release.pem installer-descriptor.json installer-descriptor.sig)
 INIT_VERIFIER_SHA256=f8976a2f8e3f40243efe0805c850339614e50b0615b419babec5a8aaa409ca1f
-# The room the corpus download needs, as the README states it (about 3.5 GB):
-# stage_vectors wants the blocks and their envelope at once on ONE filesystem,
-# or the envelope on TMPDIR's and the blocks on the cache's when they differ.
-INIT_CORPUS_BYTES=3500000000
+# The room the corpus download needs, on stage_vectors' rule: the blocks and
+# their envelope at once on ONE filesystem (needed*2+256 MiB), or the envelope
+# (needed+256 MiB) under TMPDIR and the blocks (needed MiB) under the cache on
+# two. The shipped corpus's blocks total 1,616,286,454 bytes (needed = 1541
+# MiB), so one filesystem needs 3,500,146,688 bytes -- "about 3.5 GB" in the
+# README -- and two need 1,884,291,072 and 1,615,855,616.
+INIT_CORPUS_BYTES=3510000000
 INIT_ENVELOPE_BYTES=1900000000
 INIT_BLOCKS_BYTES=1700000000
 INIT_LIMIT='init proves this installer arrived intact and matches its published descriptor. It cannot prove the installer is genuine, because a modified installer could skip its own check. The stronger check is the separate verifier, run by hand BEFORE executing anything: bash verify-release.sh gsj-install.sh installer-descriptor.json installer-descriptor.sig release.pem'
@@ -5482,9 +5489,9 @@ init_json_line() {
  # descriptor with sorted keys at two-space indents), read the way
  # verify-release.sh reads the descriptor: no jq, which may be one of the
  # tools init reports missing. $1 file, $2 indent, $3 key. One line, or none.
- sed -n 's/^'"$2"'"'"$3"'": "\([^"]*\)",*$/\1/p' "$1" | head -n1
+ sed -n 's/^'"$2"'"'"$3"'": "\([^"]*\)",*$/\1/p' "$1" 2>/dev/null | head -n1
 }
-init_json_number() { sed -n 's/^'"$2"'"'"$3"'": \([0-9][0-9]*\),*$/\1/p' "$1" | head -n1; }
+init_json_number() { sed -n 's/^'"$2"'"'"$3"'": \([0-9][0-9]*\),*$/\1/p' "$1" 2>/dev/null | head -n1; }
 init_json_string() {
  # A JSON string literal from a bash value: backslash and quote escaped, the
  # control characters JSON forbids made spaces. Every value that reaches here
@@ -5506,40 +5513,68 @@ init_row() {
 init_curl_condition() {
  # The CONDITION curl's exit establishes, in this installer's words; curl's
  # own line is kept under $GSJ_WORK and never repeated (a proxy composes it).
- # $1 rc, $2 origin, $3 the HTTP code curl wrote. A transport failure is what
- # the no-egress route is about; an HTTP answer means the origin was reached.
+ # $1 rc, $2 origin, $3 the HTTP code curl wrote, $4 the proxy's CONNECT
+ # answer (000 when no proxy was in the way). A transport failure is what the
+ # no-egress route is about; an HTTP answer means the origin was reached.
+ case ${4:-000} in 000|200) ;; *) printf 'the proxy this machine uses answered HTTP %s to the connection for %s (its credentials, or an exemption for that origin: the guide, step 1)' "$4" "$2"; return;; esac
  case $1 in
    22) case $3 in 401|403) printf '%s requires credentials for that file (HTTP %s), which init never sends' "$2" "$3";; *) printf '%s does not publish that file at this release'"'"'s directory (HTTP %s)' "$2" "$3";; esac;;
+   1) case $3 in 3*) printf '%s redirected to a location that is not HTTPS (HTTP %s), which init never follows' "$2" "$3";; *) printf 'the download from %s failed (curl exit 1: an unsupported protocol or option)' "$2";; esac;;
    6) printf 'the name of %s did not resolve' "$2";;
    7) printf '%s refused the connection' "$2";;
    28) printf '%s did not answer in time' "$2";;
    35|60) printf 'the TLS connection to %s could not be established (a proxy, or a certificate this machine does not trust)' "$2";;
    77) printf 'curl on this machine has no readable CA bundle (install ca-certificates), so %s could not be trusted' "$2";;
-   63) printf '%s sent a file larger than a companion file can be' "$2";;
+   63|153) printf '%s sent a file larger than a companion file can be' "$2";;
    *) printf 'the download from %s failed (curl exit %s)' "$2" "$1";;
  esac
 }
-init_transport_failure() { case $1 in 5|6|7|28|35|60|77) return 0;; *) return 1;; esac; }
+init_transport_failure() { case $1 in 5|6|7|28|35|60|77|proxy) return 0;; *) return 1;; esac; }
+init_shape_ok() {
+ # A downloaded file must look like the companion it is named as, before its
+ # identity is judged: a proxy's or a portal's HTML page is a failed download,
+ # never "a release from elsewhere". $1 name, $2 path.
+ local head; head=$(head -c 40 "$2" 2>/dev/null | tr -d '\000' || true)
+ case $1 in
+   verify-release.sh) [[ $head == '#!/usr/bin/env bash'* ]];;
+   release.pem) [[ $head == '-----BEGIN PUBLIC KEY-----'* ]];;
+   installer-descriptor.json) [[ $head == '{'* ]];;
+   installer-descriptor.sig) [[ $head != '<'* && $head != '{'* && $head != '#'* ]];;
+ esac
+}
 init_download() {
  # One companion file, from THIS release's own directory below its release
  # base, with the download policy `upgrade --to` uses (download_curl: HTTPS
  # only, redirects only to HTTPS; -q so no ~/.curlrc can loosen it), into
  # $GSJ_WORK -- checked there, published beside the installer only afterwards.
- # Sets INIT_WHY and INIT_RC and returns 1 on failure.
- local name=$1 url="$INIT_BASE/$INIT_VERSION/$1" out="$INIT_STAGE/$1" code rc=0
+ # `ulimit -f` bounds the file on a curl too old for --max-filesize to apply
+ # to a response of unknown length. Sets INIT_WHY and INIT_RC and returns 1
+ # on failure; the partial file never stays.
+ local name=$1 url="$INIT_BASE/$INIT_VERSION/$1" out="$INIT_STAGE/$1" answer code connect rc=0
  INIT_RC=0
- code=$(download_curl -q --fail --silent --show-error --location --proto '=https' --connect-timeout 15 --max-time 120 --max-filesize 1048576 --write-out '%{http_code}' "$url" -o "$out" 2>"$GSJ_WORK/init-download-$name.err") || rc=$?
- if (( rc != 0 )); then rm -f "$out"; INIT_RC=$rc; INIT_WHY=$(init_curl_condition "$rc" "$INIT_ORIGIN" "${code:-000}"); return 1; fi
- [[ $code == 200 ]] || { rm -f "$out"; INIT_RC=22; INIT_WHY="$INIT_ORIGIN answered HTTP ${code:-000} instead of the file"; return 1; }
+ answer=$( ( ulimit -f 2048 2>/dev/null; download_curl -q --fail --silent --show-error --location --proto '=https' --connect-timeout 15 --max-time 120 --max-filesize 1048576 --write-out '%{http_code} %{http_connect}' "$url" -o "$out" ) 2>"$GSJ_WORK/init-download-$name.err" ) || rc=$?
+ read -r code connect <<< "${answer:-000 000}"; code=${code:-000}; connect=${connect:-000}
+ if (( rc != 0 )); then
+   rm -f "$out"; INIT_RC=$rc; INIT_WHY=$(init_curl_condition "$rc" "$INIT_ORIGIN" "$code" "$connect")
+   case $connect in 000|200) ;; *) INIT_RC=proxy;; esac
+   return 1
+ fi
+ [[ $code == 200 ]] || { rm -f "$out"; INIT_RC=22; INIT_WHY="$INIT_ORIGIN answered HTTP $code instead of the file"; return 1; }
  [[ -s $out ]] || { rm -f "$out"; INIT_RC=22; INIT_WHY="$INIT_ORIGIN sent an empty file"; return 1; }
+ init_shape_ok "$name" "$out" || { rm -f "$out"; INIT_RC=22; INIT_WHY="$INIT_ORIGIN -- or a proxy or portal in between -- answered with something that is not $name (an HTML page, for example)"; return 1; }
 }
 init_publish() {
- # A checked download, put beside the installer create-only: an existing name
- # of any kind is left alone. $1 name. Returns 1 (INIT_WHY set) when it could
- # not be written; the checked copy under $GSJ_WORK still serves this run.
- local name=$1 dest="$INIT_HERE/$1"
- [[ ! -e $dest && ! -L $dest ]] || { INIT_WHY="$dest appeared during the download and was not replaced"; return 1; }
- ( set -o noclobber; cat "$INIT_STAGE/$name" > "$dest" ) 2>/dev/null || { rm -f "$dest" 2>/dev/null || true; INIT_WHY="$INIT_HERE is not writable"; return 1; }
+ # A checked download, put create-only where the release lives: an existing
+ # name of any kind is left alone, and only a file this call created is ever
+ # removed. $1 name, $2 the directory. Returns 2 (INIT_WHY set) when a name
+ # was already there, 1 when the directory could not be written; the checked
+ # copy under $GSJ_WORK still serves this run either way.
+ local name=$1 dest="$2/$1"
+ if ! ( set -o noclobber; : > "$dest" ) 2>/dev/null; then
+   if [[ -e $dest || -L $dest ]]; then INIT_WHY="$dest appeared during the download and was not replaced"; return 2; fi
+   INIT_WHY="$2 is not writable"; return 1
+ fi
+ cat "$INIT_STAGE/$name" > "$dest" 2>/dev/null || { rm -f "$dest"; INIT_WHY="$dest could not be written"; return 1; }
 }
 init_own_dir() {
  # The working folder and its credentials folder, on the add-on staging
@@ -5562,246 +5597,61 @@ init_own_dir() {
  done
  [[ -L $path ]] && { INIT_WHY="$path is a symlink"; return 1; }
  if [[ ! -e $path ]]; then
-   mkdir -m 700 "$path" 2>/dev/null || { INIT_WHY="$path could not be created"; return 1; }
-   INIT_MADE=true; INIT_MODE=700; return 0
+   if mkdir -m 700 "$path" 2>/dev/null; then INIT_MADE=true; INIT_MODE=700; return 0; fi
+   [[ -e $path || -L $path ]] || { INIT_WHY="$path could not be created"; return 1; }
  fi
+ [[ -L $path ]] && { INIT_WHY="$path is a symlink"; return 1; }
  [[ -d $path ]] || { INIT_WHY="$path is not a directory"; return 1; }
  owner=$(stat -c %u "$path" 2>/dev/null || stat -f %u "$path" 2>/dev/null) || owner=''
  mode=$(stat -c %a "$path" 2>/dev/null || stat -f %Lp "$path" 2>/dev/null) || mode=''
  [[ $owner == "$(id -u)" ]] || { INIT_WHY="$path is owned by uid ${owner:-?}, not by this user (uid $(id -u))"; return 1; }
  [[ $mode =~ ^[0-7]+$ ]] || { INIT_WHY="the mode of $path could not be read"; return 1; }
- (( (8#$mode & 022) == 0 )) || { INIT_WHY="$path is writable by group or others (mode $mode)"; return 1; }
+ (( (8#$mode & 022) == 0 )) || { INIT_WHY="$path is writable by group or others (mode $mode); chmod go-w $(printf '%q' "$path")"; return 1; }
  INIT_MODE=$mode
 }
 init_reach() {
- # Reachability only: the HTTP code, or 000 when nothing answered. No
- # credential is offered and no body is kept (the probe inspect makes).
- curl -q --silent --output /dev/null --connect-timeout 10 --max-time 12 --write-out '%{http_code}' "$1" </dev/null 2>/dev/null || true
+ # Reachability only: the HTTP code, "proxy:CODE" when a proxy refused the
+ # connection, or 000 when nothing answered. No credential is offered and no
+ # body is kept (the probe inspect makes).
+ local answer code connect
+ answer=$(curl -q --silent --output /dev/null --connect-timeout 10 --max-time 12 --write-out '%{http_code} %{http_connect}' "$1" </dev/null 2>/dev/null) || true
+ read -r code connect <<< "${answer:-000 000}"; code=${code:-000}; connect=${connect:-000}
+ case $connect in 000|200) printf '%s' "$code";; *) printf 'proxy:%s' "$connect";; esac
 }
 init_free_bytes() {
- # $1 an existing path: "DEVICE FREE-BYTES", or "unknown 0" when df cannot say.
- local device free
- read -r device free < <( { df -Pk "$1" 2>/dev/null || true; } | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $1, $4*1024; found=1} END {if (!found) print "unknown 0"}')
- printf '%s %s' "$device" "$free"
-}
-init_box() {
- local name here self trust base origin version identity found dir where present=0 downloaded=0 missing='' why='' verifier='' descriptor='' signature='' pem='' status detail utility
- local -a wanted=() saved=()
- INIT_PASS=0; INIT_FAIL=0; INIT_UNKNOWN=0; INIT_ROWS=''; INIT_FIXES=''; INIT_WHY=''; INIT_RC=0
- # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to
- # release, a process group to signal). init sets none; an operator's exported
- # leftovers must not reach a cluster through init's exit.
- unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT
- for utility in df stat id dirname basename tr head tail sed wc; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
- here=$(CDPATH= cd -- "$(dirname -- "$0")" >/dev/null && pwd -P) || fail 'the directory holding this installer is unreadable'
- self="$here/$(basename -- "$0")"; [[ -f $self ]] || fail "this installer could not find its own file at $self"
- version=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' version); identity=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' identity)
- trust=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' trustKeySha256); base=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' release_base_url)
- [[ -n $version && -n $identity && -n $trust ]] || fail 'this installer'"'"'s release.json names no version, identity or trust key'
- [[ $(sha_file "$GSJ_PAYLOAD/trust/release.pem") == "$trust" ]] || fail 'embedded trust key does not match this installer'"'"'s release.json'
- [[ $base == https://* ]] || base=''
- origin=$(url_origin_only "$base"); INIT_BASE=$base; INIT_ORIGIN=$origin; INIT_VERSION=$version; INIT_IDENTITY=$identity; INIT_TRUST=$trust; INIT_HERE=$here; INIT_STAGE="$GSJ_WORK/init-companions"; mkdir -p "$INIT_STAGE"
- printf 'GSJ init: release %s (%s)\n' "$version" "$identity"
- # THE WORKING FOLDER FIRST -- refused by name before anything is written
- # anywhere; its rows come at step 5, where the guide's steps meet it.
- [[ -n ${HOME:-} && ${HOME:-} == /* ]] || fail 'HOME is not set to an absolute path; init cannot place the working folder'
- local work="$HOME/gsj-operator" work_made work_mode cred_made cred_mode
- init_own_dir "$work" || fail "refusing $work: $INIT_WHY (init creates it only when nothing of that name exists; a plain folder this user owns is used as it is)"
- work_made=$INIT_MADE; work_mode=$INIT_MODE
- init_own_dir "$work/credentials" || fail "refusing $work/credentials: $INIT_WHY"
- cred_made=$INIT_MADE; cred_mode=$INIT_MODE
- # 1 -- THE REST OF ITS OWN RELEASE. A companion beside the installer, else in
- # the working folder's trust/ (the guide's layout), is used and never
- # overwritten; one from another release is refused by name, never replaced;
- # every present file is looked at BEFORE anything is downloaded. The missing
- # are downloaded into $GSJ_WORK, checked there, and only then put beside
- # the installer.
- for name in "${INIT_COMPANIONS[@]}"; do
-   where=''
-   for dir in "$here" "$work/trust"; do
-     if [[ -e $dir/$name || -L $dir/$name ]]; then where="$dir/$name"; break; fi
-   done
-   if [[ -n $where ]]; then
-     [[ -f $where && ! -L $where ]] || fail "$where is not a plain file; move it aside (a companion file is never replaced)"
-     init_check_companion "$name" "$where" present
-     present=$((present+1)); log "init: using $where"
-   else
-     wanted+=("$name")
-   fi
-   case $name in verify-release.sh) verifier=$where;; release.pem) pem=$where;; installer-descriptor.json) descriptor=$where;; installer-descriptor.sig) signature=$where;; esac
- done
- # A present pair is checked against each other before anything is fetched:
- # a signature from another release is refused by name, not worked around.
- if [[ -n $descriptor && -n $signature ]]; then init_verify_signature "$descriptor" "$signature"; fi
- local transport_failed=false
- for name in ${wanted[@]+"${wanted[@]}"}; do
-   if [[ -z $base ]]; then missing+="${missing:+, }$name"; continue; fi
-   if $transport_failed; then missing+="${missing:+, }$name (not tried)"; continue; fi
-   log "init: downloading $name from $origin"
-   if init_download "$name"; then
-     init_check_companion "$name" "$INIT_STAGE/$name" downloaded
-     downloaded=$((downloaded+1)); where="$INIT_STAGE/$name"
-     case $name in verify-release.sh) verifier=$where;; release.pem) pem=$where;; installer-descriptor.json) descriptor=$where;; installer-descriptor.sig) signature=$where;; esac
-   else
-     missing+="${missing:+, }$name"; why=$INIT_WHY
-     ! init_transport_failure "$INIT_RC" || transport_failed=true
-   fi
- done
- if [[ -n $missing ]]; then
-   if [[ -z $base ]]; then detail="not verified: $missing missing beside the installer and in $work/trust, and this build carries no release directory (release_base_url is empty, as a qualification build is packaged): put the four companion files beside the installer yourself"
-   else detail="not verified: $missing could not be downloaded ($why). Put the four companion files beside the installer yourself, or fix the connection and run init again"; fi
-   status=UNKNOWN
-   init_row release-verification UNKNOWN "$present present, $downloaded downloaded, missing: $missing" "$detail" 'obtain the four companion files (the release page), put them beside the installer, then run init again -- or verify by hand'
- else
-   # The signature that binds the descriptor to this release's key, then the
-   # descriptor's own claims about THIS file -- the check `upgrade --to`
-   # makes on a target, without jq, under the EMBEDDED key. A present file
-   # that fails is refused by name (never replaced); a downloaded one is not
-   # kept, and the release is asked for again.
-   init_verify_descriptor "$descriptor" "$signature" "$self"
-   # THE PUBLISHED VERIFIER, unchanged (its bytes are pinned above), over this
-   # installer's bytes; its own fixed lines go to the screen.
-   log "init: running $verifier"
-   bash "$verifier" "$self" "$descriptor" "$signature" "$pem" || fail "release verification FAILED: verify-release.sh refused this installer (its line is above). Do not run this installer; ask for the release again"
-   for name in ${wanted[@]+"${wanted[@]}"}; do
-     if init_publish "$name"; then saved+=("$name"); else log "init: $name verified but not saved: $INIT_WHY"; fi
-   done
-   status=PASS
-   detail="the installer matches its signed descriptor ($present companion file(s) present, $downloaded downloaded from ${origin:-nowhere}"
-   if (( downloaded > 0 )); then detail+=", ${#saved[@]} saved beside the installer"; fi
-   init_row release-verification PASS "verified under the embedded key and by $verifier" "$detail)"
- fi
- # 2 -- EVERY TOOL AGAINST ITS FLOOR, all at once, on the customer's own PATH
- # (init refuses --fetch-tools, so nothing sits in front of it).
- local tool floor pinned kubectl_version=''
- for tool in helm kubectl jq; do
-   case $tool in helm) floor=$GSJ_HELM_FLOOR;; kubectl) floor=$GSJ_KUBECTL_FLOOR;; jq) floor=$GSJ_JQ_FLOOR;; esac
-   if gsj_client_info "$tool" "$GSJ_PLATFORM" >/dev/null 2>&1; then pinned="any other command accepts --fetch-tools (this release pins a $tool for $GSJ_PLATFORM for that run only; read the guide's note on kubectl and your server's version first)"; else pinned="--fetch-tools cannot help here: this release pins no $tool for $GSJ_PLATFORM"; fi
-   where=$(command -v "$tool" 2>/dev/null) || where=''
-   if [[ -z $where ]]; then init_row "$tool" FAIL 'none on PATH' "requires $tool >= $floor, found none on PATH" "install $tool >= $floor with your distribution; $pinned"; continue; fi
-   found=$(client_version "$tool")
-   if [[ -z $found ]]; then init_row "$tool" FAIL "$where" "requires $tool >= $floor, but $where did not report a version" "check that binary; $pinned"
-   elif version_at_least "$found" "$floor"; then init_row "$tool" PASS "$found at $where" "$tool $found (floor $floor)"; [[ $tool != kubectl ]] || kubectl_version=$found
-   else init_row "$tool" FAIL "$found at $where" "requires $tool >= $floor, found $found" "upgrade $tool; $pinned"; fi
- done
- found=$(openssl version 2>/dev/null | head -n1); init_row openssl PASS "$found at $(command -v openssl)" "$found (floor OpenSSL $GSJ_OPENSSL_FLOOR, checked before any command runs; --fetch-tools does not supply OpenSSL)"
- init_row bash PASS "bash $BASH_VERSION" "bash $BASH_VERSION"
- found=$(curl --version 2>/dev/null | head -n1 | cut -d ' ' -f1-2); init_row curl PASS "${found:-curl}" "${found:-curl} (downloads honour the proxy variables curl reads)"
- for tool in tar gzip base64; do init_row "$tool" PASS "$(command -v "$tool")" "$tool at $(command -v "$tool")"; done
- if command -v sha256sum >/dev/null; then init_row sha256 PASS "$(command -v sha256sum)" 'sha256sum (checked before any command runs)'; else init_row sha256 PASS "$(command -v shasum)" 'shasum (checked before any command runs)'; fi
- # 3 -- WHAT IT CAN REACH. The cluster its kubeconfig points at, named by its
- # context; github.com, where the corpus release lives; ghcr.io, the images
- # (from THIS machine: the nodes' route is step 4's pull probe).
- local context='' server='' versions code_github code_ghcr egress
- context=${CONTEXT_ARG:-}
- if [[ -z $context ]] && command -v kubectl >/dev/null; then context=$(kubectl config current-context 2>/dev/null </dev/null) || context=''; fi
- if ! command -v kubectl >/dev/null; then init_row cluster UNKNOWN 'no kubectl' 'the cluster could not be read: kubectl is missing (above)' ''
- elif [[ -z $context ]]; then init_row cluster FAIL 'no context' 'no kubeconfig context is selected (KUBECONFIG unset, empty, or without a current-context)' 'export KUBECONFIG=/path/to/kubeconfig, or pass --context NAME'
- else
-   versions=$( { kubectl --context "$context" --request-timeout 20s version -o json 2>/dev/null </dev/null || true; } | tr -d '\n' )
-   server=$(printf '%s' "$versions" | sed -n 's/.*"serverVersion"[^}]*"gitVersion"[^"]*"v\{0,1\}\([0-9][0-9.]*\).*/\1/p')
-   if [[ -z $server ]]; then init_row cluster FAIL "context $context" "the API server of context $context did not answer (unreachable, no such context, or the kubeconfig's credentials were refused)" 'check KUBECONFIG and the network to the API server; with a proxy exported, put the API server'"'"'s host in no_proxy (the guide, step 1)'
-   elif version_at_least "$server" "$GSJ_SERVER_FLOOR"; then init_row cluster PASS "context $context, Kubernetes $server" "context $context answered: Kubernetes $server (floor $GSJ_SERVER_FLOOR)"
-   else init_row cluster FAIL "context $context, Kubernetes $server" "context $context answered Kubernetes $server, below the floor $GSJ_SERVER_FLOOR" "a cluster of Kubernetes >= $GSJ_SERVER_FLOOR"; fi
- fi
- if [[ $kubectl_version == *.* && $server == *.* ]]; then
-   local cm sm; cm=${kubectl_version#*.}; cm=${cm%%.*}; sm=${server#*.}; sm=${sm%%.*}
-   if (( 10#$cm - 10#$sm <= 1 && 10#$sm - 10#$cm <= 1 )); then init_row kubectl-skew PASS "client $kubectl_version, server $server" "kubectl $kubectl_version is within one minor of the server ($server)"
-   else init_row kubectl-skew FAIL "client $kubectl_version, server $server" "kubectl $kubectl_version is more than one minor from the server ($server)" "install a kubectl within one minor of $server (the guide, step 1)"; fi
- else init_row kubectl-skew UNKNOWN '' 'not compared: kubectl or the server version is unknown (above)' ''; fi
- code_github=$(init_reach https://github.com/); code_ghcr=$(init_reach https://ghcr.io/v2/)
- if [[ $code_github != 000 ]]; then init_row egress-github PASS "HTTP $code_github" "github.com answered (HTTP $code_github): the corpus release can be downloaded from this machine"; else init_row egress-github FAIL 'no answer' 'github.com did not answer: the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine' 'open egress or export a proxy for this machine (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)'; fi
- if [[ $code_ghcr != 000 ]]; then init_row egress-ghcr PASS "HTTP $code_ghcr" "ghcr.io answered (HTTP $code_ghcr) from this machine; this says nothing about your NODES, whose route step 4's pull probe proves"; else init_row egress-ghcr FAIL 'no answer' 'ghcr.io did not answer from this machine; the nodes pull the images, so prove their route in step 4' 'open the route, or mirror the six images into a registry the nodes reach (registry.base)'; fi
- if [[ $code_github == 000 && $code_ghcr == 000 ]]; then egress=none; elif [[ $code_github != 000 && $code_ghcr != 000 ]]; then egress=full; else egress=partial; fi
- # 4 -- THE BOX: room for the corpus download, the OS, the architecture. The
- # rule is stage_vectors': one filesystem holds blocks and envelope at once.
- local cache="${XDG_CACHE_HOME:-$HOME/.cache}/gsj-install" tmpdir="${TMPDIR:-/tmp}" cache_device cache_free work_device work_free
- dir=$cache; while [[ ! -d $dir && $dir != / ]]; do dir=$(dirname "$dir"); done
- read -r cache_device cache_free <<< "$(init_free_bytes "$dir")"
- read -r work_device work_free <<< "$(init_free_bytes "$tmpdir")"
- if [[ $cache_device == unknown || $work_device == unknown ]]; then init_row disk UNKNOWN "cache $cache, TMPDIR $tmpdir" "free space at $cache or $tmpdir could not be measured" ''
- elif [[ $cache_device == "$work_device" ]]; then
-   if (( work_free >= INIT_CORPUS_BYTES )); then init_row disk PASS "$((work_free/1000000)) MB free on $work_device" "$((work_free/1000000)) MB free on the filesystem that holds both the corpus cache ($cache) and TMPDIR ($tmpdir); the download needs about 3.5 GB there"
-   else init_row disk FAIL "$((work_free/1000000)) MB free on $work_device" "$((work_free/1000000)) MB free on the filesystem that holds both the corpus cache ($cache) and TMPDIR ($tmpdir); the download needs about 3.5 GB there" 'free space there, or export XDG_CACHE_HOME and TMPDIR to a larger filesystem before installing (the guide, step 1)'; fi
- else
-   if (( work_free >= INIT_ENVELOPE_BYTES && cache_free >= INIT_BLOCKS_BYTES )); then init_row disk PASS "$((work_free/1000000)) MB free on $work_device, $((cache_free/1000000)) MB free on $cache_device" "TMPDIR ($tmpdir) has $((work_free/1000000)) MB and the corpus cache ($cache) $((cache_free/1000000)) MB, on different filesystems; the download needs about 1.9 GB and 1.7 GB there"
-   else init_row disk FAIL "$((work_free/1000000)) MB free on $work_device, $((cache_free/1000000)) MB free on $cache_device" "TMPDIR ($tmpdir) has $((work_free/1000000)) MB and the corpus cache ($cache) $((cache_free/1000000)) MB, on different filesystems; the download needs about 1.9 GB and 1.7 GB there" 'free space there, or export XDG_CACHE_HOME and TMPDIR to larger filesystems before installing (the guide, step 1)'; fi
- fi
- found=$(uname -s 2>/dev/null || printf unknown)
- if [[ $found == Linux ]]; then init_row os PASS "$found" 'Linux'; else init_row os FAIL "$found" "$found: the installer runs on Linux" 'run the installer from a Linux machine'; fi
- init_row architecture PASS "$GSJ_PLATFORM" "$GSJ_PLATFORM (this machine)"
- # 5 -- THE WORKING FOLDER the guide's later steps use (admitted above).
- if $work_made; then init_row working-folder PASS "$work" "created $work (mode 700)"; else init_row working-folder PASS "$work" "using the existing $work (owned by this user, mode $work_mode)"; fi
- if $cred_made; then init_row credentials-folder PASS "$work/credentials" "created $work/credentials (mode 700) for the registry auth file, the operator password and the backup passphrase"
- elif (( (8#$cred_mode & 077) == 0 )); then init_row credentials-folder PASS "$work/credentials" "using the existing $work/credentials (mode $cred_mode)"
- else init_row credentials-folder FAIL "$work/credentials (mode $cred_mode)" "$work/credentials is readable by group or others (mode $cred_mode); it holds credentials" "chmod 700 $work/credentials"; fi
- # 6 -- INSPECT, unchanged, then ONE report. inspect needs jq and kubectl at
- # their floors and a server that answered; it runs guarded, so nothing it
- # meets can end init, and its document is spliced only when it is one.
- local profile="$GSJ_WORK/init-inspect.json" node_arch
- printf '{"unavailable":true,"reason":"inspect needs kubectl and jq at their floors and a cluster that answered (above)"}\n' > "$profile"
- if [[ -n $server ]] && command -v jq >/dev/null && version_at_least "$(client_version jq)" "$GSJ_JQ_FLOOR" && version_at_least "$kubectl_version" "$GSJ_KUBECTL_FLOOR"; then
-   log 'init: running inspect'
-   if ( CONTEXT_ARG=$context; inspect_cluster ) </dev/null > "$GSJ_WORK/init-inspect.out" 2>"$GSJ_WORK/init-inspect.err" && jq -e '.schema=="gsj.inspect/1"' "$GSJ_WORK/init-inspect.out" >/dev/null 2>&1; then
-     mv -f "$GSJ_WORK/init-inspect.out" "$profile"; init_row inspect PASS "context $context" "the cluster profile (gsj.inspect/1) is in the report"
-   else printf '{"unavailable":true,"reason":"inspect did not complete"}\n' > "$profile"; init_row inspect UNKNOWN "context $context" 'inspect did not complete; run the inspect command by hand and read its line' ''; fi
- else init_row inspect UNKNOWN '' 'not run: inspect needs kubectl and jq at their floors and a cluster that answered (above)' ''; fi
- if jq -e '.nodes' "$profile" >/dev/null 2>&1; then
-   node_arch=$(jq -r '[.nodes[]?.architecture // empty | "linux/" + .] | unique | join(", ")' "$profile" 2>/dev/null) || node_arch=''
-   if [[ -z $node_arch ]]; then init_row node-architecture UNKNOWN '' 'the nodes reported no architecture' ''
-   elif jq -e --arg archs "$node_arch" '($archs | split(", ")) - .platforms == []' "$GSJ_PAYLOAD/release.json" >/dev/null 2>&1; then init_row node-architecture PASS "$node_arch" "every node is $node_arch, which this release has images for"
-   else init_row node-architecture FAIL "$node_arch" "a node is $node_arch, and this release has images only for $(jq -r '.platforms | join(", ")' "$GSJ_PAYLOAD/release.json")" 'the node that carries the volumes (storage.node) needs an architecture the release has images for'; fi
- else init_row node-architecture UNKNOWN '' 'not compared: no cluster profile (above)' ''; fi
- local stamp report ready=false n
- stamp=$(date -u +%Y%m%dT%H%M%SZ)
- [[ $status == PASS ]] && (( INIT_FAIL == 0 )) && ready=true
- {
-   printf '{"schema":"gsj.init/1",\n "installer":{"name":%s,"version":%s,"identity":%s,"sha256":"%s","platform":"%s"},\n' "$(init_json_string "$(basename -- "$self")")" "$(init_json_string "$version")" "$(init_json_string "$identity")" "$(sha_file "$self")" "$GSJ_PLATFORM"
-   printf ' "release_origin":%s,\n "verification":{"status":"%s","companions_present":%s,"companions_downloaded":%s,"companions_saved":%s,"missing":%s,"limit":%s},\n' "$(init_json_string "$origin")" "$status" "$present" "$downloaded" "${#saved[@]}" "$(init_json_string "$missing")" "$(init_json_string "$INIT_LIMIT")"
-   printf ' "checks":[%s\n ],\n "summary":{"pass":%s,"fail":%s,"unknown":%s,"ready":%s,"egress":"%s"},\n "inspect":' "$INIT_ROWS" "$INIT_PASS" "$INIT_FAIL" "$INIT_UNKNOWN" "$ready" "$egress"
-   cat "$profile"
-   printf '}\n'
- } > "$GSJ_WORK/init-report.json"
- report=''
- for n in '' -2 -3 -4 -5 -6 -7 -8 -9; do
-   [[ ! -e $work/gsj-init-report-$stamp$n.json && ! -L $work/gsj-init-report-$stamp$n.json ]] || continue
-   if ( set -o noclobber; cat "$GSJ_WORK/init-report.json" > "$work/gsj-init-report-$stamp$n.json" ) 2>/dev/null; then report="$work/gsj-init-report-$stamp$n.json"; break; fi
- done
- [[ -n $report ]] || fail "the report could not be created in $work"
- printf '\n%s passed, %s failed, %s unknown.\n' "$INIT_PASS" "$INIT_FAIL" "$INIT_UNKNOWN"
- if [[ $status != PASS ]]; then printf 'This installer is NOT verified (release-verification above): do not install from it until it is.\n'; fi
- if [[ -n $INIT_FIXES ]]; then printf 'Fix before an install:\n%s' "$INIT_FIXES"; fi
- if [[ $egress == none ]]; then printf 'No internet from this machine: the no-egress route needs the corpus staged locally (corpus.vectors_path: the manifest and its seven blocks), the six images mirrored where your nodes pull (registry.base) -- and the add-on images too if you choose a managed profile -- and --fetch-tools cannot download anything.\n'; fi
- printf 'Send this one file back: %s\n' "$report"
- printf 'Limit: %s\n' "$INIT_LIMIT"
- printf 'Not answered here: the six questions of step 0 (the storage provisioner, the model endpoints, a registry prefix, NetworkPolicy, the ingress). The profile in the report shows your storage and ingress classes; the rest is yours to settle before step 7.\n'
- $ready || exit 3
+ # $1 an existing path: "DEVICE FREE-BYTES MOUNTPOINT", or "unknown 0 unknown"
+ # when df cannot say. The device is compared, never printed: df's source
+ # column can carry a remote path or a URL.
+ local device free mount
+ read -r device free mount < <( { df -Pk "$1" 2>/dev/null || true; } | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $1, $4*1024, $NF; found=1} END {if (!found) print "unknown 0 unknown"}')
+ printf '%s %s %s' "$device" "$free" "$mount"
 }
 init_check_companion() {
- # A companion's identity, before anything else touches it: $1 name, $2 path,
- # $3 present|downloaded. A wrong one stops init by name -- a present file is
- # never replaced, a downloaded one is never saved.
- local name=$1 path=$2 how=$3 found other
+ # A companion's identity, judged on the private copy: $1 name, $2 the copy,
+ # $3 present|downloaded, $4 the path it was found at (for the message). A
+ # wrong one stops init by name -- a present file is never replaced, a
+ # downloaded one is never saved.
+ local name=$1 path=$2 how=$3 where=$4 found other
  case $name in
    installer-descriptor.json)
-     found=$(init_json_line "$path" '  ' version); [[ $found =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || found=''
-     other=$(init_json_line "$path" '  ' releaseId); [[ $other =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || other=''
+     found=$(init_json_line "$path" '  ' version) || found=''; [[ $found =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || found=''
+     other=$(init_json_line "$path" '  ' releaseId) || other=''; [[ $other =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || other=''
      if [[ $found != "$INIT_VERSION" ]]; then
-       if [[ $how == present ]]; then fail "$path belongs to release ${found:-of an unreadable version}; this installer is $INIT_VERSION. Move it aside: a companion file is never replaced"
+       if [[ $how == present ]]; then fail "$where belongs to release ${found:-of an unreadable version}; this installer is $INIT_VERSION. Move it aside: a companion file is never replaced"
        else fail "the descriptor published at $INIT_ORIGIN for $INIT_VERSION names release ${found:-of an unreadable version}. Do not run this installer; ask for the release again"; fi
      fi
      if [[ $other != "$INIT_IDENTITY" ]]; then
-       if [[ $how == present ]]; then fail "$path describes build ${other:-of an unreadable identity} of $INIT_VERSION; this installer is build $INIT_IDENTITY. Move it aside and use the descriptor published with this file: a companion file is never replaced"
+       if [[ $how == present ]]; then fail "$where describes build ${other:-of an unreadable identity} of $INIT_VERSION; this installer is build $INIT_IDENTITY. Move it aside and use the descriptor published with this file: a companion file is never replaced"
        else fail "the descriptor published at $INIT_ORIGIN for $INIT_VERSION describes build ${other:-of an unreadable identity}; this installer is build $INIT_IDENTITY. Do not run this installer; ask for the release again"; fi
      fi;;
    release.pem)
      if [[ $(sha_file "$path") != "$INIT_TRUST" ]]; then
-       if [[ $how == present ]]; then fail "$path is not the key this installer carries (SHA-256 $INIT_TRUST): a key from another release line. Move it aside: a companion file is never replaced"
+       if [[ $how == present ]]; then fail "$where is not the key this installer carries (SHA-256 $INIT_TRUST): a key from another release line. Move it aside: a companion file is never replaced"
        else fail "the release.pem published at $INIT_ORIGIN for $INIT_VERSION is not the key this installer carries (SHA-256 $INIT_TRUST). Do not run this installer; ask for the release again"; fi
      fi;;
    verify-release.sh)
      if [[ $(sha_file "$path") != "$INIT_VERIFIER_SHA256" ]]; then
-       if [[ $how == present ]]; then fail "$path is not the verifier published with release $INIT_VERSION (SHA-256 $INIT_VERIFIER_SHA256), so init will not execute it. Move it aside: a companion file is never replaced"
+       if [[ $how == present ]]; then fail "$where is not the verifier published with release $INIT_VERSION (SHA-256 $INIT_VERIFIER_SHA256), so init will not execute it. Move it aside: a companion file is never replaced"
        else fail "the verify-release.sh published at $INIT_ORIGIN for $INIT_VERSION is not the one this release was published with (SHA-256 $INIT_VERIFIER_SHA256); it was not executed. Do not run this installer; ask for the release again"; fi
      fi;;
  esac
@@ -5823,6 +5673,239 @@ init_verify_descriptor() {
  [[ $expected =~ ^[0-9a-f]{64}$ && $bytes =~ ^[0-9]+$ ]] || fail 'the descriptor names no installer digest and length'
  [[ $(sha_file "$self") == "$expected" ]] || fail "release verification FAILED: this file's SHA-256 differs from the signed descriptor (a download cut short, altered or swapped). Do not run this installer; ask for the release again"
  [[ $(wc -c < "$self" | tr -d ' ') == "$bytes" ]] || fail "release verification FAILED: this file's length differs from the signed descriptor. Do not run this installer; ask for the release again"
+}
+init_box() {
+ local name here self trust base origin version identity found dir where present=0 downloaded=0 missing='' why='' status detail utility target
+ local -a wanted=() saved=()
+ INIT_PASS=0; INIT_FAIL=0; INIT_UNKNOWN=0; INIT_ROWS=''; INIT_FIXES=''; INIT_WHY=''; INIT_RC=0
+ for utility in df stat id dirname basename tr head tail sed wc readlink; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
+ # This file, through any symlink it was run as: "beside the installer" is
+ # beside the file itself.
+ self=$0; while [[ -L $self ]]; do target=$(readlink -- "$self") || fail "the link $self could not be read"; [[ $target == /* ]] && self=$target || self="$(dirname -- "$self")/$target"; done
+ here=$(CDPATH= cd -- "$(dirname -- "$self")" >/dev/null && pwd -P) || fail 'the directory holding this installer is unreadable'
+ self="$here/$(basename -- "$self")"; [[ -f $self ]] || fail "this installer could not find its own file at $self"
+ version=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' version); identity=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' identity)
+ trust=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' trustKeySha256); base=$(init_json_line "$GSJ_PAYLOAD/release.json" '  ' release_base_url)
+ [[ -n $version && -n $identity && -n $trust ]] || fail 'this installer'"'"'s release.json names no version, identity or trust key'
+ [[ $(sha_file "$GSJ_PAYLOAD/trust/release.pem") == "$trust" ]] || fail 'embedded trust key does not match this installer'"'"'s release.json'
+ [[ $base == https://* ]] || base=''
+ origin=$(url_origin_only "$base"); INIT_BASE=$base; INIT_ORIGIN=$origin; INIT_VERSION=$version; INIT_IDENTITY=$identity; INIT_TRUST=$trust; INIT_HERE=$here
+ INIT_STAGE="$GSJ_WORK/init-companions"; mkdir -m 700 "$INIT_STAGE"
+ printf 'GSJ init: release %s (%s)\n' "$version" "$identity"
+ # THE WORKING FOLDER FIRST -- refused by name before anything is written
+ # anywhere; its rows come at step 5, where the guide's steps meet it.
+ [[ -n ${HOME:-} && ${HOME:-} == /* ]] || fail 'HOME is not set to an absolute path; init cannot place the working folder'
+ local work="$HOME/gsj-operator" work_made work_mode cred_made cred_mode
+ init_own_dir "$work" || fail "refusing $work: $INIT_WHY (init creates it only when nothing of that name exists; a plain folder this user owns that group and others cannot write is used as it is)"
+ work_made=$INIT_MADE; work_mode=$INIT_MODE
+ init_own_dir "$work/credentials" || fail "refusing $work/credentials: $INIT_WHY"
+ cred_made=$INIT_MADE; cred_mode=$INIT_MODE
+ # 1 -- THE REST OF ITS OWN RELEASE. A companion beside the installer -- and
+ # the key alone also in the working folder's trust/, the guide's layout,
+ # where one key serves the release line -- is used and never overwritten;
+ # one from another release is refused by name, never replaced; every present
+ # file is copied into the private stage and judged there BEFORE anything is
+ # downloaded. The missing are downloaded into the stage, checked there, and
+ # only after the whole verification passes put beside the installer.
+ for name in "${INIT_COMPANIONS[@]}"; do
+   where=''
+   for dir in "$here" "$work/trust"; do
+     [[ $dir == "$here" || $name == release.pem ]] || continue
+     if [[ -e $dir/$name || -L $dir/$name ]]; then where="$dir/$name"; break; fi
+   done
+   if [[ -n $where ]]; then
+     [[ -f $where && ! -L $where ]] || fail "$where is not a plain file; move it aside (a companion file is never replaced)"
+     [[ -r $where ]] && cp -- "$where" "$INIT_STAGE/$name" 2>/dev/null || fail "$where cannot be read by this user (uid $(id -u)); fix its permissions (a companion file is never replaced)"
+     init_check_companion "$name" "$INIT_STAGE/$name" present "$where"
+     present=$((present+1)); log "init: using $where"
+   else
+     wanted+=("$name")
+   fi
+ done
+ # A present pair is checked against each other before anything is fetched:
+ # a signature from another release is refused by name, not worked around.
+ if [[ -f $INIT_STAGE/installer-descriptor.json && -f $INIT_STAGE/installer-descriptor.sig ]]; then init_verify_signature "$INIT_STAGE/installer-descriptor.json" "$INIT_STAGE/installer-descriptor.sig"; fi
+ local transport_failed=false
+ for name in ${wanted[@]+"${wanted[@]}"}; do
+   if [[ -z $base ]]; then missing+="${missing:+, }$name"; continue; fi
+   if $transport_failed; then missing+="${missing:+, }$name (not tried)"; continue; fi
+   log "init: downloading $name from $origin"
+   if init_download "$name"; then
+     init_check_companion "$name" "$INIT_STAGE/$name" downloaded "$origin"
+     downloaded=$((downloaded+1))
+   else
+     missing+="${missing:+, }$name"; why=$INIT_WHY
+     ! init_transport_failure "$INIT_RC" || transport_failed=true
+   fi
+ done
+ local saved_in=''
+ if [[ -n $missing ]]; then
+   if [[ -z $base ]]; then detail="not verified: $missing missing beside the installer, and this build carries no release directory (release_base_url is empty, as a qualification build is packaged): put the four companion files beside the installer yourself"
+   else detail="not verified: $missing could not be downloaded ($why). Put the four companion files beside the installer yourself, or fix the connection and run init again"; fi
+   status=UNKNOWN
+   init_row release-verification UNKNOWN "$present present, $downloaded downloaded, missing: $missing" "$detail" 'obtain the four companion files (the release page), put them beside the installer, then run init again -- or verify by hand'
+ else
+   # The signature that binds the descriptor to this release's key, then the
+   # descriptor's own claims about THIS file -- the check `upgrade --to`
+   # makes on a target, without jq, under the EMBEDDED key.
+   init_verify_descriptor "$INIT_STAGE/installer-descriptor.json" "$INIT_STAGE/installer-descriptor.sig" "$self"
+   # THE PUBLISHED VERIFIER, unchanged (its bytes are pinned above), over this
+   # installer's bytes, from the private copy; its own fixed lines go to the
+   # screen.
+   log 'init: running the published verify-release.sh'
+   bash "$INIT_STAGE/verify-release.sh" "$self" "$INIT_STAGE/installer-descriptor.json" "$INIT_STAGE/installer-descriptor.sig" "$INIT_STAGE/release.pem" || fail "release verification FAILED: verify-release.sh refused this installer (its line is above). Do not run this installer; ask for the release again"
+   # Only now are the downloads kept: beside the installer, or -- when that
+   # folder cannot be written -- in the working folder's releases/<version>/.
+   if (( downloaded > 0 )); then
+     saved_in=$here
+     local rc
+     for name in ${wanted[@]+"${wanted[@]}"}; do
+       rc=0; init_publish "$name" "$saved_in" || rc=$?
+       if (( rc == 0 )); then saved+=("$name"); continue; fi
+       log "init: $name not saved in $saved_in: $INIT_WHY"
+       # A folder that cannot be written (the installer in a read-only place)
+       # sends the checked copies to the working folder's releases/<version>/;
+       # a name that was already there is simply left alone.
+       if (( rc == 1 )) && [[ $saved_in == "$here" && ${#saved[@]} -eq 0 ]] && init_own_dir "$work/releases" && init_own_dir "$work/releases/$version"; then
+         saved_in="$work/releases/$version"
+         rc=0; init_publish "$name" "$saved_in" || rc=$?
+         if (( rc == 0 )); then saved+=("$name"); continue; fi
+         log "init: $name not saved in $saved_in either: $INIT_WHY"
+       fi
+     done
+   fi
+   status=PASS
+   detail="the installer matches its signed descriptor ($present companion file(s) present, $downloaded downloaded from ${origin:-nowhere}"
+   if (( downloaded > 0 )); then
+     if (( ${#saved[@]} == downloaded )); then detail+=", all $downloaded saved in $saved_in"
+     elif (( ${#saved[@]} > 0 )); then detail+=", ${#saved[@]} saved in $saved_in, the rest not saved (see the log lines above)"
+     else detail+=", none saved: $INIT_WHY"; fi
+   fi
+   init_row release-verification PASS "verified under the embedded key and by the published verify-release.sh" "$detail)"
+   if (( downloaded > 0 && ${#saved[@]} < downloaded )); then INIT_FIXES+="  - companions: the verified files could not all be saved ($INIT_WHY); download the four from the release page into a folder you can write, beside the installer"$'\n'; fi
+ fi
+ # 2 -- EVERY TOOL AGAINST ITS FLOOR, all at once, on the customer's own PATH
+ # (init refuses --fetch-tools, so nothing sits in front of it).
+ local tool floor pinned kubectl_version='' kubectl_ok=false
+ for tool in helm kubectl jq; do
+   case $tool in helm) floor=$GSJ_HELM_FLOOR;; kubectl) floor=$GSJ_KUBECTL_FLOOR;; jq) floor=$GSJ_JQ_FLOOR;; esac
+   if gsj_client_info "$tool" "$GSJ_PLATFORM" >/dev/null 2>&1; then pinned="any other command accepts --fetch-tools (this release pins a $tool for $GSJ_PLATFORM for that run only; read the guide's note on kubectl and your server's version first)"; else pinned="--fetch-tools cannot help here: this release pins no $tool for $GSJ_PLATFORM"; fi
+   where=$(command -v "$tool" 2>/dev/null) || where=''
+   if [[ -z $where ]]; then init_row "$tool" FAIL 'none on PATH' "requires $tool >= $floor, found none on PATH" "install $tool >= $floor with your distribution; $pinned"; continue; fi
+   found=$(client_version "$tool")
+   [[ $tool != kubectl ]] || kubectl_version=$found
+   if [[ -z $found ]]; then init_row "$tool" FAIL "$where" "requires $tool >= $floor, but $where did not report a version" "check that binary; $pinned"
+   elif version_at_least "$found" "$floor"; then init_row "$tool" PASS "$found at $where" "$tool $found (floor $floor)"; [[ $tool != kubectl ]] || kubectl_ok=true
+   else init_row "$tool" FAIL "$found at $where" "requires $tool >= $floor, found $found" "upgrade $tool; $pinned"; fi
+ done
+ found=$(openssl version 2>/dev/null | head -n1); init_row openssl PASS "$found at $(command -v openssl)" "$found (floor OpenSSL $GSJ_OPENSSL_FLOOR, checked before any command runs; --fetch-tools does not supply OpenSSL)"
+ init_row bash PASS "bash $BASH_VERSION" "bash $BASH_VERSION (required before any command runs)"
+ found=$(curl --version 2>/dev/null | head -n1 | cut -d ' ' -f1-2); init_row curl PASS "${found:-curl}" "${found:-curl} (required before any command runs; downloads honour the proxy variables curl reads)"
+ for tool in tar gzip base64; do init_row "$tool" PASS "$(command -v "$tool")" "$tool at $(command -v "$tool") (required before any command runs)"; done
+ if command -v sha256sum >/dev/null; then init_row sha256 PASS "$(command -v sha256sum)" 'sha256sum (required before init runs)'; else init_row sha256 PASS "$(command -v shasum)" 'shasum (required before init runs)'; fi
+ # 3 -- WHAT IT CAN REACH. The cluster its kubeconfig points at, named by its
+ # context; github.com, where the corpus release lives; ghcr.io, the images
+ # (from THIS machine: the nodes' route is step 4's pull probe).
+ local context='' server='' versions code_github code_ghcr egress kube_err="$GSJ_WORK/init-kubectl.err"
+ context=${CONTEXT_ARG:-}
+ if [[ -z $context && -n $kubectl_version ]]; then context=$(kubectl config current-context 2>/dev/null </dev/null) || context=''; fi
+ if ! command -v kubectl >/dev/null; then init_row cluster UNKNOWN 'no kubectl' 'the cluster could not be read: kubectl is missing (above)' ''
+ elif [[ -z $kubectl_version ]]; then init_row cluster UNKNOWN 'kubectl did not run' 'the cluster could not be read: kubectl did not report a version (above)' ''
+ elif [[ -z $context ]]; then init_row cluster FAIL 'no context' 'no kubeconfig context is selected (KUBECONFIG unset, empty, or without a current-context)' 'export KUBECONFIG=/path/to/kubeconfig, or pass --context NAME'
+ else
+   versions=$( { kubectl --context "$context" --request-timeout 20s version -o json 2>"$kube_err" </dev/null || true; } | tr -d '\n' )
+   server=$(printf '%s' "$versions" | sed -n 's/.*"serverVersion"[^}]*"gitVersion"[^"]*"v\{0,1\}\([0-9][0-9.]*\).*/\1/p')
+   if [[ -z $server ]]; then
+     # kubectl's words are classified, never repeated: a credential plugin's
+     # login instructions belong on a terminal, which init's call has none of.
+     if grep -q -i -E 'exec plugin|getting credentials|credential plugin' "$kube_err" 2>/dev/null; then init_row cluster FAIL "context $context" "the API server of context $context could not be read: the context's credential plugin did not finish or needs a terminal" "run kubectl --context $context version once by hand (it may ask you to log in), then run init again"
+     else init_row cluster FAIL "context $context" "the API server of context $context did not answer (unreachable, no such context, or the kubeconfig's credentials were refused)" 'check KUBECONFIG and the network to the API server; with a proxy exported, put the API server'"'"'s host in no_proxy (the guide, step 1)'; fi
+   elif version_at_least "$server" "$GSJ_SERVER_FLOOR"; then init_row cluster PASS "context $context, Kubernetes $server" "context $context answered: Kubernetes $server (floor $GSJ_SERVER_FLOOR)"
+   else init_row cluster FAIL "context $context, Kubernetes $server" "context $context answered Kubernetes $server, below the floor $GSJ_SERVER_FLOOR" "a cluster of Kubernetes >= $GSJ_SERVER_FLOOR"; fi
+ fi
+ if [[ $kubectl_version == *.* && $server == *.* ]]; then
+   local cm sm; cm=${kubectl_version#*.}; cm=${cm%%.*}; sm=${server#*.}; sm=${sm%%.*}
+   if (( 10#$cm - 10#$sm <= 1 && 10#$sm - 10#$cm <= 1 )); then init_row kubectl-skew PASS "client $kubectl_version, server $server" "kubectl $kubectl_version is within one minor of the server ($server)"
+   else init_row kubectl-skew FAIL "client $kubectl_version, server $server" "kubectl $kubectl_version is more than one minor from the server ($server)" "install a kubectl within one minor of $server (the guide, step 1)"; fi
+ else init_row kubectl-skew UNKNOWN '' 'not compared: kubectl or the server version is unknown (above)' ''; fi
+ code_github=$(init_reach https://github.com/); code_ghcr=$(init_reach https://ghcr.io/v2/)
+ case $code_github in
+   000) init_row egress-github FAIL 'no answer' 'github.com did not answer: the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine' 'open egress or export a proxy for this machine (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
+   proxy:*) init_row egress-github FAIL "proxy answered HTTP ${code_github#proxy:}" "the proxy this machine uses answered HTTP ${code_github#proxy:} to the connection for github.com" 'give the proxy its credentials or an exemption for github.com and release-assets.githubusercontent.com (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
+   *) init_row egress-github PASS "HTTP $code_github" "github.com answered (HTTP $code_github): the corpus release can be downloaded from this machine";;
+ esac
+ case $code_ghcr in
+   000) init_row egress-ghcr FAIL 'no answer' 'ghcr.io did not answer from this machine; the nodes pull the images, so prove their route in step 4' 'open the route, or mirror the six images into a registry the nodes reach (registry.base)';;
+   proxy:*) init_row egress-ghcr FAIL "proxy answered HTTP ${code_ghcr#proxy:}" "the proxy this machine uses answered HTTP ${code_ghcr#proxy:} to the connection for ghcr.io; the nodes pull the images, so prove their route in step 4" 'give the proxy its credentials or an exemption (the guide, step 1), or mirror the six images (registry.base)';;
+   *) init_row egress-ghcr PASS "HTTP $code_ghcr" "ghcr.io answered (HTTP $code_ghcr) from this machine; this says nothing about your NODES, whose route step 4's pull probe proves";;
+ esac
+ if [[ $code_github == 000 && $code_ghcr == 000 ]]; then egress=none; elif [[ $code_github != 000 && $code_github != proxy:* && $code_ghcr != 000 && $code_ghcr != proxy:* ]]; then egress=full; else egress=partial; fi
+ # 4 -- THE BOX: room for the corpus download, the OS, the architecture. The
+ # rule is stage_vectors' (above): one filesystem holds blocks and envelope.
+ local cache="${XDG_CACHE_HOME:-$HOME/.cache}/gsj-install" tmpdir="${TMPDIR:-/tmp}" cache_device cache_free cache_mount work_device work_free work_mount
+ dir=$cache; while [[ ! -d $dir && $dir != / ]]; do dir=$(dirname "$dir"); done
+ read -r cache_device cache_free cache_mount <<< "$(init_free_bytes "$dir")"
+ read -r work_device work_free work_mount <<< "$(init_free_bytes "$tmpdir")"
+ if [[ $cache_device == unknown || $work_device == unknown ]]; then init_row disk UNKNOWN "cache $cache, TMPDIR $tmpdir" "free space at $cache or $tmpdir could not be measured" ''
+ elif [[ $cache_device == "$work_device" ]]; then
+   if (( work_free >= INIT_CORPUS_BYTES )); then init_row disk PASS "$((work_free/1000000)) MB free on $work_mount" "$((work_free/1000000)) MB free on the filesystem ($work_mount) that holds both the corpus cache ($cache) and TMPDIR ($tmpdir); the download needs about 3.5 GB there"
+   else init_row disk FAIL "$((work_free/1000000)) MB free on $work_mount" "$((work_free/1000000)) MB free on the filesystem ($work_mount) that holds both the corpus cache ($cache) and TMPDIR ($tmpdir); the download needs about 3.5 GB there" 'free space there, or export XDG_CACHE_HOME and TMPDIR to a larger filesystem before installing (the guide, step 1)'; fi
+ else
+   if (( work_free >= INIT_ENVELOPE_BYTES && cache_free >= INIT_BLOCKS_BYTES )); then init_row disk PASS "$((work_free/1000000)) MB free on $work_mount, $((cache_free/1000000)) MB free on $cache_mount" "TMPDIR ($tmpdir) has $((work_free/1000000)) MB and the corpus cache ($cache) $((cache_free/1000000)) MB, on different filesystems; the download needs about 1.9 GB and 1.7 GB there"
+   else init_row disk FAIL "$((work_free/1000000)) MB free on $work_mount, $((cache_free/1000000)) MB free on $cache_mount" "TMPDIR ($tmpdir) has $((work_free/1000000)) MB and the corpus cache ($cache) $((cache_free/1000000)) MB, on different filesystems; the download needs about 1.9 GB and 1.7 GB there" 'free space there, or export XDG_CACHE_HOME and TMPDIR to larger filesystems before installing (the guide, step 1)'; fi
+ fi
+ found=$(uname -s 2>/dev/null || printf unknown)
+ if [[ $found == Linux ]]; then init_row os PASS "$found" 'Linux'; else init_row os FAIL "$found" "$found: the installer runs on Linux" 'run the installer from a Linux machine'; fi
+ if [[ $GSJ_PLATFORM == linux/* ]]; then init_row architecture PASS "$GSJ_PLATFORM" "$GSJ_PLATFORM (this machine)"; else init_row architecture UNKNOWN "$GSJ_PLATFORM" "$GSJ_PLATFORM: not a Linux machine (the os row)" ''; fi
+ # 5 -- THE WORKING FOLDER the guide's later steps use (admitted above).
+ if $work_made; then init_row working-folder PASS "$work" "created $work (mode 700)"; else init_row working-folder PASS "$work" "using the existing $work (owned by this user, mode $work_mode)"; fi
+ if $cred_made; then init_row credentials-folder PASS "$work/credentials" "created $work/credentials (mode 700) for the registry auth file, the operator password and the backup passphrase"
+ elif (( (8#$cred_mode & 077) == 0 )); then init_row credentials-folder PASS "$work/credentials" "using the existing $work/credentials (mode $cred_mode)"
+ else init_row credentials-folder FAIL "$work/credentials (mode $cred_mode)" "$work/credentials is readable by group or others (mode $cred_mode); it holds credentials" "chmod 700 $(printf '%q' "$work/credentials")"; fi
+ # 6 -- INSPECT, unchanged, then ONE report. inspect needs jq and kubectl at
+ # their floors and a server that answered; it runs guarded, so nothing it
+ # meets can end init, and its document is spliced only when it is one.
+ local profile="$GSJ_WORK/init-inspect.json" node_arch
+ printf '{"unavailable":true,"reason":"inspect needs kubectl and jq at their floors and a cluster that answered (above)"}\n' > "$profile"
+ if [[ -n $server ]] && $kubectl_ok && command -v jq >/dev/null && version_at_least "$(client_version jq)" "$GSJ_JQ_FLOOR"; then
+   log 'init: running inspect'
+   if ( CONTEXT_ARG=$context; inspect_cluster ) </dev/null > "$GSJ_WORK/init-inspect.out" 2>"$GSJ_WORK/init-inspect.err" && jq -e '.schema=="gsj.inspect/1"' "$GSJ_WORK/init-inspect.out" >/dev/null 2>&1; then
+     mv -f "$GSJ_WORK/init-inspect.out" "$profile"; init_row inspect PASS "context $context" "the cluster profile (gsj.inspect/1) is in the report"
+   else printf '{"unavailable":true,"reason":"inspect did not complete"}\n' > "$profile"; init_row inspect UNKNOWN "context $context" 'inspect did not complete; run the inspect command by hand and read its line' ''; fi
+ else init_row inspect UNKNOWN '' 'not run: inspect needs kubectl and jq at their floors and a cluster that answered (above)' ''; fi
+ if jq -e '.nodes' "$profile" >/dev/null 2>&1; then
+   node_arch=$(jq -r '[.nodes[]?.architecture // empty | "linux/" + .] | unique | join(", ")' "$profile" 2>/dev/null) || node_arch=''
+   if [[ -z $node_arch ]]; then init_row node-architecture UNKNOWN '' 'the nodes reported no architecture' ''
+   elif jq -e --arg archs "$node_arch" '($archs | split(", ")) - .platforms == []' "$GSJ_PAYLOAD/release.json" >/dev/null 2>&1; then init_row node-architecture PASS "$node_arch" "every node is $node_arch, which this release has images for"
+   else init_row node-architecture FAIL "$node_arch" "a node is $node_arch, and this release has images only for $(jq -r '.platforms | join(", ")' "$GSJ_PAYLOAD/release.json")" 'the node that carries the volumes (storage.node) needs an architecture the release has images for'; fi
+ else init_row node-architecture UNKNOWN '' 'not compared: no cluster profile (above)' ''; fi
+ local stamp report='' ready=false n
+ stamp=$(date -u +%Y%m%dT%H%M%SZ)
+ [[ $status == PASS ]] && (( INIT_FAIL == 0 )) && ready=true
+ {
+   printf '{"schema":"gsj.init/1",\n "installer":{"name":%s,"version":%s,"identity":%s,"sha256":"%s","platform":"%s"},\n' "$(init_json_string "$(basename -- "$self")")" "$(init_json_string "$version")" "$(init_json_string "$identity")" "$(sha_file "$self")" "$GSJ_PLATFORM"
+   printf ' "release_origin":%s,\n "verification":{"status":"%s","companions_present":%s,"companions_downloaded":%s,"companions_saved":%s,"saved_in":%s,"missing":%s,"limit":%s},\n' "$(init_json_string "$origin")" "$status" "$present" "$downloaded" "${#saved[@]}" "$(init_json_string "$saved_in")" "$(init_json_string "$missing")" "$(init_json_string "$INIT_LIMIT")"
+   printf ' "checks":[%s\n ],\n "summary":{"pass":%s,"fail":%s,"unknown":%s,"ready":%s,"egress":"%s"},\n "inspect":' "$INIT_ROWS" "$INIT_PASS" "$INIT_FAIL" "$INIT_UNKNOWN" "$ready" "$egress"
+   cat "$profile"
+   printf '}\n'
+ } > "$GSJ_WORK/init-report.json"
+ # Create-only, then written: a name that exists (or is a link) is skipped for
+ # the next suffix; a write that fails removes only the file this run made.
+ for n in '' -2 -3 -4 -5 -6 -7 -8 -9; do
+   target="$work/gsj-init-report-$stamp$n.json"
+   ( set -o noclobber; : > "$target" ) 2>/dev/null || continue
+   cat "$GSJ_WORK/init-report.json" > "$target" 2>/dev/null || { rm -f "$target"; fail "the report could not be written in $work (no space, or a quota)"; }
+   report=$target; break
+ done
+ [[ -n $report ]] || fail "the report could not be created in $work"
+ printf '\n%s passed, %s failed, %s unknown.\n' "$INIT_PASS" "$INIT_FAIL" "$INIT_UNKNOWN"
+ if [[ $status != PASS ]]; then printf 'This installer is NOT verified (release-verification above): do not install from it until it is.\n'; fi
+ if [[ -n $INIT_FIXES ]]; then printf 'Fix before an install:\n%s' "$INIT_FIXES"; fi
+ if [[ $egress == none ]]; then printf 'No internet from this machine: the no-egress route needs the corpus staged locally (corpus.vectors_path: the manifest and its seven blocks), the six images mirrored where your nodes pull (registry.base) -- and the add-on images too if you choose a managed profile -- and --fetch-tools cannot download anything.\n'; fi
+ printf 'Send this one file back: %s\n' "$report"
+ printf 'Limit: %s\n' "$INIT_LIMIT"
+ printf 'Not answered here: the six questions of step 0 (the storage provisioner, the model endpoints, a registry prefix, NetworkPolicy, the ingress). The profile in the report shows your storage and ingress classes; the rest is yours to settle as step 0 says -- before anything else, NetworkPolicy by step 4'"'"'s probe.\n'
+ $ready || exit 3
 }
 # ---------------------------------------------------------------- /init --
 configure_interaction() {
@@ -5869,6 +5952,9 @@ main() {
  [[ $COMMAND != upgrade || -n $TO || -n $EXPECTED_VERSION ]] || $INTERACTIVE || fail 'non-interactive upgrade requires --to VERSION; repeat the installed release with --to <installed version>'
  # init reports on the clients this machine has and downloads nothing but its own release's files.
  [[ $COMMAND != init ]] || ! $FETCH_TOOLS || fail 'init reports on the clients this machine has and downloads nothing but its own release; run it without --fetch-tools'
+ # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal); init sets
+ # none, and an operator's exported leftovers must not reach a cluster through init's exit trap.
+ [[ $COMMAND != init ]] || unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT
  bootstrap; install_exit_traps
  source "$GSJ_PAYLOAD/helpers/verification-cleanup.sh"
  source "$GSJ_PAYLOAD/helpers/startup-recovery.sh"

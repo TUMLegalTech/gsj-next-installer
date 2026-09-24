@@ -88,25 +88,29 @@ bash gsj-install.sh init
 `init` fetches the rest of its own release — `verify-release.sh`,
 `release.pem`, `installer-descriptor.json` and `installer-descriptor.sig`,
 from the release directory the installer names, for its own version. Files
-already beside the installer (or, for the key and the verifier, in
+already beside the installer (or, for the key alone, in
 `$HOME/gsj-operator/trust/`, the guide's layout) are used and never
 overwritten; a file from another release — another version, another build
 of the same version, another key, a verifier that is not the one this
-release was published with — is refused by name and never replaced. A
-download is checked before it is kept: the key against the one the
-installer carries, the descriptor's version and build against the
-installer's own, the signature under the embedded key; only then are the
-four put beside the installer. Then the installer's own bytes are held to
-the signed descriptor (SHA-256 and length, under the embedded key), and the
-published verifier is run over the same files — a companion
-`verify-release.sh` is executed only when its bytes are the ones this
-release was published with.
+release was published with — is refused by name and never replaced. Every
+file, present or downloaded, is copied into the run's private work directory
+and judged there: the key against the one the installer carries, the
+descriptor's version and build against the installer's own, the signature
+under the embedded key, a verifier's bytes against the ones this release was
+published with. Then the installer's own bytes are held to the signed
+descriptor (SHA-256 and length, under the embedded key), the published
+verifier is run over the same files from that private copy, and only when
+both pass are the downloaded files put beside the installer (or, when that
+folder cannot be written, in `$HOME/gsj-operator/releases/<version>/`); an
+unverified run keeps none.
 
 Then it checks the box, all at once, and writes every result as PASS, FAIL
-or UNKNOWN with the reason and the fix: every client against its floor —
-helm, kubectl (and its skew against the cluster), jq, OpenSSL, bash, curl,
-tar, gzip, base64, the SHA-256 tool — saying what to install and which of
-them `--fetch-tools` can supply for the other commands (never OpenSSL); the
+or UNKNOWN with the reason and the fix: helm, kubectl (and its skew
+against the cluster) and jq against their floors, saying what to install and
+which of them `--fetch-tools` can supply for the other commands (never
+OpenSSL), with OpenSSL, bash, curl, tar, gzip, base64 and the SHA-256 tool
+recorded as found (a box that lacks one of those is refused before `init`
+can run, one at a time); the
 cluster its kubeconfig points at, named by its context, and its version
 against the floor; `github.com`, where the corpus release lives, and
 `ghcr.io`, where the images are, from this machine; the free disk the corpus
@@ -116,7 +120,8 @@ the architecture — and the nodes' architecture against the release's
 images, once `inspect` has run. It prepares `$HOME/gsj-operator/` with a
 private `credentials/` folder (created 0700, create-only, never through a
 symlink; a folder it did not make is refused unless it is a plain folder
-you own, and that refusal comes before anything is written anywhere), runs
+you own that group and others cannot write, and that refusal comes before
+anything is written anywhere), runs
 `inspect`, and writes **one report** —
 `$HOME/gsj-operator/gsj-init-report-<time>.json`: the verification result,
 every check, and the inspect profile — the one file to send back to TUM
@@ -127,17 +132,19 @@ release included), 1 when it stopped on a named refusal (a failed
 verification, a companion file from another release, a working folder it
 refused, `--fetch-tools`).
 
-`init` is **read-only against your cluster**: its only reads are one
-`kubectl version` and `inspect`'s gets; it creates, changes and deletes
+`init` is **read-only against your cluster**: its own read is one
+`kubectl version`, and `inspect`'s are its gets, one more `version` and
+`top nodes`; it creates, changes and deletes
 nothing there — no namespace, no Lease, no Pod, no probe — so it is safe to
 run against a production cluster. It downloads only its own release's four
 files, only over HTTPS, and executes nothing it downloaded except the
 published verifier; it refuses `--fetch-tools`, which would download and
 run three clients. Without a network it still produces its report from what
 is on the box, and says what the no-egress route needs instead. A missing or
-LibreSSL `openssl`, or a machine without `sha256sum` or `shasum`, is refused
-by name before `init` runs, like before every other command: those are the
-tools `init` cannot report around.
+LibreSSL `openssl`, a missing bash, curl, tar, gzip or base64, or a machine
+without `sha256sum` or `shasum`, is refused by name before `init` runs, one
+at a time, like before every other command: those are the tools `init`
+cannot report around.
 
 **The honest limit.** `init` proves that the installer arrived intact and
 matches its published descriptor. It cannot prove that the installer is
@@ -192,7 +199,7 @@ channel, no fingerprint delivered out of band, and no key ceremony.
 <!-- init: begin -->
 `bash gsj-install.sh init` runs this same verifier for you — after fetching
 the four companion files of its own release and checking each one — and
-reports the result (see *`init`: one file, one command, how to verify one*
+reports the result (see *`init`: one file, one command, one report*
 above). That is the convenient check; the command above, run by hand before
 executing anything, is the stronger one: `init` runs from inside the file it
 verifies, and a modified installer could skip its own check.
