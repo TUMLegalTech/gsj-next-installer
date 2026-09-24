@@ -5616,7 +5616,9 @@ init_shape_ok() {
    verify-release.sh) [[ $head == '#!/usr/bin/env bash'* ]];;
    release.pem) [[ $head == '-----BEGIN PUBLIC KEY-----'* ]];;
    installer-descriptor.json) [[ $head == '{'* ]];;
-   installer-descriptor.sig) [[ $head != '<'* && $head != '{'* && $head != '#'* ]];;
+   # an RSA signature is random bytes: its first forty hold at least one
+   # byte that is neither printable nor whitespace, which no text page does
+   installer-descriptor.sig) (( $(head -c 40 "$2" 2>/dev/null | LC_ALL=C tr -d '[:print:][:space:]' | wc -c | tr -d ' ') > 0 ));;
  esac
 }
 init_download() {
