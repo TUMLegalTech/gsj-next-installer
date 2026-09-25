@@ -1416,8 +1416,9 @@ acquire() {
  if [[ $current == '{}' ]]; then refuse_foreign_release; fi
  # A backing-off initializer that already ran restarts on its own; it is as
  # active as a running one. A terminal code (initializer_stop) never clears by
- # restarting and a container that never ran cannot write: both admit the
- # operation that repairs them.
+ # restarting -- except a source-verification verdict older than this run's
+ # staging, which wait_application gives one restart -- and a container that
+ # never ran cannot write: both admit the operation that repairs them.
  if k get pods -l "app.kubernetes.io/instance=$RELEASE" -o json | jq -e 'any(.items[]; any(.status.initContainerStatuses[]?; .state.running != null or
      (.state.waiting != null and .lastState.terminated != null and
       ((.lastState.terminated.message//"")|test("^gsj-(corpus|copy):(terminal-budget-exhausted|deadline-exceeded|checkpoint-identity-mismatch|source-verification-failed|released-vectors-missing|corpus-update-required|model-change-blocked|manifest-mismatch|core-mismatch|invalid-settings)\\s*$")|not))))' >/dev/null; then
@@ -1688,6 +1689,9 @@ p.write_bytes(data); os.chmod(p,0o500)' "$helper" "$helper_hash" < "$GSJ_PAYLOAD
  transfer_handback "$pod"
  k delete pod "$pod" --wait=true >/dev/null
  log "Staged $(jq -r .vectors "$GSJ_WORK/vectors-staged.json") released vectors from $(jq -r .shards "$GSJ_WORK/vectors-staged.json") blocks; the initializer verifies them again before it trusts one"
+ # The initializer has been running since helm_apply and may have judged the
+ # blocks before this staging: wait_application gives it one restart on them.
+ VECTORS_STAGED_IN_THIS_RUN=true
 }
 abandon_operation() {
  # The sanctioned end for an operation that will never be resumed.
@@ -3925,6 +3929,20 @@ wait_application() {
      k logs "$pod" -c corpus-initialize --tail=3 2>/dev/null || true
    fi
    code=$(initializer_failure "$GSJ_WORK/application-pods.json")
+   if [[ $code == corpus:source-verification-failed && ${VECTORS_STAGED_IN_THIS_RUN:-} == true && ${STAGED_RESTART:-} != done ]]; then
+     # The initializer started at helm_apply and may have judged the released
+     # vectors BEFORE stage_vectors put them in place [review, the major]:
+     # its verdict binds to the bytes it read and a restart judges the staged
+     # ones afresh -- but the kubelet's backoff between restarts grows to five
+     # minutes, and this poll read the verdict as terminal before the restart
+     # came. ONE fresh attempt on the staged bytes decides: the Pod is
+     # recreated now (the Deployment brings it back; the checkpoint is on the
+     # volume); a second such verdict is on the staged bytes and terminal.
+     STAGED_RESTART=done
+     log "corpus-initialize refused the released vectors with a verdict that may predate their staging in this run; restarting it once on the staged blocks"
+     k delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+     sleep 20; continue
+   fi
    [[ -z $code ]] || initializer_stop "$code"
    sleep 20
  done
