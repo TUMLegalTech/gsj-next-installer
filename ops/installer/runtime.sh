@@ -5725,6 +5725,19 @@ init_reach() {
  read -r code connect <<< "${answer:-000 000}"; code=${code:-000}; connect=${connect:-000}
  case $connect in 000|200) printf '%s' "$code";; *) printf 'proxy:%s' "$connect";; esac
 }
+init_reach_corpus() {
+ # The corpus manifest's own URL, followed through its redirect to the asset
+ # host as the download follows it (fetch_public: redirects, HTTPS only):
+ # "CODE ORIGIN" -- the final answer and the origin that gave it -- or
+ # "proxy:CODE" when a proxy refused the connection, "000 ORIGIN" when
+ # nothing answered. The manifest is a few KB; nothing of it is kept. Only
+ # the ORIGIN of the effective URL is ever printed: a release asset's URL
+ # carries a signed query.
+ local answer code connect effective
+ answer=$(curl -q --silent --output /dev/null --location --proto-redir '=https' --connect-timeout 10 --max-time 30 --write-out '%{http_code} %{http_connect} %{url_effective}' "$1" </dev/null 2>/dev/null) || true
+ read -r code connect effective <<< "${answer:-000 000 $1}"; code=${code:-000}; connect=${connect:-000}
+ case $connect in 000|200) printf '%s %s' "$code" "$(url_origin_only "${effective:-$1}")";; *) printf 'proxy:%s' "$connect";; esac
+}
 init_free_bytes() {
  # $1 an existing path: "DEVICE FREE-BYTES MOUNTPOINT", or "unknown 0 unknown"
  # when df cannot say. The device is compared, never printed: df's source
@@ -5948,18 +5961,42 @@ init_box() {
    if (( 10#$cm - 10#$sm <= 1 && 10#$sm - 10#$cm <= 1 )); then init_row kubectl-skew PASS "client $kubectl_version, server $server" "kubectl $kubectl_version is within one minor of the server ($server)"
    else init_row kubectl-skew FAIL "client $kubectl_version, server $server" "kubectl $kubectl_version is more than one minor from the server ($server)" "install a kubectl within one minor of $server (the guide, step 1)"; fi
  else init_row kubectl-skew UNKNOWN '' 'not compared: kubectl or the server version is unknown (above)' ''; fi
- code_github=$(init_reach https://github.com/); code_ghcr=$(init_reach https://ghcr.io/v2/)
- # An answer is classified by what it establishes: a 2xx/3xx
- # from github.com is the route the corpus download takes; a 4xx is a refusal
- # by github.com or by something between (a portal, a filter, a rate limit),
- # a 5xx an error there or between -- neither is "downloadable". ghcr.io
- # answers an anonymous request with 401 by design, so 401 is its PASS.
+ # The github.com row probes what the corpus download uses: the URL the
+ # installer fetches the corpus manifest from -- the vectors.json asset of the
+ # corpus release whose tag ends in this release's corpus fingerprint (the
+ # guide's formula, corpus.vectors_url) -- followed through its redirect to
+ # the asset host. A homepage that answers proves nothing about the release
+ # asset or the host it redirects to, so the row no longer claims it.
+ local corpus_fp='' corpus_tag='' corpus_origin='' corpus_what
+ corpus_fp=$(jq -r '.corpus.fingerprint // ""' "$GSJ_PAYLOAD/release.json" 2>/dev/null </dev/null) || corpus_fp=''
+ if [[ $corpus_fp =~ ^[0-9a-f]{64}$ ]]; then
+   corpus_tag="corpus-1.snowflake-m-v2-int8-768.${corpus_fp:0:8}"
+   read -r code_github corpus_origin <<< "$(init_reach_corpus "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/$corpus_tag/vectors.json")"
+   corpus_what="the corpus manifest of release $corpus_tag (github.com)"
+ else
+   # a release.json without a corpus fingerprint (every release carries one):
+   # the manifest's URL cannot be composed, so only the homepage is asked,
+   # and the row says so instead of claiming the asset route
+   code_github=$(init_reach https://github.com/)
+   corpus_what='github.com (its homepage: this release.json names no corpus fingerprint, so the corpus manifest'"'"'s own URL could not be composed and its route is not proved)'
+ fi
+ code_ghcr=$(init_reach https://ghcr.io/v2/)
+ # An answer is classified by what it establishes: a 2xx for the manifest
+ # after its redirect was followed is the route the corpus download takes,
+ # and the row names the origin that answered; a 3xx that stayed is a
+ # redirect the download could not follow (not HTTPS); a 4xx is a refusal by
+ # github.com (a 404: no such release asset under that name) or by something
+ # between (a portal, a filter, a rate limit), a 5xx an error there or
+ # between -- none is "downloadable". ghcr.io answers an anonymous request
+ # with 401 by design, so 401 is its PASS.
  case $code_github in
-   000) init_row egress-github FAIL 'no answer' 'github.com did not answer: the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine' 'open egress or export a proxy for this machine (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
+   000) init_row egress-github FAIL 'no answer' "$corpus_what did not answer: the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine" 'open egress or export a proxy for this machine (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
    proxy:*) init_row egress-github FAIL "proxy answered HTTP ${code_github#proxy:}" "the proxy this machine uses answered HTTP ${code_github#proxy:} to the connection for github.com" 'give the proxy its credentials or an exemption for github.com and release-assets.githubusercontent.com (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
-   2??|3??) init_row egress-github PASS "HTTP $code_github" "github.com answered HTTP $code_github: the route the corpus release is downloaded over (github.com, then release-assets.githubusercontent.com) is open from this machine";;
-   4??) init_row egress-github FAIL "HTTP $code_github" "github.com answered HTTP $code_github: the request was refused, by github.com or by something between this machine and it (a portal, a content filter, a rate limit); the corpus release was not proved downloadable" 'find what refuses github.com from this machine (a portal login, a filter exemption for github.com and release-assets.githubusercontent.com), or stage the corpus files locally (corpus.vectors_path)';;
-   *) init_row egress-github FAIL "HTTP $code_github" "github.com answered HTTP $code_github: an error at github.com or at something between this machine and it; the corpus release was not proved downloadable" 'run init again later; if the answer stays, find what sits between this machine and github.com, or stage the corpus files locally (corpus.vectors_path)';;
+   2??) if [[ -n $corpus_tag ]]; then init_row egress-github PASS "HTTP $code_github from ${corpus_origin#https://}" "$corpus_what answered HTTP $code_github from $corpus_origin, its redirect followed: the route the corpus release is downloaded over is open from this machine"
+        else init_row egress-github PASS "HTTP $code_github" "$corpus_what answered HTTP $code_github"; fi;;
+   3??) init_row egress-github FAIL "HTTP $code_github" "$corpus_what redirected to a location the download cannot follow (HTTP $code_github: not HTTPS, or too many redirects); the corpus release was not proved downloadable" 'find what rewrites redirects between this machine and github.com (a proxy, a portal), or stage the corpus files locally (corpus.vectors_path)';;
+   4??) init_row egress-github FAIL "HTTP $code_github" "$corpus_what answered HTTP $code_github: the request was refused, by github.com (a 404: no such release asset is published under that name) or by something between this machine and it (a portal, a content filter, a rate limit); the corpus release was not proved downloadable" 'find what refuses github.com from this machine (a portal login, a filter exemption for github.com and release-assets.githubusercontent.com), or stage the corpus files locally (corpus.vectors_path)';;
+   *) init_row egress-github FAIL "HTTP $code_github" "$corpus_what answered HTTP $code_github: an error at github.com or at something between this machine and it; the corpus release was not proved downloadable" 'run init again later; if the answer stays, find what sits between this machine and github.com, or stage the corpus files locally (corpus.vectors_path)';;
  esac
  case $code_ghcr in
    000) init_row egress-ghcr FAIL 'no answer' 'ghcr.io did not answer from this machine; the nodes pull the images, so prove their route in step 4' 'open the route, or mirror the six images into a registry the nodes reach (registry.base)';;

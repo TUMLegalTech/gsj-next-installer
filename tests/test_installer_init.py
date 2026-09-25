@@ -132,11 +132,23 @@ if "-o" in a and "--write-out" in a:
         else: target.write_text("operator's own copy of " + name)
     shutil.copyfile(lookup[name], out); sys.stdout.write("200 000"); sys.exit(0)
 if "--write-out" in a:
-    if offline: sys.stdout.write("000 000"); print("curl: (7) Failed to connect " + canary, file=sys.stderr); sys.exit(7)
-    if proxy: sys.stdout.write("000 " + proxy); print("curl: (56) Received HTTP code 407 from proxy " + canary, file=sys.stderr); sys.exit(56)
+    effective = " " + url if "url_effective" in a[a.index("--write-out") + 1] else ""
+    if offline: sys.stdout.write("000 000" + effective); print("curl: (7) Failed to connect " + canary, file=sys.stderr); sys.exit(7)
+    if proxy: sys.stdout.write("000 " + proxy + effective); print("curl: (56) Received HTTP code 407 from proxy " + canary, file=sys.stderr); sys.exit(56)
+    if "/releases/download/" in url:
+        # the corpus manifest: github.com redirects the release asset to the asset
+        # host, whose URL carries a signed query (the canary rides in it); followed
+        # (--location), the asset host answers TEST_CURL_CORPUS_CODE; not followed,
+        # or redirected to plain HTTP (TEST_CURL_CORPUS_REDIRECT_HTTP=1, rc 1), the
+        # answer stays the 302
+        asset = "https://release-assets.githubusercontent.com/github-production-release-asset/1/vectors.json?X-Amz-Signature=" + canary
+        if os.environ.get("TEST_CURL_CORPUS_REDIRECT_HTTP") == "1": sys.stdout.write("302 000 " + url); print("curl: (1) Protocol http not supported " + canary, file=sys.stderr); sys.exit(1)
+        if "--location" not in a: sys.stdout.write("302 000" + (" " + url if effective else "")); sys.exit(0)
+        code = os.environ.get("TEST_CURL_CORPUS_CODE", "200")
+        sys.stdout.write(code + " 000" + (" " + (asset if code[0] != "4" and code[0] != "5" else url) if effective else "")); sys.exit(0)
     # TEST_CURL_GHCR_CODE / TEST_CURL_GITHUB_CODE: what the origin answers the probe
     code = os.environ.get("TEST_CURL_GHCR_CODE", "401") if "ghcr" in url else os.environ.get("TEST_CURL_GITHUB_CODE", "200")
-    sys.stdout.write(code + " 000"); sys.exit(0)
+    sys.stdout.write(code + " 000" + effective); sys.exit(0)
 print("unexpected curl invocation " + canary, file=sys.stderr); sys.exit(97)
 '''
 
@@ -157,7 +169,11 @@ sys.exit(rc)
 '''
 
 
-def _installer(directory, keypair, *, base=BASE, version=VERSION, identity=IDENTITY, clients=None):
+CORPUS_FINGERPRINT = "f93c956f" + "0" * 56          # the tag of the corpus release ends in its first eight characters
+CORPUS_TAG = "corpus-1.snowflake-m-v2-int8-768." + CORPUS_FINGERPRINT[:8]
+
+
+def _installer(directory, keypair, *, base=BASE, version=VERSION, identity=IDENTITY, clients=None, corpus=True):
     """A REAL installer: the branch's runtime.sh over a synthetic payload,
     signed the way build.py sign() signs (canonical descriptor, RSA-SHA256).
     The four companions are written into `directory/assets` -- a staged
@@ -167,7 +183,7 @@ def _installer(directory, keypair, *, base=BASE, version=VERSION, identity=IDENT
     clients = clients or {tool: {"linux/amd64": {"url": "https://example.test/" + tool, "sha256": "a" * 64}} for tool in ("helm", "kubectl", "jq")}
     release = builder.canonical({"schema": "gsj.release/1", "version": version, "identity": identity, "qualification": True,
                                  "release_base_url": base, "trustKeySha256": builder.sha(pem), "platforms": ["linux/amd64"],
-                                 "clients": clients})
+                                 "clients": clients, **({"corpus": {"fingerprint": CORPUS_FINGERPRINT}} if corpus else {})})
     source = (INSTALLER / "runtime.sh").read_text()
     header, trailing = source.rsplit(builder.MARKER, 1)
     assert not trailing.strip()
@@ -255,7 +271,7 @@ class Box:
     def __init__(self, tmp_path, keypair, **tools):
         self.tmp = tmp_path
         self.keypair = keypair
-        self.installer, self.assets = _installer(tmp_path / "release", keypair)
+        self.installer, self.assets = _installer(tmp_path / "release", keypair, corpus=tools.pop("corpus", True))
         self.home = tmp_path / "home"
         self.home.mkdir(mode=0o700)
         self.tmpdir = tmp_path / "tmp"
@@ -1137,27 +1153,62 @@ def test_a_recovery_bundle_refuses_init_like_every_verb_but_inspect_and_lease_re
     assert not (work / "init-ran").exists()
 
 
-@pytest.mark.parametrize("code,status", [("200", "PASS"), ("301", "PASS"), ("403", "FAIL"), ("429", "FAIL"), ("500", "FAIL"), ("503", "FAIL")])
-def test_the_github_row_reports_what_the_answer_established(tmp_path, keypair, code, status):
-    """The row said "the corpus release can be downloaded from
-    this machine" and PASSED on ANY answer -- a 403 from a portal, a 500 --
-    and the summary said ready. A 2xx/3xx is the open route; a 4xx is a
-    refusal by github.com or by something between, a 5xx an error there or
-    between: named as that, FAIL, and the box is not ready."""
+@pytest.mark.parametrize("code,status", [("200", "PASS"), ("301", "FAIL"), ("403", "FAIL"), ("404", "FAIL"), ("429", "FAIL"), ("500", "FAIL"), ("503", "FAIL")])
+def test_the_github_row_probes_the_corpus_manifest_through_its_redirect_and_reports_what_answered(tmp_path, keypair, code, status):
+    """The row probed github.com's HOMEPAGE and then claimed the route through
+    the release-asset host open -- a host it never contacted. It probes what
+    the corpus download uses: the URL the installer fetches the corpus
+    manifest from (the vectors.json asset of the corpus release whose tag
+    ends in this release's corpus fingerprint), its redirect followed to the
+    asset host, and it names the origin that answered. A 2xx there is the
+    open route; a 3xx that stayed is a redirect the download cannot follow;
+    a 4xx is a refusal by github.com (a 404: no such asset) or by something
+    between, a 5xx an error there or between: named as that, FAIL, and the
+    box is not ready. The asset URL's signed query is never printed."""
     box = Box(tmp_path, keypair)
-    result = box.run(TEST_CURL_GITHUB_CODE=code)
+    result = box.run(TEST_CURL_CORPUS_CODE=code)
     report = _report(result)
     row = _check(report, "egress-github")
-    assert row["status"] == status and row["found"] == f"HTTP {code}", row
+    probe = next(call for call in box.curl_calls() if any(v.startswith("https://github.com/") for v in call))
+    assert "--location" in probe and "--proto-redir" in probe and "url_effective" in probe[probe.index("--write-out") + 1]
+    assert f"https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/{CORPUS_TAG}/vectors.json" in probe
+    assert CORPUS_TAG in row["detail"] and "homepage" not in row["detail"]
+    assert row["status"] == status, row
     if status == "PASS":
+        assert row["found"] == f"HTTP {code} from release-assets.githubusercontent.com"
+        assert "from https://release-assets.githubusercontent.com, its redirect followed" in row["detail"]
         assert result.returncode == 0 and report["summary"]["ready"] is True
         assert "route the corpus release is downloaded over" in row["detail"] and "not proved" not in row["detail"]
     else:
+        assert row["found"] == f"HTTP {code}"
         assert result.returncode == 3 and report["summary"]["ready"] is False
-        assert "not proved downloadable" in row["detail"] and "can be downloaded" not in row["detail"]
+        assert "not proved downloadable" in row["detail"] and "can be downloaded" not in row["detail"] and "is open" not in row["detail"]
         assert ("refused" in row["detail"]) == (code[0] == "4") and ("error at github.com" in row["detail"]) == (code[0] == "5")
+        assert ("cannot follow" in row["detail"]) == (code[0] == "3") and ("no such release asset" in row["detail"]) == (code[0] == "4")
         assert "corpus.vectors_path" in row["fix"]
     assert report["summary"]["egress"] == "full"          # an answer is an answer: the egress class is about reach
+    assert "X-Amz" not in result.stdout + "".join(p.read_text() for p in result.reports)
+    _no_leak(box, result)
+
+
+def test_a_corpus_manifest_redirected_to_plain_http_is_named_as_a_redirect_the_download_cannot_follow(tmp_path, keypair):
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_CURL_CORPUS_REDIRECT_HTTP="1")
+    row = _check(_report(result), "egress-github")
+    assert row["status"] == "FAIL" and row["found"] == "HTTP 302" and "cannot follow" in row["detail"] and CORPUS_TAG in row["detail"]
+    _no_leak(box, result)
+
+
+def test_a_release_without_a_corpus_fingerprint_asks_the_homepage_and_says_so(tmp_path, keypair):
+    """every release carries a corpus fingerprint; a payload without one cannot
+    compose the manifest's URL, so the row asks the homepage and says the
+    corpus route is not proved instead of claiming the asset host"""
+    box = Box(tmp_path, keypair, corpus=False)
+    result = box.run()
+    row = _check(_report(result), "egress-github")
+    assert row["status"] == "PASS" and row["found"] == "HTTP 200"
+    assert "homepage" in row["detail"] and "not proved" in row["detail"] and "is open" not in row["detail"]
+    assert not any("/releases/download/" in v for call in box.curl_calls() for v in call)
     _no_leak(box, result)
 
 
