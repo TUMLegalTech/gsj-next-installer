@@ -245,12 +245,20 @@ def test_insufficient_or_unknown_capacity_blocks_all_payload_writes(bundle, monk
     assert list(root(bundle).iterdir()) == [journal(bundle)]
 
 
-def test_shared_filesystem_free_bytes_counted_once_and_partial_cost_is_conservative(bundle):
+def test_shared_filesystem_free_bytes_counted_once_and_partial_cost_is_conservative(bundle, monkeypatch):
+    """The capacity check reads the filesystem ONCE for every volume root on
+    it. Measured against a controlled statvfs (the previous form
+    compared two live readings and failed once when free space moved by
+    4,096 bytes between them): the available bytes are exactly the one
+    reading's, and the partial cost exceeds the entries' sizes."""
     with tarfile.open(bundle.archive) as archive: records = json.load(archive.extractfile("GSJ-BACKUP.json"))["entries"]
     roots = {name: root(bundle, name) for name in backup.VOLUMES}
+    actual = os.statvfs(root(bundle))
+    frozen = SimpleNamespace(**{name: getattr(actual, name) for name in ("f_frsize", "f_bavail", "f_files", "f_favail")})
+    monkeypatch.setattr(restore.os, "statvfs", lambda path: frozen)
     data = restore.capacity_check(roots, {r["path"]: r for r in records}, {})
     assert data["filesystems"] == 1
-    assert data["available_bytes"] <= os.statvfs(root(bundle)).f_bavail * os.statvfs(root(bundle)).f_frsize
+    assert data["available_bytes"] == frozen.f_bavail * frozen.f_frsize
     assert data["required_bytes"] > sum(r.get("size", 0) for r in records)
 
 

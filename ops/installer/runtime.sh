@@ -723,12 +723,19 @@ inspect_cluster() {
  done
  # A proxy is reported by PRESENCE and origin only: a proxy URL may carry
  # user:password@, which must never reach this document (proxy_file_check
- # refuses one at the site input for the same reason).
+ # refuses one at the site input for the same reason). Through
+ # url_origin_only, the one function -- the hand-made cut before it dropped
+ # the userinfo, the scheme and the path and KEPT the query and the fragment
+ # (an init report carried `proxy.example?REVIEW_PROXY_QUERY_SECRET`)
+ # [review B2]. A proxy variable may omit its scheme: one is lent for
+ # the parse and taken back, so the field keeps its host[:port] shape; an
+ # authority that is not a host is named by the function's fixed words.
  local proxy_set proxy_origin=''
  proxy_set=$( [[ -n ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}} ]] && printf true || printf false)
  if [[ $proxy_set == true ]]; then
    proxy_origin=${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}
-   proxy_origin=${proxy_origin##*@}; proxy_origin=${proxy_origin##*://}; proxy_origin=${proxy_origin%%/*}
+   [[ $proxy_origin == *://* ]] || proxy_origin="http://$proxy_origin"
+   proxy_origin=$(url_origin_only "$proxy_origin"); proxy_origin=${proxy_origin#*://}
  fi
  jq -n --arg context "$CONTEXT" --arg platform "$GSJ_PLATFORM" --arg helm "$(helm version --short 2>/dev/null || printf unknown)" --argjson cores "$cores" --arg ram "$ram" --arg disk "$disk" --slurpfile versions "$out/version.json" --slurpfile nodes "$out/nodes.json" --slurpfile pods "$out/pods.json" --slurpfile pvcs "$out/persistentvolumeclaims.json" --slurpfile pvs "$out/persistentvolumes.json" --slurpfile classes "$out/storageclasses.json" --slurpfile ingress "$out/ingressclasses.json" --rawfile usage "$out/live-usage.txt" \
    --arg kubectl_floor "$GSJ_KUBECTL_FLOOR" --arg helm_floor "$GSJ_HELM_FLOOR" --arg jq_floor "$GSJ_JQ_FLOOR" \
@@ -2903,7 +2910,10 @@ relocated_images_probe() {
  base=$(j '.registry.base // ""')
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
  [[ -n $base || $base != "$recorded" ]] || return 0
- if [[ -n $base ]]; then where="registry.base ($base)"; else where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"; fi
+ # registry.base has no scheme (the schema holds it to host[:port][/path]), so
+ # url_origin_only prints it as it is: routed like every printed address, so
+ # the URL scan's alias rule sees the wrapper [review B2]
+ if [[ -n $base ]]; then where="registry.base ($(url_origin_only "$base"))"; else where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"; fi
  deadline=$(j .deadlines.dependencies_seconds)
  want=$(jq '.images|length' "$GSJ_PAYLOAD/release.json")
  pod="gsj-pull-${OPERATION:0:12}"
