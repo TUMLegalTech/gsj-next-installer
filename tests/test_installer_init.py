@@ -363,7 +363,7 @@ def test_missing_companions_are_downloaded_checked_verified_then_saved(tmp_path,
     assert report["verification"] == {"status": "PASS", "companions_present": 0, "companions_downloaded": 4, "companions_saved": 4,
                                       "saved_in": str(box.installer.parent), "missing": "", "limit": report["verification"]["limit"]}
     assert "modified installer could skip its own check" in report["verification"]["limit"]
-    assert "Verified signed descriptor and exact installer bytes" in result.stdout
+    assert "init: the published verify-release.sh confirms the signed descriptor and the exact bytes of this installer" in result.stdout
     assert report["installer"] == {"name": "gsj-install.sh", "version": VERSION, "identity": IDENTITY,
                                    "sha256": builder.sha(box.installer.read_bytes()), "platform": "linux/amd64"}
     assert report["summary"]["ready"] is True and report["summary"]["egress"] == "full"
@@ -1106,7 +1106,7 @@ def test_help_lists_init_and_the_verifier_and_inspect_are_pinned(runtime):
     assert pinned == hashlib.sha256((INSTALLER / "verify-release.sh").read_bytes()).hexdigest(), \
         "verify-release.sh changed: update INIT_VERIFIER_SHA256 in runtime.sh (init executes only the published verifier)"
     # inspect_cluster is byte-identical to the text init was built on: the
-    # fix-pass-installer head whose proxy field goes through url_origin_only
+    # base head be7b2e7, whose proxy field goes through url_origin_only
     # (re-pinned deliberately at that merge; before it, base 833fe99's text)
     body = source[source.index("\ninspect_cluster() {"):source.index("\nquantity_bytes() {")]
     assert hashlib.sha256(body.encode()).hexdigest() == "861eee2b780591f89ea8dc1b7c1d07082554717af04d98278aa337744c629788", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
