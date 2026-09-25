@@ -121,7 +121,9 @@ images, once `inspect` has run. It prepares `$HOME/gsj-operator/` with a
 private `credentials/` folder (created 0700, create-only, never through a
 symlink; a folder it did not make is refused unless it is a plain folder
 you own that group and others cannot write, and that refusal comes before
-anything is written anywhere), runs
+anything is written beside the installer or under `$HOME` -- the only
+thing written before it is the payload the installer unpacks into its own
+private temporary folder, which it removes on exit), runs
 `inspect`, and writes **one report** —
 `$HOME/gsj-operator/gsj-init-report-<time>.json`: the verification result,
 every check, and the inspect profile — the one file to send back to TUM

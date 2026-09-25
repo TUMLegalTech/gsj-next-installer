@@ -5772,7 +5772,10 @@ init_box() {
  INIT_STAGE="$GSJ_WORK/init-companions"; mkdir -m 700 "$INIT_STAGE"
  printf 'GSJ init: release %s (%s)\n' "$version" "$identity"
  # THE WORKING FOLDER FIRST -- refused by name before anything is written
- # anywhere; its rows come at step 5, where the guide's steps meet it.
+ # beside the installer or under $HOME (bootstrap has already unpacked the
+ # payload into this run's private temporary directory, which the exit trap
+ # removes); its rows come at step 5, where the guide's steps
+ # meet it.
  [[ -n ${HOME:-} && ${HOME:-} == /* ]] || fail 'HOME is not set to an absolute path; init cannot place the working folder'
  local work="$HOME/gsj-operator" work_made work_mode cred_made cred_mode
  init_own_dir "$work" || fail "refusing $work: $INIT_WHY (init creates it only when nothing of that name exists; a plain folder this user owns that group and others cannot write is used as it is)"
@@ -5832,7 +5835,17 @@ init_box() {
    # installer's bytes, from the private copy; its own fixed lines go to the
    # screen.
    log 'init: running the published verify-release.sh'
-   bash "$INIT_STAGE/verify-release.sh" "$self" "$INIT_STAGE/installer-descriptor.json" "$INIT_STAGE/installer-descriptor.sig" "$INIT_STAGE/release.pem" || fail "release verification FAILED: verify-release.sh refused this installer (its line is above). Do not run this installer; ask for the release again"
+   # The verifier's own success line says "The installer was not executed",
+   # which is true of the verifier and false on this screen -- init IS this
+   # installer, running. Its output is kept in the work directory;
+   # on success init says what was established in its own words, on a refusal
+   # the verifier's line is shown, since it names the check that failed.
+   if bash "$INIT_STAGE/verify-release.sh" "$self" "$INIT_STAGE/installer-descriptor.json" "$INIT_STAGE/installer-descriptor.sig" "$INIT_STAGE/release.pem" > "$GSJ_WORK/init-verifier.out" 2>&1; then
+     printf 'init: the published verify-release.sh confirms the signed descriptor and the exact bytes of this installer (the verifier executes nothing; init, which is this installer already running, ran it)\n'
+   else
+     cat "$GSJ_WORK/init-verifier.out" >&2
+     fail "release verification FAILED: verify-release.sh refused this installer (its line is above). Do not run this installer; ask for the release again"
+   fi
    # Only now are the downloads kept: beside the installer, or -- when that
    # folder cannot be written -- in the working folder's releases/<version>/.
    if (( downloaded > 0 )); then
@@ -5908,15 +5921,24 @@ init_box() {
    else init_row kubectl-skew FAIL "client $kubectl_version, server $server" "kubectl $kubectl_version is more than one minor from the server ($server)" "install a kubectl within one minor of $server (the guide, step 1)"; fi
  else init_row kubectl-skew UNKNOWN '' 'not compared: kubectl or the server version is unknown (above)' ''; fi
  code_github=$(init_reach https://github.com/); code_ghcr=$(init_reach https://ghcr.io/v2/)
+ # An answer is classified by what it establishes: a 2xx/3xx
+ # from github.com is the route the corpus download takes; a 4xx is a refusal
+ # by github.com or by something between (a portal, a filter, a rate limit),
+ # a 5xx an error there or between -- neither is "downloadable". ghcr.io
+ # answers an anonymous request with 401 by design, so 401 is its PASS.
  case $code_github in
    000) init_row egress-github FAIL 'no answer' 'github.com did not answer: the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine' 'open egress or export a proxy for this machine (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
    proxy:*) init_row egress-github FAIL "proxy answered HTTP ${code_github#proxy:}" "the proxy this machine uses answered HTTP ${code_github#proxy:} to the connection for github.com" 'give the proxy its credentials or an exemption for github.com and release-assets.githubusercontent.com (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
-   *) init_row egress-github PASS "HTTP $code_github" "github.com answered (HTTP $code_github): the corpus release can be downloaded from this machine";;
+   2??|3??) init_row egress-github PASS "HTTP $code_github" "github.com answered HTTP $code_github: the route the corpus release is downloaded over (github.com, then release-assets.githubusercontent.com) is open from this machine";;
+   4??) init_row egress-github FAIL "HTTP $code_github" "github.com answered HTTP $code_github: the request was refused, by github.com or by something between this machine and it (a portal, a content filter, a rate limit); the corpus release was not proved downloadable" 'find what refuses github.com from this machine (a portal login, a filter exemption for github.com and release-assets.githubusercontent.com), or stage the corpus files locally (corpus.vectors_path)';;
+   *) init_row egress-github FAIL "HTTP $code_github" "github.com answered HTTP $code_github: an error at github.com or at something between this machine and it; the corpus release was not proved downloadable" 'run init again later; if the answer stays, find what sits between this machine and github.com, or stage the corpus files locally (corpus.vectors_path)';;
  esac
  case $code_ghcr in
    000) init_row egress-ghcr FAIL 'no answer' 'ghcr.io did not answer from this machine; the nodes pull the images, so prove their route in step 4' 'open the route, or mirror the six images into a registry the nodes reach (registry.base)';;
    proxy:*) init_row egress-ghcr FAIL "proxy answered HTTP ${code_ghcr#proxy:}" "the proxy this machine uses answered HTTP ${code_ghcr#proxy:} to the connection for ghcr.io; the nodes pull the images, so prove their route in step 4" 'give the proxy its credentials or an exemption (the guide, step 1), or mirror the six images (registry.base)';;
-   *) init_row egress-ghcr PASS "HTTP $code_ghcr" "ghcr.io answered (HTTP $code_ghcr) from this machine; this says nothing about your NODES, whose route step 4's pull probe proves";;
+   2??|3??|401) init_row egress-ghcr PASS "HTTP $code_ghcr" "ghcr.io answered HTTP $code_ghcr from this machine (401 is how a registry answers an anonymous request); this says nothing about your NODES, whose route step 4's pull probe proves";;
+   4??) init_row egress-ghcr FAIL "HTTP $code_ghcr" "ghcr.io answered HTTP $code_ghcr: the request was refused, by ghcr.io or by something between this machine and it (a portal, a content filter, a rate limit); the nodes pull the images, so prove their route in step 4" 'find what refuses ghcr.io from this machine, or mirror the six images into a registry the nodes reach (registry.base)';;
+   *) init_row egress-ghcr FAIL "HTTP $code_ghcr" "ghcr.io answered HTTP $code_ghcr: an error at ghcr.io or at something between this machine and it; the nodes pull the images, so prove their route in step 4" 'run init again later; if the answer stays, mirror the six images into a registry the nodes reach (registry.base)';;
  esac
  if [[ $code_github == 000 && $code_ghcr == 000 ]]; then egress=none; elif [[ $code_github != 000 && $code_github != proxy:* && $code_ghcr != 000 && $code_ghcr != proxy:* ]]; then egress=full; else egress=partial; fi
  # 4 -- THE BOX: room for the corpus download, the OS, the architecture. The

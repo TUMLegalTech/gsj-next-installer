@@ -134,7 +134,9 @@ if "-o" in a and "--write-out" in a:
 if "--write-out" in a:
     if offline: sys.stdout.write("000 000"); print("curl: (7) Failed to connect " + canary, file=sys.stderr); sys.exit(7)
     if proxy: sys.stdout.write("000 " + proxy); print("curl: (56) Received HTTP code 407 from proxy " + canary, file=sys.stderr); sys.exit(56)
-    sys.stdout.write(("401" if "ghcr" in url else "200") + " 000"); sys.exit(0)
+    # TEST_CURL_GHCR_CODE / TEST_CURL_GITHUB_CODE: what the origin answers the probe
+    code = os.environ.get("TEST_CURL_GHCR_CODE", "401") if "ghcr" in url else os.environ.get("TEST_CURL_GITHUB_CODE", "200")
+    sys.stdout.write(code + " 000"); sys.exit(0)
 print("unexpected curl invocation " + canary, file=sys.stderr); sys.exit(97)
 '''
 
@@ -469,7 +471,11 @@ def test_the_published_verifier_runs_after_the_internal_check_and_its_own_refusa
     box.place(*COMPANIONS)
     result = box.run()
     assert result.returncode == 0, result.stderr
-    assert "Verified signed descriptor and exact installer bytes. The installer was not executed." in result.stdout
+    # the verifier's own success line ("The installer was not executed") is
+    # not forwarded: init IS the installer, running -- init says in its own
+    # words what the verifier established
+    assert "was not executed" not in result.stdout + result.stderr
+    assert "init: the published verify-release.sh confirms the signed descriptor and the exact bytes of this installer" in result.stdout
     assert result.stderr.index("init: running the published verify-release.sh") < result.stderr.index("init: running inspect")
     descriptor = json.loads((box.assets / "installer-descriptor.json").read_text())
     descriptor["zz"] = {"sha256": "0" * 64}
@@ -861,9 +867,12 @@ def test_the_fix_command_for_the_credentials_folder_is_quoted(tmp_path, keypair)
 
 @pytest.mark.parametrize("shape", ["symlink", "file", "group-writable", "credentials-symlink", "credentials-file", "other-owner", "other-owner-ancestor-link"])
 def test_a_preseeded_or_symlinked_working_folder_is_refused_before_any_write(tmp_path, keypair, shape):
-    """Refused by name BEFORE anything is written anywhere: not into the
-    folder, not through the link, and no companion beside the installer. The
-    owner rules are exercised with an `id -u` that answers another uid."""
+    """Refused by name BEFORE anything is written beside the installer or
+    under $HOME: not into the folder, not through the link, and no companion
+    beside the installer (bootstrap's payload extraction into the run's own
+    private temporary directory, removed on exit, is the one write before
+    it -- what the guide now says). The owner rules are exercised with an
+    `id -u` that answers another uid."""
     box = Box(tmp_path, keypair)
     work = box.home / "gsj-operator"
     elsewhere = tmp_path / "elsewhere"
@@ -1124,3 +1133,76 @@ def test_a_recovery_bundle_refuses_init_like_every_verb_but_inspect_and_lease_re
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { :; }\ninstall_exit_traps() { :; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n')
     assert result.returncode != 0 and "supports only inspect and lease-repair" in result.stderr
     assert not (work / "init-ran").exists()
+
+
+@pytest.mark.parametrize("code,status", [("200", "PASS"), ("301", "PASS"), ("403", "FAIL"), ("429", "FAIL"), ("500", "FAIL"), ("503", "FAIL")])
+def test_the_github_row_reports_what_the_answer_established(tmp_path, keypair, code, status):
+    """The row said "the corpus release can be downloaded from
+    this machine" and PASSED on ANY answer -- a 403 from a portal, a 500 --
+    and the summary said ready. A 2xx/3xx is the open route; a 4xx is a
+    refusal by github.com or by something between, a 5xx an error there or
+    between: named as that, FAIL, and the box is not ready."""
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_CURL_GITHUB_CODE=code)
+    report = _report(result)
+    row = _check(report, "egress-github")
+    assert row["status"] == status and row["found"] == f"HTTP {code}", row
+    if status == "PASS":
+        assert result.returncode == 0 and report["summary"]["ready"] is True
+        assert "route the corpus release is downloaded over" in row["detail"] and "not proved" not in row["detail"]
+    else:
+        assert result.returncode == 3 and report["summary"]["ready"] is False
+        assert "not proved downloadable" in row["detail"] and "can be downloaded" not in row["detail"]
+        assert ("refused" in row["detail"]) == (code[0] == "4") and ("error at github.com" in row["detail"]) == (code[0] == "5")
+        assert "corpus.vectors_path" in row["fix"]
+    assert report["summary"]["egress"] == "full"          # an answer is an answer: the egress class is about reach
+    _no_leak(box, result)
+
+
+@pytest.mark.parametrize("code,status", [("401", "PASS"), ("200", "PASS"), ("403", "FAIL"), ("500", "FAIL")])
+def test_the_ghcr_row_reports_what_the_answer_established(tmp_path, keypair, code, status):
+    """The same rule for ghcr.io, whose PASS includes 401 -- how a registry
+    answers an anonymous request."""
+    box = Box(tmp_path, keypair)
+    result = box.run(TEST_CURL_GHCR_CODE=code)
+    report = _report(result)
+    row = _check(report, "egress-ghcr")
+    assert row["status"] == status and row["found"] == f"HTTP {code}", row
+    assert (result.returncode == 0) == (status == "PASS") and report["summary"]["ready"] is (status == "PASS")
+    if code == "401":
+        assert "anonymous request" in row["detail"]
+    if status == "FAIL":
+        assert "registry.base" in row["fix"]
+    _no_leak(box, result)
+
+
+def test_the_full_report_carries_only_the_proxy_s_origin(tmp_path, keypair):
+    """Review B2: a full init run -- inspect included, its profile spliced
+    into the report -- with a proxy whose URL carries userinfo, a path, a
+    query and a fragment, each a canary. The report's
+    .inspect.profile.networking.egress.proxy_origin is the origin alone (the
+    review's run wrote `proxy.example?REVIEW_PROXY_QUERY_SECRET` there: the
+    previous canary test ran without inspect and never saw it), and no
+    canary reaches the screen, the report or any file under the working
+    folder."""
+    box = Box(tmp_path, keypair)
+    result = box.run(HTTPS_PROXY=f"http://u:{CANARY}@proxy.example:3128/{CANARY}?REVIEW_PROXY_QUERY_SECRET={CANARY}#{CANARY}")
+    assert result.returncode == 0, result.stderr + result.stdout
+    report = _report(result)
+    assert _check(report, "inspect")["status"] == "PASS"
+    egress = report["inspect"]["profile"]["networking"]["egress"]
+    assert egress["proxy_configured"] is True and egress["proxy_origin"] == "proxy.example:3128", egress
+    text = json.dumps(report) + result.stdout + result.stderr
+    assert "REVIEW_PROXY_QUERY_SECRET" not in text and "3128/" not in text and "?" not in egress["proxy_origin"]
+    _no_leak(box, result)
+
+
+def test_the_full_report_keeps_the_origin_of_a_scheme_less_proxy_with_a_query(tmp_path, keypair):
+    """The review's exact shape: `proxy.example?REVIEW_PROXY_QUERY_SECRET`."""
+    box = Box(tmp_path, keypair)
+    result = box.run(HTTPS_PROXY="proxy.example?REVIEW_PROXY_QUERY_SECRET")
+    assert result.returncode == 0, result.stderr + result.stdout
+    report = _report(result)
+    assert report["inspect"]["profile"]["networking"]["egress"]["proxy_origin"] == "proxy.example"
+    assert "REVIEW_PROXY_QUERY_SECRET" not in json.dumps(report) + result.stdout + result.stderr
+    _no_leak(box, result)

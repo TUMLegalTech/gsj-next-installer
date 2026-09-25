@@ -495,12 +495,12 @@ row settles:
 | `base64` | present | never: refused before `init` ran |
 | `sha256` | `sha256sum` or `shasum` present | never: refused before `init` ran |
 | `cluster` | the context answered and its Kubernetes is 1.27 or newer | no context selected, no answer (unreachable, no such context, refused credentials, a credential plugin that needs a terminal, or a proxy without `no_proxy`), or below the floor; UNKNOWN when kubectl is missing or did not run |
-| `egress-github` | `github.com` answered from this machine | no answer, or a proxy that refused the connection: the corpus cannot be downloaded from here — a proxy, egress, or `corpus.vectors_path` |
-| `egress-ghcr` | `ghcr.io` answered from this machine (which says nothing about your nodes: step 4) | no answer, or a proxy that refused the connection: open the route, or `registry.base` |
+| `egress-github` | `github.com` answered HTTP 2xx or 3xx from this machine: the route the corpus download takes is open | no answer, a proxy that refused the connection, a 4xx (refused by `github.com` or by something between — a portal, a filter, a rate limit) or a 5xx (an error there or between): the corpus was not proved downloadable from here — a proxy, egress, or `corpus.vectors_path` |
+| `egress-ghcr` | `ghcr.io` answered HTTP 2xx, 3xx or 401 from this machine (401 is how a registry answers an anonymous request; this says nothing about your nodes: step 4) | no answer, a proxy that refused the connection, another 4xx or a 5xx: open the route, or `registry.base` |
 | `disk` | room for the corpus download, named by mount point: about 3.5 GB on the one filesystem holding the cache and `TMPDIR`, or 1.9 GB under `TMPDIR` and 1.7 GB under the cache on two | less than that; UNKNOWN when `df` could not measure it |
 | `os` | Linux | anything else |
 | `architecture` | linux/amd64 or linux/arm64 | UNKNOWN on a machine that is not Linux (the `os` row); another CPU was refused before `init` ran |
-| `working-folder` | `$HOME/gsj-operator` created (mode 700) or an existing plain folder you own that group and others cannot write | never a row: a symlink, a file, another owner's folder or one writable by group or others (`chmod go-w` it) is refused before anything is written |
+| `working-folder` | `$HOME/gsj-operator` created (mode 700) or an existing plain folder you own that group and others cannot write | never a row: a symlink, a file, another owner's folder or one writable by group or others (`chmod go-w` it) is refused before anything is written beside the installer or under `$HOME` (the payload unpacked into the installer's own private temporary folder, removed on exit, is the one write before it) |
 | `credentials-folder` | `$HOME/gsj-operator/credentials` created or existing at mode 700 | existing but readable by group or others — `chmod 700` it; a symlink or a file there is refused |
 | `inspect` | the cluster profile is in the report | UNKNOWN: not run (it needs kubectl and jq at their floors and a cluster that answered) or did not complete |
 | `node-architecture` | every node's architecture is one the release has images for | a node is not; UNKNOWN when there is no profile |
