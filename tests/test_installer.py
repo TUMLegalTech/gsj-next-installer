@@ -2735,32 +2735,65 @@ def test_the_closing_line_knows_every_skip_reason_the_verifier_can_record():
 
 # --- the repair recovers: one restart on the staged blocks [review, the major] ---
 
-def _verdict_pods(state):
-    """the application Pod's corpus-initialize status (the helper above):
-    waiting after a verdict, or running (the restart after the staging)"""
-    if state == "waiting":
-        return _initializer_pods("corpus-initialize", BACKING_OFF, "gsj-corpus:source-verification-failed")
-    return _initializer_pods("corpus-initialize", {"running": {}})
+DEPLOY_UID = "deploy-uid-0001"
+FOREIGN_POD = "other-thing-0"
+
+
+def _application_pod(state, name="synthetic-release-web-7c9d8-abcde", uid="installer-pod-uid-0001"):
+    """this release's application Pod (the labels, the owner chain to the
+    release's Deployment through its ReplicaSet): corpus-initialize waiting
+    after a verdict, or running (the restart after the staging)"""
+    pod = _initializer_pods("corpus-initialize", BACKING_OFF, "gsj-corpus:source-verification-failed" if state == "waiting" else None)["items"][0]
+    if state != "waiting":
+        pod["status"]["initContainerStatuses"][0]["state"] = {"running": {}}
+    pod["metadata"] = {"name": name, "uid": uid,
+                       "labels": {"app.kubernetes.io/instance": "synthetic-release", "app.kubernetes.io/component": "gsj"},
+                       "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "synthetic-release-web-7c9d8",
+                                            "uid": "rs-uid-0001", "controller": True}]}
+    return pod
+
+
+def _foreign_pod():
+    """a HEALTHY Pod of another controller that carries the release's two
+    labels (the review's sequence): a StatefulSet's, no initializer verdict"""
+    return {"metadata": {"name": FOREIGN_POD, "uid": "foreign-pod-uid-0001",
+                         "labels": {"app.kubernetes.io/instance": "synthetic-release", "app.kubernetes.io/component": "gsj"},
+                         "ownerReferences": [{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "other-thing",
+                                              "uid": "foreign-sts-uid-0001", "controller": True}]},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "other", "ready": True, "state": {"running": {}}}]}}
+
+
+def _replicaset(owner_uid=DEPLOY_UID):
+    return {"metadata": {"name": "synthetic-release-web-7c9d8", "uid": "rs-uid-0001",
+                         "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "synthetic-release-web",
+                                              "uid": owner_uid, "controller": True}]}}
 
 
 def _deploy(ready):
-    return {"metadata": {"generation": 1}, "status": {"observedGeneration": 1, "updatedReplicas": 1,
-                                                       "availableReplicas": 1 if ready else 0, "readyReplicas": 1 if ready else 0}}
+    return {"metadata": {"generation": 1, "uid": DEPLOY_UID},
+            "status": {"observedGeneration": 1, "updatedReplicas": 1, "availableReplicas": 1 if ready else 0, "readyReplicas": 1 if ready else 0}}
 
 
-def _wait_application(runtime, staged_in_this_run, verdict_persists):
+def _wait_application(runtime, staged_in_this_run, verdict_persists, waiting=None, deletion="ok", replicaset=None):
+    """drives wait_application over a fake kubectl: `waiting` is the Pod list
+    the labels select before the restart (the application Pod after its
+    verdict by default), `deletion` what the API answers the recreation
+    (ok, or refused: the uid precondition failed / the Pod is gone)"""
     run, _, work = runtime
     site = _site(); site["deadlines"] = {"initialization_seconds": 60, "dependencies_seconds": 60}
     (work / "site.json").write_text(json.dumps(site))
-    (work / "pods-waiting.json").write_text(json.dumps(_verdict_pods("waiting")))
-    (work / "pods-running.json").write_text(json.dumps(_verdict_pods("running")))
+    (work / "pods-waiting.json").write_text(json.dumps({"items": waiting if waiting is not None else [_application_pod("waiting")]}))
+    (work / "pods-running.json").write_text(json.dumps({"items": [_application_pod("running", uid="installer-pod-uid-0002")]}))
     (work / "deploy-not-ready.json").write_text(json.dumps(_deploy(False)))
     (work / "deploy-ready.json").write_text(json.dumps(_deploy(True)))
+    (work / "replicaset.json").write_text(json.dumps(replicaset if replicaset is not None else _replicaset()))
     script = f'''
 k() {{
   case "$1 $2" in
     "get deploy") if [[ -f $TEST_WORK/recovered ]]; then cat "$TEST_WORK/deploy-ready.json"; else cat "$TEST_WORK/deploy-not-ready.json"; fi;;
     "get pods") if [[ -f $TEST_WORK/deleted && {'false' if verdict_persists else 'true'} == true ]]; then cat "$TEST_WORK/pods-running.json"; else cat "$TEST_WORK/pods-waiting.json"; fi;;
+    "get replicasets") [[ $3 == synthetic-release-web-7c9d8 ]] || return 1; cat "$TEST_WORK/replicaset.json";;
+    "delete --raw") printf '%s %s\\n' "$*" "$(jq -c . "$5")" >> "$TEST_WORK/kubectl-deletes"; [[ {deletion} == ok ]] || return 1; : > "$TEST_WORK/deleted";;
     "delete pod") printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-deletes"; : > "$TEST_WORK/deleted";;
     "logs "*) :;;
     *) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-other";;
@@ -2777,6 +2810,17 @@ wait_application
     return result, deletes
 
 
+# the one deletion the restart may issue: the application Pod that reported
+# the verdict, by name AND uid (a replacement under the same name is never
+# touched), through the API's own precondition
+RECREATE_INSTALLER_POD = ('delete --raw /api/v1/namespaces/synthetic-namespace/pods/synthetic-release-web-7c9d8-abcde -f '
+                          + '@WORK@/initializer-delete.json {"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"installer-pod-uid-0001"}}')
+
+
+def _recreate(work):
+    return RECREATE_INSTALLER_POD.replace("@WORK@", str(work))
+
+
 def test_a_source_verification_verdict_before_the_staging_gets_one_restart_on_the_staged_blocks(runtime):
     """The review's major, the installer's half: every recovery pipeline runs
     helm_apply, then stage_vectors, then wait_application -- the initializer
@@ -2790,7 +2834,7 @@ def test_a_source_verification_verdict_before_the_staging_gets_one_restart_on_th
     and the wait goes on; the operation completes when the restart imports."""
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False)
     assert result.returncode == 0, result.stderr
-    assert deletes == ["delete pod synthetic-web --wait=false"], deletes
+    assert deletes == [_recreate(runtime[2])], deletes
     assert "restarting it once on the staged blocks" in result.stderr
     assert "stopped terminally" not in result.stderr
 
@@ -2800,7 +2844,7 @@ def test_a_verdict_that_persists_after_the_restart_on_the_staged_blocks_is_termi
     repair -- and only one restart is ever forced."""
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=True)
     assert result.returncode == 1, result.stderr
-    assert deletes == ["delete pod synthetic-web --wait=false"], deletes
+    assert deletes == [_recreate(runtime[2])], deletes
     assert "stopped terminally (source-verification-failed)" in result.stderr and "repair --operation aaaaaaaaaaaaaaaaaaaaaaaa" in result.stderr
 
 
@@ -2812,3 +2856,45 @@ def test_a_source_verification_verdict_with_no_staging_in_this_run_is_terminal_a
     assert result.returncode == 1, result.stderr
     assert deletes == [], deletes
     assert "stopped terminally (source-verification-failed)" in result.stderr
+
+
+def test_the_restart_recreates_the_pod_that_reported_the_verdict_never_the_first_under_the_labels(runtime):
+    """The review's sequence [the major]: a healthy Pod of a foreign controller
+    carrying the release's two labels is listed FIRST, the application Pod
+    with the verdict second. The verdict was read across every Pod under the
+    labels while the deletion took the first one: the foreign Pod was
+    deleted, even with real Lease and Helm validation. The deletion is bound
+    to the Pod whose verdict was read -- by name and uid, as the API's
+    precondition -- and the foreign Pod is never touched."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
+                                        waiting=[_foreign_pod(), _application_pod("waiting")])
+    assert result.returncode == 0, result.stderr
+    assert deletes == [_recreate(runtime[2])], deletes
+    assert FOREIGN_POD not in "\n".join(deletes)
+    assert "restarting it once on the staged blocks" in result.stderr
+
+
+def test_the_restart_refuses_a_verdict_pod_whose_owner_chain_is_not_the_release_deployment(runtime):
+    """The Pod with the verdict is recreated only when its owner chain leads
+    to this release's own workload: Pod -> its controller ReplicaSet (by name
+    and uid) -> the Deployment $RELEASE-web with the uid the wait just read.
+    A chain that ends elsewhere (here: the ReplicaSet's controller is another
+    Deployment's uid) is a named refusal, no deletion at all."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
+                                        replicaset=_replicaset(owner_uid="another-deployment-uid"))
+    assert result.returncode == 1, result.stderr
+    assert deletes == [], deletes
+    assert "synthetic-release-web-7c9d8-abcde" in result.stderr and "not the application Pod of release synthetic-release" in result.stderr
+    assert "stopped terminally" not in result.stderr
+
+
+def test_a_refused_or_failed_recreation_is_an_error_never_a_restart_that_happened(runtime):
+    """A deletion the API refuses (the uid precondition failed: the Pod was
+    replaced under its name) or that fails is an error naming the Pod and
+    the resume -- never silently ignored with the unchanged verdict then
+    counted as the second, terminal one."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=True, deletion="refused")
+    assert result.returncode == 1, result.stderr
+    assert deletes == [_recreate(runtime[2])], deletes
+    assert "could not be recreated" in result.stderr and "resume --operation aaaaaaaaaaaaaaaaaaaaaaaa" in result.stderr
+    assert "stopped terminally" not in result.stderr

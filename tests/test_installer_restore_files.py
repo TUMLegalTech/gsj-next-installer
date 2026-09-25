@@ -44,7 +44,8 @@ def bundle(tmp_path):
         volumes[role] = {"name": role + "-pvc", "uid": role + "-pvc-uid", "pv_name": role + "-pv",
                          "pv_uid": role + "-pv-uid", "root": str(target)}
     source = Path(sources["gsj"])
-    (source / "nested").mkdir(mode=0o750)
+    (source / "nested").mkdir()
+    (source / "nested").chmod(0o750)          # set, never mkdir's mode: under umask 077 that made 0700, and the drift below to 0700 changed nothing
     (source / "nested" / "payload").write_bytes(b"synthetic restore sentinel\n" * 100)
     (source / "nested" / "payload").chmod(0o640)
     (source / "alias").symlink_to("nested/payload")

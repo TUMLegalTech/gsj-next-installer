@@ -178,7 +178,10 @@ fi
         tree = json.loads((tmp_path / 'tree.json').read_text())
         assert tree['group'] != os.getpgid(proc.pid)
         assert os.getpgid(tree['worker']) == os.getpgid(tree['child']) == tree['group']
-        while not (tmp_path / 'writes').exists() and time.monotonic() < deadline: time.sleep(.01)
+        # the FIRST WRITE, never the file's creation: the writer opens the file
+        # (it exists, empty) before its first write lands, and the signal must
+        # find a writer that writes
+        while not ((tmp_path / 'writes').exists() and (tmp_path / 'writes').stat().st_size > 0) and time.monotonic() < deadline: time.sleep(.01)
         assert (tmp_path / 'writes').stat().st_size > 0
         proc.send_signal(signal.SIGTERM)
         if ignore_term:

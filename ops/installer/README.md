@@ -426,7 +426,7 @@ no private input.
    It runs the release's web image (the initializer's own code, library and
    model) against the release's Chroma image through Docker, on a synthetic
    corpus and vector sidecar the image's own generator builds, and passes
-   only when all five hold: the released vectors are imported
+   only when all six hold: the released vectors are imported
    (`corpus-vector-source` says `released`, nothing is embedded); SQLite and
    Chroma read back with matching identities (rows, vectors, the sidecar's
    own values, `current.json`); a deliberate deterministic shard failure
@@ -438,7 +438,12 @@ no private input.
    repair starts before it restages the blocks -- is terminal on those
    bytes, terminal again on its own bytes when restaged damaged, and
    imported once restaged intact, the site completing on that restart
-   (the verdict is bound to the staged content it judged). The initializer pair it
+   (the verdict is bound to the staged content it judged); and a valid sidecar
+   restaged by the release's own staging helper after the initializer loaded
+   the vectors manifest -- the same corpus, the blocks repacked, other
+   digests -- is imported and the site stays complete on the restart (each
+   block is judged against the manifest as staged at the attempt, never
+   against the one loaded earlier). The initializer pair it
    proves is the one registered in `startup-runtime-preflight.py`
    (`QUALIFIED_SOURCE_RUNTIMES`): registering a pair there records a claim,
    this run is what backs it: the report names the initializer pair it

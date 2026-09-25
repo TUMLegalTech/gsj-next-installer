@@ -22,8 +22,8 @@ def module():
 
 def _passed(module):
     observed = {name: dict(expected) for name, expected in module.EXPECTED.items()}
-    pair = ("7b32ab049fda8a37b8d49a1bd6ebc332f8f98152db59d4ca35df149d0053ede1",
-            "c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8")
+    pair = ("43785dcca030cc96fcaa8ebc66f2e4f586cd122e82117cd3bc77b0901397b507",
+            "2ee3f420432386ef549d98802182f0e681a86af7b37dcd1d242b9b70e1ae097b")
     return {"schema": module.SCHEMA, "cases": module.judge(observed),
             "pair": {"initialize_sha256": pair[0], "corpus_sha256": pair[1], "registered": True}}
 
@@ -52,7 +52,8 @@ def test_the_judgement_lives_on_the_host_and_every_expected_value_is_load_bearin
                           damaged_verdicts_lifted=0, damaged_shard_attempts=2, restaged_exit=1, restaged_verdicts_lifted=0,
                           restaged_complete=False, restaged_vector_source=None, restaged_rows_match=False, restaged_vectors_match=False,
                           restaged_shard_complete=False, restaged_shard_imported=False, restaged_chroma_count_matches=False)
-    assert {n: c["status"] for n, c in module.judge(old).items()} == {"import": "passed", "readback": "passed", "core": "failed", "block": "failed", "restage": "failed"}
+    old["restage-valid"].update(exit=1, complete=False, rows_match=False, vectors_match=False, restart_exit=1, restart_complete=False)
+    assert {n: c["status"] for n, c in module.judge(old).items()} == {"import": "passed", "readback": "passed", "core": "failed", "block": "failed", "restage": "failed", "restage-valid": "failed"}
     # the last pass's initializer (9c8426, withdrawn): terminal at once and
     # terminal on every restart, the restaged block never judged -- fails
     # restage by name and nothing else
@@ -60,7 +61,15 @@ def test_the_judgement_lives_on_the_host_and_every_expected_value_is_load_bearin
     reviewed["restage"].update(damaged_verdicts_lifted=0, restaged_exit=1, restaged_verdicts_lifted=0, restaged_complete=False,
                                restaged_vector_source=None, restaged_rows_match=False, restaged_vectors_match=False,
                                restaged_shard_complete=False, restaged_shard_imported=False, restaged_chroma_count_matches=False)
-    assert {n: c["status"] for n, c in module.judge(reviewed).items()} == {"import": "passed", "readback": "passed", "core": "passed", "block": "passed", "restage": "failed"}
+    reviewed["restage-valid"].update(exit=1, complete=False, rows_match=False, vectors_match=False, restart_exit=1, restart_complete=False)
+    assert {n: c["status"] for n, c in module.judge(reviewed).items()} == {"import": "passed", "readback": "passed", "core": "passed", "block": "passed", "restage": "failed", "restage-valid": "failed"}
+    # the withdrawn 7b32ab04 (never deployed): every case but restage-valid --
+    # a valid sidecar restaged after the manifest was loaded was judged
+    # against the old entries, terminal, bound to the new bytes, and the
+    # restart repeated it -- fails restage-valid by name and nothing else
+    withdrawn = {n: dict(e) for n, e in module.EXPECTED.items()}
+    withdrawn["restage-valid"].update(exit=1, complete=False, rows_match=False, vectors_match=False, restart_exit=1, restart_complete=False)
+    assert {n: c["status"] for n, c in module.judge(withdrawn).items()} == {"import": "passed", "readback": "passed", "core": "passed", "block": "passed", "restage": "passed", "restage-valid": "failed"}
     assert module.judge({})["import"]["status"] == "failed"
 
 
@@ -80,8 +89,8 @@ def test_the_verdict_needs_every_case_and_a_registered_measured_pair(module):
     assert module.verdict({}) == "failed" and module.verdict(None) == "failed"
     # the registry the verdict consults is the installer's own
     pairs = module.registered_pairs()
-    assert ("7b32ab049fda8a37b8d49a1bd6ebc332f8f98152db59d4ca35df149d0053ede1",
-            "c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8") in pairs
+    assert ("43785dcca030cc96fcaa8ebc66f2e4f586cd122e82117cd3bc77b0901397b507",
+            "2ee3f420432386ef549d98802182f0e681a86af7b37dcd1d242b9b70e1ae097b") in pairs
 
 
 def test_the_images_are_read_off_the_release_manifest_by_repository_and_digest(module):
@@ -96,14 +105,20 @@ def test_the_images_are_read_off_the_release_manifest_by_repository_and_digest(m
             module.image_references(broken)
 
 
-def test_the_driver_is_valid_python_and_runs_the_five_cases_through_the_real_entrypoint(module):
+def test_the_driver_is_valid_python_and_runs_the_six_cases_through_the_real_entrypoint(module):
     """The driver runs inside the released web image: it must parse, and it must
     run the initializer as the kubelet does -- `python -m gsj_deploy.initialize
     --settings` -- once per case and once more for each restart (the restage
-    case restarts twice: the block restaged damaged, then intact)."""
+    case restarts twice: the block restaged damaged, then intact; the
+    restage-valid case stops the first run with SIGSTOP right after
+    `corpus-vector-source`, stages sidecar B with the release's own staging
+    helper (its source from the environment), continues it, and restarts)."""
     compile(module.DRIVER, "driver", "exec")
     assert '"-m", "gsj_deploy.initialize", "--settings"' in module.DRIVER
-    assert module.CASES == ("import", "core", "block", "restage") and set(module.EXPECTED) == {*module.CASES, "readback"}
+    assert module.CASES == ("import", "core", "block", "restage", "restage-valid") and set(module.EXPECTED) == {*module.CASES, "readback"}
+    for step in ("signal.SIGSTOP", "signal.SIGCONT", 'os.environ["GSJ_STAGE_HELPER"]', "mtime=1700000000", "restage-valid-staged"):
+        assert step in module.DRIVER, step
+    assert module.STAGE_HELPER.is_file() and module.STAGE_HELPER.name == "stage-vectors.py"
     for name in module.CASES:
         assert f'hosts["{name}"]' in module.DRIVER, name
     assert "restart" in module.DRIVER and "corpus-vector-source" in module.DRIVER
@@ -119,17 +134,17 @@ def test_the_release_steps_and_the_runtime_registry_name_this_qualification():
     assert "ci/qualify-initializer.py" in readme
     step = readme.split("**Initializer qualification**", 1)[1].split("\n6. ", 1)[0]
     for phrase in ("before any deployment that runs\n   this initializer is upgraded", "before the installer is published",
-                   "core-mismatch", "source-verification-failed", "restaged", "QUALIFIED_SOURCE_RUNTIMES", "ci/qualify.py gate"):
+                   "core-mismatch", "source-verification-failed", "restaged", "valid sidecar", "QUALIFIED_SOURCE_RUNTIMES", "ci/qualify.py gate"):
         assert phrase in step, phrase
     assert "5. **Initializer qualification**" in readme and "6. **Staging**" in readme      # before anything leaves the machine
     registry = (INSTALLER / "startup-runtime-preflight.py").read_text()
     assert "ci/qualify-initializer.py" in registry
     # the pair the registration comment backs is the LAST registered pair, and
-    # the two withdrawn initializers (the message-pass one and the last pass's
-    # 9c8426, neither ever deployed) are not registered
+    # the three withdrawn initializers (the message-pass one, 9c8426 and
+    # 7b32ab04, none ever deployed) are not registered
     pairs = re.findall(r"\('([0-9a-f]{64})',\s*'([0-9a-f]{64})'\)", registry)
-    assert pairs[-1] == ("7b32ab049fda8a37b8d49a1bd6ebc332f8f98152db59d4ca35df149d0053ede1",
-                         "c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8")
-    assert not any(p[0].startswith(("4de81568", "9c8426db")) for p in pairs)
+    assert pairs[-1] == ("43785dcca030cc96fcaa8ebc66f2e4f586cd122e82117cd3bc77b0901397b507",
+                         "2ee3f420432386ef549d98802182f0e681a86af7b37dcd1d242b9b70e1ae097b")
+    assert not any(p[0].startswith(("4de81568", "9c8426db", "7b32ab04")) for p in pairs)
     # the gate reads the report
     assert "check_initializer_qualification" in (INSTALLER / "ci" / "qualify.py").read_text()

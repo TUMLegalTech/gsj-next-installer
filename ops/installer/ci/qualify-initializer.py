@@ -25,9 +25,18 @@ and passes only when all five hold:
            bytes; the block restaged DAMAGED is judged afresh and terminal on its own bytes;
            the block restaged intact is imported on the restart and the site completes --
            the verdict is bound to the staged content it judged, never to the shard alone
-           (the pre-release review's interleaving).
+           (the pre-release review's interleaving);
+  restage-valid
+           a VALID sidecar restaged after the initializer loaded the vectors manifest --
+           the same vectors repacked, other digests, another fingerprint, installed by the
+           release's own staging helper (blocks first, the manifest last) while the
+           initializer is stopped right after `corpus-vector-source` -- is imported: each
+           block is judged against the manifest as staged at the attempt, never against
+           the one loaded earlier (an initializer that judged the new blocks against the
+           old entries was terminal, bound to the new bytes, and every restart repeated it).
 
-Only the release's images run; nothing here is mounted into them. The report binds what it
+Only the release's images run; nothing here is mounted into them (the driver and the staging
+helper's own source travel in over stdin and the environment, like any other input). The report binds what it
 proves: the images by digest (or, for an engineering image without one, its id, marked
 local), the platform, the library commit, and the (initialize.py, corpus.py) sha256 pair
 MEASURED inside the image -- which must be registered. The pass criteria live HERE, on the
@@ -48,7 +57,8 @@ import time
 from pathlib import Path
 
 SCHEMA = "gsj.initializer-qualification/1"
-CASES = ("import", "core", "block", "restage")
+CASES = ("import", "core", "block", "restage", "restage-valid")
+STAGE_HELPER = Path(__file__).resolve().parents[1] / "stage-vectors.py"
 REGISTRY = Path(__file__).resolve().parents[1] / "startup-runtime-preflight.py"
 # What a passing run observes; the driver measures, this module judges.
 EXPECTED = {
@@ -71,12 +81,17 @@ EXPECTED = {
                 "restaged_exit": 0, "restaged_verdicts_lifted": 1, "restaged_complete": True,
                 "restaged_vector_source": "released", "restaged_rows_match": True, "restaged_vectors_match": True,
                 "restaged_shard_complete": True, "restaged_shard_imported": True, "restaged_chroma_count_matches": True},
+    "restage-valid": {"stopped_after": "corpus-vector-source", "failing_shard_imported_before_stop": False,
+                      "sidecar_differs": True, "staged_by_helper": True, "exit": 0, "complete": True,
+                      "vector_source": "released", "rows_match": True, "vectors_match": True,
+                      "volume_manifest_is_the_restaged": True, "chroma_count_matches": True,
+                      "restart_exit": 0, "restart_complete": True, "restart_verdicts_lifted": 0},
 }
 # The driver runs INSIDE the web image, on its own python and library; it must import
 # nothing that image does not carry (gsj, gsj_deploy, chromadb, numpy). It measures and
 # reports; it judges nothing.
 DRIVER = r'''
-import hashlib, inspect, json, os, platform, shutil, sqlite3, subprocess, sys
+import gzip, hashlib, inspect, io, json, os, platform, shutil, signal, sqlite3, subprocess, sys, tarfile
 from pathlib import Path
 import numpy as np
 from gsj_deploy import corpus, initialize as init
@@ -298,6 +313,83 @@ report["restage"] = {
     "restaged_shard_imported": any(e.get("stage") == "corpus-import" and e.get("shard") == failing for e in events3),
     "restaged_chroma_count_matches": count4 == manifest["chunks"]}
 
+# --- restage-valid: a valid sidecar restaged after the manifest was loaded --------------
+# Sidecar B is A repacked: the same vectors, another gzip header per block, other digests,
+# another fingerprint, as valid as A. It is installed by the release's OWN staging helper
+# (stage-vectors.py, from the environment: blocks first, the manifest last) while the
+# initializer is STOPPED (SIGSTOP) right after it reported `corpus-vector-source` -- A is
+# loaded, no shard judged yet -- and continued once B is on the volume.
+copied5 = root / "restage-valid" / "copied"; copied5.parent.mkdir(parents=True)
+corpus.copy_payload(image, copied5, corpus.digest(image / "manifest.json"))
+sidecar_into(copied5, vectors_dir)
+manifest_a = json.loads((copied5 / "vectors.json").read_bytes())
+blocks_b, shards_b = {}, []
+for entry in manifest_a["shards"]:
+    data = gzip.compress(gzip.decompress((copied5 / entry["archive"]).read_bytes()), 6, mtime=1700000000)
+    blocks_b[entry["archive"]] = data
+    shards_b.append({**entry, "sha256": corpus.sha(data), "bytes": len(data)})
+manifest_b = {k: v for k, v in manifest_a.items() if k != "fingerprint"}; manifest_b["shards"] = shards_b
+manifest_b["fingerprint"] = corpus.sha(corpus.canonical(manifest_b))
+manifest_b_bytes = corpus.canonical(manifest_b) + b"\n"
+envelope = io.BytesIO()
+with tarfile.open(fileobj=envelope, mode="w:") as tar:
+    for name, data in [("vectors.json", manifest_b_bytes)] + sorted(blocks_b.items()):
+        info = tarfile.TarInfo(name); info.size = len(data); tar.addfile(info, io.BytesIO(data))
+helper = os.environ["GSJ_STAGE_HELPER"]
+
+
+def stage_b():
+    staged = subprocess.run([sys.executable, "-B", "-c", helper, str(copied5), corpus.sha(manifest_b_bytes)],
+                            input=envelope.getvalue(), capture_output=True, timeout=300)
+    emit(stage="restage-valid-staged", exit=staged.returncode, stderr_tail=staged.stderr[-400:].decode(errors="replace"))
+    return staged.returncode == 0
+
+
+settings5 = settings_for("restage-valid", copied5, hosts["restage-valid"])
+path5 = root / "restage-valid" / "settings-first.json"; path5.write_text(json.dumps(settings5))
+with open(root / "restage-valid" / "first.stderr", "w") as err5:
+    proc5 = subprocess.Popen([sys.executable, "-B", "-m", "gsj_deploy.initialize", "--settings", str(path5)],
+                             stdout=subprocess.PIPE, stderr=err5, text=True)
+    events5, before_stop, staged_ok = [], None, None
+    for line in proc5.stdout:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        events5.append(event)
+        if before_stop is None and event.get("stage") == "corpus-vector-source":
+            os.kill(proc5.pid, signal.SIGSTOP)       # frozen wherever it is: nothing of it runs while B lands
+            before_stop = [e.get("stage") for e in events5]
+            staged_ok = stage_b()
+            os.kill(proc5.pid, signal.SIGCONT)
+    rc5 = proc5.wait(timeout=1800)
+emit(stage="initializer-run", case="restage-valid", run="first", exit=rc5, stages=[e.get("stage") for e in events5],
+     stderr_tail=(root / "restage-valid" / "first.stderr").read_text()[-400:])
+complete5 = next((e for e in events5 if e.get("stage") == "corpus-complete"), None)
+source5 = next((e for e in events5 if e.get("stage") == "corpus-vector-source"), {})
+rc5b, events5b = run_initializer("restage-valid", settings5, "restart")
+try:
+    import chromadb
+    coll5 = init.collection(chromadb.HttpClient(host=hosts["restage-valid"], port=8000), manifest)
+    count5 = coll5.count() if coll5 is not None else None
+except Exception as exc:                                 # noqa: BLE001 -- reported, never hidden
+    count5 = f"{type(exc).__name__}"
+report["restage-valid"] = {
+    "stopped_after": (before_stop or [None])[-1],
+    "failing_shard_imported_before_stop": any(e.get("stage") == "corpus-import" and e.get("shard") == failing
+                                              for e in events5[:len(before_stop or [])]),
+    "sidecar_differs": all(blocks_b[e["archive"]] != (vectors_dir / e["archive"]).read_bytes() for e in manifest_a["shards"])
+                       and manifest_b["fingerprint"] != manifest_a["fingerprint"],
+    "staged_by_helper": staged_ok, "helper_sha256": hashlib.sha256(helper.encode()).hexdigest(),
+    "exit": rc5, "complete": complete5 is not None, "vector_source": source5.get("source"),
+    "rows_match": (complete5 or {}).get("rows") == manifest["rows"],
+    "vectors_match": (complete5 or {}).get("vectors") == manifest["chunks"],
+    "volume_manifest_is_the_restaged": (copied5 / "vectors.json").read_bytes() == manifest_b_bytes,
+    "chroma_count_matches": count5 == manifest["chunks"],
+    "first_reason": reason_of(events5), "judged_manifest_is_the_restaged": (record_of(settings5).get("judged") or {}).get("vectors_manifest", {}).get("sha256") == corpus.sha(manifest_b_bytes),
+    "restart_exit": rc5b, "restart_complete": any(e.get("stage") == "corpus-complete" for e in events5b),
+    "restart_reason": reason_of(events5b), "restart_verdicts_lifted": lifted(events5b)}
+
 emit(stage="initializer-qualification", report=report)
 '''
 
@@ -378,6 +470,7 @@ def qualify(web, chroma, report_path, keep):
             containers.append(name); hosts[case] = name
         time.sleep(3)                                   # the initializer waits for Chroma itself
         proc = subprocess.run(["docker", "run", "--rm", "-i", "--network", network, "--name", f"{network}-web",
+                               "-e", "GSJ_STAGE_HELPER=" + STAGE_HELPER.read_text(),
                                web, "python", "-B", "-", json.dumps(hosts)],
                               input=DRIVER, text=True, capture_output=True, timeout=3 * 3600)
         lines = []
