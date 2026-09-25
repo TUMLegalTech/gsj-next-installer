@@ -105,7 +105,9 @@ network -- code 000 on stdout, a canary on stderr, the way a proxy's error
 page would ride. TEST_CURL_PROXY=407 answers like a proxy that wants
 credentials (http_code 000, http_connect 407, rc 22 for downloads).
 TEST_CURL_REDIRECT_HTTP=1 answers like an origin redirecting to plain HTTP
-(rc 1, code 302). TEST_CURL_PLANT=DIR writes a file at DIR/NAME just before
+(rc 1, code 302). TEST_CURL_CORPUS_ASSET_UNREACHED=1 answers the corpus
+manifest's redirect but not the asset host (rc 7, code 302, the asset's URL
+effective). TEST_CURL_PLANT=DIR writes a file at DIR/NAME just before
 serving NAME. Every argv is logged. The write-out is '%{http_code}
 %{http_connect}' as init asks for it."""
 import json, os, pathlib, shutil, sys
@@ -143,6 +145,9 @@ if "--write-out" in a:
         # answer stays the 302
         asset = "https://release-assets.githubusercontent.com/github-production-release-asset/1/vectors.json?X-Amz-Signature=" + canary
         if os.environ.get("TEST_CURL_CORPUS_REDIRECT_HTTP") == "1": sys.stdout.write("302 000 " + url); print("curl: (1) Protocol http not supported " + canary, file=sys.stderr); sys.exit(1)
+        # the asset host does not answer: the redirect was followed (the effective
+        # URL is the asset's, signed query and all), the connection failed (rc 7)
+        if os.environ.get("TEST_CURL_CORPUS_ASSET_UNREACHED") == "1" and "--location" in a: sys.stdout.write("302 000 " + asset); print("curl: (7) Failed to connect to release-assets.githubusercontent.com port 443 " + canary, file=sys.stderr); sys.exit(7)
         if "--location" not in a: sys.stdout.write("302 000" + (" " + url if effective else "")); sys.exit(0)
         code = os.environ.get("TEST_CURL_CORPUS_CODE", "200")
         sys.stdout.write(code + " 000" + (" " + (asset if code[0] != "4" and code[0] != "5" else url) if effective else "")); sys.exit(0)
@@ -774,6 +779,28 @@ def test_a_redirect_to_plain_http_is_named_as_refused_not_as_a_failed_download(t
     row = _check(_report(result), "release-verification")
     assert "redirected to a location that is not HTTPS (HTTP 302)" in row["detail"]
     assert box.beside() == []
+
+
+def test_an_asset_host_that_cannot_be_reached_is_named_as_unreached_not_as_a_bad_redirect(tmp_path, keypair):
+    """github.com answers, redirects the corpus manifest to the asset host, and
+    the asset host cannot be reached: the row says that -- the redirect was
+    followed and the host it led to did not answer -- and stays a FAIL. It is
+    not "not HTTPS, or too many redirects" (a 302 that STAYED), which blames
+    a rewriting proxy the box does not have; and the asset URL's signed query
+    is never repeated."""
+    box = Box(tmp_path, keypair)
+    box.serve(box.assets)
+    result = box.run(TEST_CURL_CORPUS_ASSET_UNREACHED="1")
+    assert result.returncode == 3
+    report = _report(result)
+    row = _check(report, "egress-github")
+    assert row["status"] == "FAIL"
+    assert "release-assets.githubusercontent.com" in row["detail"] and "could not be reached" in row["detail"]
+    assert "redirect was followed" in row["detail"]
+    assert "not HTTPS" not in row["detail"] and "too many redirects" not in row["detail"]
+    assert "release-assets.githubusercontent.com" in row["fix"]
+    assert report["summary"]["egress"] == "partial"
+    _no_leak(box, result)
 
 
 def test_a_file_the_origin_does_not_publish_is_named_without_the_no_egress_advice(tmp_path, keypair):

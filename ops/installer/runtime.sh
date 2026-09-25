@@ -5760,10 +5760,17 @@ init_reach_corpus() {
  # nothing answered. The manifest is a few KB; nothing of it is kept. Only
  # the ORIGIN of the effective URL is ever printed: a release asset's URL
  # carries a signed query.
- local answer code connect effective
- answer=$(curl -q --silent --output /dev/null --location --proto-redir '=https' --connect-timeout 10 --max-time 30 --write-out '%{http_code} %{http_connect} %{url_effective}' "$1" </dev/null 2>/dev/null) || true
+ local answer code connect effective origin rc=0
+ answer=$(curl -q --silent --output /dev/null --location --proto-redir '=https' --connect-timeout 10 --max-time 30 --write-out '%{http_code} %{http_connect} %{url_effective}' "$1" </dev/null 2>/dev/null) || rc=$?
  read -r code connect effective <<< "${answer:-000 000 $1}"; code=${code:-000}; connect=${connect:-000}
- case $connect in 000|200) printf '%s %s' "$code" "$(url_origin_only "${effective:-$1}")";; *) printf 'proxy:%s' "$connect";; esac
+ case $connect in 000|200) ;; *) printf 'proxy:%s' "$connect"; return 0;; esac
+ origin=$(url_origin_only "${effective:-$1}")
+ # curl's exit says what its last answer cannot: when the redirect WAS followed
+ # (the effective URL moved to another origin) and that origin gave no answer,
+ # the code still reads the first hop's 3xx -- that is "unreached:RC ORIGIN",
+ # not a redirect the download cannot follow. A redirect refused (not HTTPS,
+ # rc 1) or one too many (rc 47) keeps the 3xx and is reported as that.
+ if (( rc != 0 && rc != 1 && rc != 47 )) && [[ $origin != "$(url_origin_only "$1")" ]]; then printf 'unreached:%s %s' "$rc" "$origin"; else printf '%s %s' "$code" "$origin"; fi
 }
 init_free_bytes() {
  # $1 an existing path: "DEVICE FREE-BYTES MOUNTPOINT", or "unknown 0 unknown"
@@ -6019,6 +6026,7 @@ init_box() {
  case $code_github in
    000) init_row egress-github FAIL 'no answer' "$corpus_what did not answer: the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine" 'open egress or export a proxy for this machine (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
    proxy:*) init_row egress-github FAIL "proxy answered HTTP ${code_github#proxy:}" "the proxy this machine uses answered HTTP ${code_github#proxy:} to the connection for github.com" 'give the proxy its credentials or an exemption for github.com and release-assets.githubusercontent.com (the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
+   unreached:*) init_row egress-github FAIL "no answer from ${corpus_origin#https://}" "$corpus_what redirected the download to $corpus_origin; the redirect was followed and $corpus_origin could not be reached (the connection failed, curl exit ${code_github#unreached:}), so the corpus release (about 1.5 GiB, from github.com and release-assets.githubusercontent.com) cannot be downloaded from this machine" 'open egress to release-assets.githubusercontent.com as well as github.com (a firewall or proxy exemption for both hosts; the guide, step 1), or stage the corpus files locally (corpus.vectors_path)';;
    2??) if [[ -n $corpus_tag ]]; then init_row egress-github PASS "HTTP $code_github from ${corpus_origin#https://}" "$corpus_what answered HTTP $code_github from $corpus_origin, its redirect followed: the route the corpus release is downloaded over is open from this machine"
         else init_row egress-github PASS "HTTP $code_github" "$corpus_what answered HTTP $code_github"; fi;;
    3??) init_row egress-github FAIL "HTTP $code_github" "$corpus_what redirected to a location the download cannot follow (HTTP $code_github: not HTTPS, or too many redirects); the corpus release was not proved downloadable" 'find what rewrites redirects between this machine and github.com (a proxy, a portal), or stage the corpus files locally (corpus.vectors_path)';;
@@ -6032,7 +6040,7 @@ init_box() {
    4??) init_row egress-ghcr FAIL "HTTP $code_ghcr" "ghcr.io answered HTTP $code_ghcr: the request was refused, by ghcr.io or by something between this machine and it (a portal, a content filter, a rate limit); the nodes pull the images, so prove their route in step 4" 'find what refuses ghcr.io from this machine, or mirror the six images into a registry the nodes reach (registry.base)';;
    *) init_row egress-ghcr FAIL "HTTP $code_ghcr" "ghcr.io answered HTTP $code_ghcr: an error at ghcr.io or at something between this machine and it; the nodes pull the images, so prove their route in step 4" 'run init again later; if the answer stays, mirror the six images into a registry the nodes reach (registry.base)';;
  esac
- if [[ $code_github == 000 && $code_ghcr == 000 ]]; then egress=none; elif [[ $code_github != 000 && $code_github != proxy:* && $code_ghcr != 000 && $code_ghcr != proxy:* ]]; then egress=full; else egress=partial; fi
+ if [[ $code_github == 000 && $code_ghcr == 000 ]]; then egress=none; elif [[ $code_github != 000 && $code_github != proxy:* && $code_github != unreached:* && $code_ghcr != 000 && $code_ghcr != proxy:* ]]; then egress=full; else egress=partial; fi
  # 4 -- THE BOX: room for the corpus download, the OS, the architecture. The
  # rule is stage_vectors' (above): one filesystem holds blocks and envelope.
  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/gsj-install" tmpdir="${TMPDIR:-/tmp}" cache_device cache_free cache_mount work_device work_free work_mount
