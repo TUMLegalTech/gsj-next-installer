@@ -385,9 +385,10 @@ except Exception as exc:                                 # noqa: BLE001 -- repor
     count5 = f"{type(exc).__name__}"
 shards_at_stop = (checkpoint_at_stop or {}).get("shards") or {}
 shards_judged_at_stop = sum(1 for r in shards_at_stop.values() if r.get("attempts") or r.get("complete") or r.get("terminal"))
+# current.json is not a witness: the initializer writes it before any shard is
+# judged. The checkpoint's phase and its shard records are.
 stopped_before_import = (checkpoint_at_stop is not None and checkpoint_at_stop.get("phase") != "complete"
-                         and shards_judged_at_stop == 0
-                         and not (Path(settings5["state"]) / "current.json").exists())
+                         and shards_judged_at_stop == 0)
 report["restage-valid"] = {
     "stopped_after": (before_stop or [None])[-1],
     "stopped_before_import": stopped_before_import, "shards_judged_at_stop": shards_judged_at_stop,
