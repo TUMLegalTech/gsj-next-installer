@@ -1969,8 +1969,8 @@ already. Unless the site is meant to embed its own, different store, set
 
 ```json
 "corpus": {
-  "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.f93c956f/vectors.json",
-  "vectors_sha256": "15bf3fb0530af8e2cb3941f0b35bf2454cc3d21bad55a467465f5939a502399c"
+  "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.13c5dee7/vectors.json",
+  "vectors_sha256": "b3281726c7ddac5258674c19f9d64180bfec1d820c428ab164b93e2a2f292692"
 }
 ```
 
@@ -2036,8 +2036,8 @@ The OCR URL is the complete OpenAI-compatible chat-completions URL.
   "deadlines": {"initialization_seconds": 86400},
   "registry": {"config_file": "credentials/registry-auth.json", "pull_secret": "gsj-pull"},
   "corpus": {
-    "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.f93c956f/vectors.json",
-    "vectors_sha256": "15bf3fb0530af8e2cb3941f0b35bf2454cc3d21bad55a467465f5939a502399c"
+    "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.13c5dee7/vectors.json",
+    "vectors_sha256": "b3281726c7ddac5258674c19f9d64180bfec1d820c428ab164b93e2a2f292692"
   }
 }
 ```
@@ -2507,8 +2507,8 @@ tail -n "+$marker" "$INSTALLER" | base64 --decode | tar -xzO release.json \
 
 That prints `fingerprint` and `manifest_sha256` alongside the memory figures.
 **Check the `fingerprint` against the trailing segment of the corpus tag you are
-about to configure** — the `f93c956f` in
-`corpus-1.snowflake-m-v2-int8-768.f93c956f` is the first eight characters of
+about to configure** — the `13c5dee7` in
+`corpus-1.snowflake-m-v2-int8-768.13c5dee7` is the first eight characters of
 that fingerprint, and a mismatch is fatal, discovered only after the download
 and the import. The same payload also carries `site.schema.json`, which is the
 complete field reference for the site file and the "configuration schema" the
@@ -3011,8 +3011,8 @@ site at the MANIFEST; its blocks are fetched as siblings from the same release:
 
 ```json
 "corpus": {
-  "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.f93c956f/vectors.json",
-  "vectors_sha256": "15bf3fb0530af8e2cb3941f0b35bf2454cc3d21bad55a467465f5939a502399c"
+  "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.13c5dee7/vectors.json",
+  "vectors_sha256": "b3281726c7ddac5258674c19f9d64180bfec1d820c428ab164b93e2a2f292692"
 }
 ```
 
@@ -3020,7 +3020,7 @@ site at the MANIFEST; its blocks are fetched as siblings from the same release:
 publish it beside the tag. Every block's digest is inside the manifest, so that
 one hash covers the whole 1.5 GiB set. The release tag names the model
 generation and the corpus generation — `corpus-1` is the decisions and parser,
-`snowflake-m-v2-int8-768` the encoder, and the trailing `f93c956f` the **first
+`snowflake-m-v2-int8-768` the encoder, and the trailing `13c5dee7` the **first
 eight characters** of the 64-character corpus fingerprint the initializer checks
 against — so a corpus built for a different
 model can never be pointed at this one by accident.
@@ -3092,7 +3092,7 @@ Same artifact, same digests, same verification.
 ```json
 "corpus": {
   "vectors_path": "/srv/gsj-vectors/vectors.json",
-  "vectors_sha256": "15bf3fb0530af8e2cb3941f0b35bf2454cc3d21bad55a467465f5939a502399c"
+  "vectors_sha256": "b3281726c7ddac5258674c19f9d64180bfec1d820c428ab164b93e2a2f292692"
 }
 ```
 

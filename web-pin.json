@@ -1,35 +1,35 @@
 {
   "schema": "gsj.web-pin/1",
   "repository": "TUMLegalTech/gsj-next-web",
-  "commit": "228ba86b8b6942a9f8bf4553afc41879377ff52a",
-  "release": "v0.10.0-beta.5",
+  "commit": "1fcb001c756890bfbb69f789301dc4e02eed4285",
+  "release": "v0.10.0-beta.6",
   "chart": {
-    "version": "0.10.0-beta.5",
-    "tree": "eb2cf0f5dfe4297cdd6a1d84c759700ba9aeebde",
-    "sha256": "3a390fba848ef44287edb166f0cefa9833583668852c31ae68303bd836d45a60"
+    "version": "0.10.0-beta.6",
+    "tree": "e9ae4151adcc6104d27890d7cef6e2e93028b242",
+    "sha256": "41de0e557e3ea6d8f6e8d46a27a5c74f41be78bd8fcf877e7c80f902d934e2d0"
   },
   "gsj_deploy": {
-    "tree": "cad78b4e929393f374d09c74c6991a63ef30f2ac"
+    "tree": "c8131a2476207bffc77134e10d01d1cdade1f16d"
   },
   "core": {
-    "tag": "v4.12.1-snowflake"
+    "tag": "v4.13.0-fixes"
   },
   "images": {
     "web": {
       "repository": "ghcr.io/tumlegaltech/gsj-web",
-      "digest": "sha256:a78e29d2186718453db92112969cd1547ca7ec94906296753ff75d5e80bdc4f3"
+      "digest": "sha256:8d2c9b7e875b2e374edb5dc93da6d623ef72e982410843036df5f64322532da4"
     },
     "runner": {
       "repository": "ghcr.io/tumlegaltech/gsj-agent-runner",
-      "digest": "sha256:ffc15243d5a83d062521b228f9a7411dcbc734057c1d1faa63b51de872e551e8"
+      "digest": "sha256:0d73e4b65423523777591aad8e69624b28ae1233b699f9d73955eee0504d598b"
     },
     "mcp": {
       "repository": "ghcr.io/tumlegaltech/gsj-next-mcp",
-      "digest": "sha256:b0ba5340809a80b72626137588669e6ac4032f0b217301e82b80c826119e542e"
+      "digest": "sha256:d0c7b79f6b434e5805c0c18f99b266aaf0346affe8f0a638d1c80252163ef1a2"
     },
     "decisionsData": {
       "repository": "ghcr.io/tumlegaltech/gsj-decisions-data",
-      "digest": "sha256:a38161523e8d3e08070c2a3c2e45085f941c70edf78eaefb4fe6fb14c9a7cd0e"
+      "digest": "sha256:40c2b3ca622ede00999ddd682994877c46edb8b6610b68ce7c2f7033e262f77c"
     }
   }
 }

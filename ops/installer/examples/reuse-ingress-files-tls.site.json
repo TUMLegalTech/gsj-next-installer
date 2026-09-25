@@ -56,7 +56,7 @@
     "pull_secret": "gsj-pull"
   },
   "corpus": {
-    "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.f93c956f/vectors.json",
-    "vectors_sha256": "15bf3fb0530af8e2cb3941f0b35bf2454cc3d21bad55a467465f5939a502399c"
+    "vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.13c5dee7/vectors.json",
+    "vectors_sha256": "b3281726c7ddac5258674c19f9d64180bfec1d820c428ab164b93e2a2f292692"
   }
 }

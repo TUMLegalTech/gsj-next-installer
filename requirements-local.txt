@@ -18,6 +18,6 @@
 #
 # The generated installer needs none of this: it runs on Bash, jq, kubectl and
 # Helm. These are the tests' and the builder's dependencies only.
-gsj[cli] @ git+file://${GSJ_NEXT_DIR}@v4.12.1-snowflake
-gsj-web[dev] @ git+file://${GSJ_NEXT_WEB_DIR}@228ba86b8b6942a9f8bf4553afc41879377ff52a
+gsj[cli] @ git+file://${GSJ_NEXT_DIR}@v4.13.0-fixes
+gsj-web[dev] @ git+file://${GSJ_NEXT_WEB_DIR}@1fcb001c756890bfbb69f789301dc4e02eed4285
 -r ops/installer/ci/regression-requirements.txt
