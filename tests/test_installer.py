@@ -2731,3 +2731,87 @@ def test_the_closing_line_knows_every_skip_reason_the_verifier_can_record():
     assert words == set(recorded), {"installer": sorted(words), "verifier": sorted(recorded)}
     assert set(verify.SKIP_REASONS) == {"llm-absent", "llm-no-model-list", "ocr-absent", "ocr-unreachable",
                                         "ocr-refused", "ocr-not-a-chat-completion", "ocr-no-page-text"}
+
+
+# --- the repair recovers: one restart on the staged blocks [review, the major] ---
+
+def _initializer_pods(state):
+    """the application Pod's corpus-initialize status: waiting after a verdict,
+    or running (the restart after the staging)"""
+    if state == "waiting":
+        status = {"name": "corpus-initialize", "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                  "lastState": {"terminated": {"exitCode": 1, "message": "gsj-corpus:source-verification-failed"}}}
+    else:
+        status = {"name": "corpus-initialize", "state": {"running": {}}}
+    return {"items": [{"metadata": {"name": "synthetic-web-1"}, "status": {"phase": "Pending", "initContainerStatuses": [status]}}]}
+
+
+def _deploy(ready):
+    return {"metadata": {"generation": 1}, "status": {"observedGeneration": 1, "updatedReplicas": 1,
+                                                       "availableReplicas": 1 if ready else 0, "readyReplicas": 1 if ready else 0}}
+
+
+def _wait_application(runtime, staged_in_this_run, verdict_persists):
+    run, _, work = runtime
+    site = _site(); site["deadlines"] = {"initialization_seconds": 60, "dependencies_seconds": 60}
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "pods-waiting.json").write_text(json.dumps(_initializer_pods("waiting")))
+    (work / "pods-running.json").write_text(json.dumps(_initializer_pods("running")))
+    (work / "deploy-not-ready.json").write_text(json.dumps(_deploy(False)))
+    (work / "deploy-ready.json").write_text(json.dumps(_deploy(True)))
+    script = f'''
+k() {{
+  case "$1 $2" in
+    "get deploy") if [[ -f $TEST_WORK/recovered ]]; then cat "$TEST_WORK/deploy-ready.json"; else cat "$TEST_WORK/deploy-not-ready.json"; fi;;
+    "get pods") if [[ -f $TEST_WORK/deleted && {'false' if verdict_persists else 'true'} == true ]]; then cat "$TEST_WORK/pods-running.json"; else cat "$TEST_WORK/pods-waiting.json"; fi;;
+    "delete pod") printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-deletes"; : > "$TEST_WORK/deleted";;
+    "logs "*) :;;
+    *) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-other";;
+  esac
+}}
+assert_owner() {{ :; }}; helm_application_validate() {{ :; }}
+sleep() {{ [[ -f $TEST_WORK/deleted && {'false' if verdict_persists else 'true'} == true ]] && : > "$TEST_WORK/recovered"; polls=$((${{polls:-0}}+1)); (( polls < 4 )) || exit 97; }}
+OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; CONFIG="$TEST_WORK/site.json"; RELEASE=synthetic-release
+{'VECTORS_STAGED_IN_THIS_RUN=true' if staged_in_this_run else ''}
+wait_application
+'''
+    result = run(script)
+    deletes = (work / "kubectl-deletes").read_text().splitlines() if (work / "kubectl-deletes").exists() else []
+    return result, deletes
+
+
+def test_a_source_verification_verdict_before_the_staging_gets_one_restart_on_the_staged_blocks(runtime):
+    """The review's major, the installer's half: every recovery pipeline runs
+    helm_apply, then stage_vectors, then wait_application -- the initializer
+    starts before the blocks are staged, judges what it finds, exits at once,
+    and the kubelet's backoff between its restarts grows to five minutes.
+    wait_application's first poll found the container waiting with that
+    verdict as its last termination and stopped the operation as terminal
+    ("run: gsj-install.sh repair ..."), while the Pod would have recovered on
+    its next restart. The verdict binds to the bytes the attempt read, so ONE
+    fresh attempt on the staged bytes decides: the Pod is recreated at once
+    and the wait goes on; the operation completes when the restart imports."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False)
+    assert result.returncode == 0, result.stderr
+    assert deletes == ["delete pod synthetic-web-1 --wait=false"], deletes
+    assert "restarting it once on the staged blocks" in result.stderr
+    assert "stopped terminally" not in result.stderr
+
+
+def test_a_verdict_that_persists_after_the_restart_on_the_staged_blocks_is_terminal(runtime):
+    """A second such verdict is on the staged bytes: terminal, the named
+    repair -- and only one restart is ever forced."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=True)
+    assert result.returncode == 1, result.stderr
+    assert deletes == ["delete pod synthetic-web-1 --wait=false"], deletes
+    assert "stopped terminally (source-verification-failed)" in result.stderr and "repair --operation aaaaaaaaaaaaaaaaaaaaaaaa" in result.stderr
+
+
+def test_a_source_verification_verdict_with_no_staging_in_this_run_is_terminal_at_once(runtime):
+    """Without a staging in this run there is nothing the verdict could
+    predate: terminal at the first poll, no restart (a resume at a later
+    phase, an image whose copied shard failed its own verification)."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True)
+    assert result.returncode == 1, result.stderr
+    assert deletes == [], deletes
+    assert "stopped terminally (source-verification-failed)" in result.stderr
