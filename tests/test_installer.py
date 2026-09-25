@@ -2735,15 +2735,12 @@ def test_the_closing_line_knows_every_skip_reason_the_verifier_can_record():
 
 # --- the repair recovers: one restart on the staged blocks [review, the major] ---
 
-def _initializer_pods(state):
-    """the application Pod's corpus-initialize status: waiting after a verdict,
-    or running (the restart after the staging)"""
+def _verdict_pods(state):
+    """the application Pod's corpus-initialize status (the helper above):
+    waiting after a verdict, or running (the restart after the staging)"""
     if state == "waiting":
-        status = {"name": "corpus-initialize", "state": {"waiting": {"reason": "CrashLoopBackOff"}},
-                  "lastState": {"terminated": {"exitCode": 1, "message": "gsj-corpus:source-verification-failed"}}}
-    else:
-        status = {"name": "corpus-initialize", "state": {"running": {}}}
-    return {"items": [{"metadata": {"name": "synthetic-web-1"}, "status": {"phase": "Pending", "initContainerStatuses": [status]}}]}
+        return _initializer_pods("corpus-initialize", BACKING_OFF, "gsj-corpus:source-verification-failed")
+    return _initializer_pods("corpus-initialize", {"running": {}})
 
 
 def _deploy(ready):
@@ -2755,8 +2752,8 @@ def _wait_application(runtime, staged_in_this_run, verdict_persists):
     run, _, work = runtime
     site = _site(); site["deadlines"] = {"initialization_seconds": 60, "dependencies_seconds": 60}
     (work / "site.json").write_text(json.dumps(site))
-    (work / "pods-waiting.json").write_text(json.dumps(_initializer_pods("waiting")))
-    (work / "pods-running.json").write_text(json.dumps(_initializer_pods("running")))
+    (work / "pods-waiting.json").write_text(json.dumps(_verdict_pods("waiting")))
+    (work / "pods-running.json").write_text(json.dumps(_verdict_pods("running")))
     (work / "deploy-not-ready.json").write_text(json.dumps(_deploy(False)))
     (work / "deploy-ready.json").write_text(json.dumps(_deploy(True)))
     script = f'''
@@ -2793,7 +2790,7 @@ def test_a_source_verification_verdict_before_the_staging_gets_one_restart_on_th
     and the wait goes on; the operation completes when the restart imports."""
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False)
     assert result.returncode == 0, result.stderr
-    assert deletes == ["delete pod synthetic-web-1 --wait=false"], deletes
+    assert deletes == ["delete pod synthetic-web --wait=false"], deletes
     assert "restarting it once on the staged blocks" in result.stderr
     assert "stopped terminally" not in result.stderr
 
@@ -2803,7 +2800,7 @@ def test_a_verdict_that_persists_after_the_restart_on_the_staged_blocks_is_termi
     repair -- and only one restart is ever forced."""
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=True)
     assert result.returncode == 1, result.stderr
-    assert deletes == ["delete pod synthetic-web-1 --wait=false"], deletes
+    assert deletes == ["delete pod synthetic-web --wait=false"], deletes
     assert "stopped terminally (source-verification-failed)" in result.stderr and "repair --operation aaaaaaaaaaaaaaaaaaaaaaaa" in result.stderr
 
 
