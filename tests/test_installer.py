@@ -2473,38 +2473,228 @@ def test_the_summary_keeps_and_prints_only_the_origin_of_every_site_url(runtime)
     assert "@" not in origins.replace("[^/@?#:", "").replace("[^/@?#", "") and origins.endswith("*$(?![\\s\\S])")
 
 
-def test_no_printed_url_bypasses_url_origin_only():
-    """The bypass test [review B2]: in every shell file of the installer,
-    the text a line prints or records -- what follows `log`, `fail`,
-    `printf`, `echo`, the refusal wrappers (any *fail*, lease_still_live)
-    and an assignment later printed (RECOVERY_HINT, note, hint, found, next,
-    fresh, resume, message, line) -- that names a URL (the site's URL
-    fields through `j` or `jq`, or a variable named url / base / *url /
-    *_server / URL) must wrap it in url_origin_only, immediately. A line
-    continued with a backslash is scanned whole; a printf piped into `tee`
-    prints, one piped into a filter derives. A new print that bypasses the
-    function fails here by file and line; the summary's jq is held by the
-    canary test above to its six --arg origins."""
-    urlish = re.compile(r"\$\(j '?\.?[a-z_.]*(url|base_url|acme_server|offbox_url|vectors_url)\b"
-                        r"|\$\(jq [^)]*\.(public_url|base_url|url|acme_server|vectors_url|offbox_url)\b"
-                        r"|\$\{?([A-Za-z_]*url|URL|base|[a-z_]*_server)\b")
-    sinks = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still_live) ['\"]"
+# --- the URL scan [review B2; review B2: the three shapes the review proved] ---
+
+URLISH = (r"\$\(j '?\.?[a-z_.]*(url|base_url|acme_server|offbox_url|vectors_url)\b"
+          r"|\$\(jq [^)]*\.(public_url|base_url|url|acme_server|vectors_url|offbox_url)\b"
+          r"|\$\{?([A-Za-z_]*url|URL|base|[a-z_]*_server)\b")
+URL_SINKS = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still_live) ['\"]"
                        r"|\b(RECOVERY_HINT|note|hint|found|next|fresh|resume|message|line)=)")
+# a filter that DERIVES from its input -- a digest, a field, a count, a file written
+# by the installer's own writers -- so what comes out is not the URL
+URL_DERIVES = re.compile(r"\|\s*(cut|tr|sed|awk|grep|head|tail|sha256sum|shasum|md5sum|openssl|base64|jq|wc|sort|uniq|od|xxd|fold|rev|atomic|immutable_file)\b")
+URL_ASSIGN = re.compile(r"(?:^|[;&|({]\s*|\bthen\s+|\belse\s+|\bdo\s+|\blocal\s+(?:-[A-Za-z]+\s+)*|\bexport\s+|\bdeclare\s+(?:-[A-Za-z]+\s+)*|\s)([A-Za-z_][A-Za-z0-9_]*)=")
+URL_FUNCTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{")
+URL_LOCAL = re.compile(r"\blocal\s+((?:-[A-Za-z]+\s+)*)([^;|&]*)")
+
+
+def _logical_lines(text):
+    """(line number, text) per LOGICAL line: a backslash-newline joins, and so
+    does a newline inside a single- or double-quoted string -- a `log "..."`
+    whose quoted text continues on the next line prints that line too."""
+    out, buf, start, quote, n, i = [], [], 1, None, 1, 0
+    while i < len(text):
+        c = text[i]
+        if quote is None and c == "\\" and text[i + 1:i + 2] == "\n":
+            buf.append(" "); n += 1; i += 2; continue
+        if quote == '"' and c == "\\":
+            buf.append(text[i:i + 2]); i += 2
+            if text[i - 1:i] == "\n":
+                n += 1
+            continue
+        if quote is None and c == "#" and (not buf or buf[-1].endswith((" ", "\t")) or "".join(buf).strip() == ""):
+            end = text.find("\n", i)
+            end = len(text) if end < 0 else end
+            buf.append(text[i:end]); i = end; continue
+        if c == "\n":
+            if quote is None:
+                out.append((start, "".join(buf))); buf = []; n += 1; start = n; i += 1; continue
+            buf.append(" "); n += 1; i += 1; continue
+        if quote is None and c in "'\"":
+            quote = c
+        elif quote == c:
+            quote = None
+        buf.append(c); i += 1
+    if buf:
+        out.append((start, "".join(buf)))
+    return out
+
+
+def _expandable(line):
+    """the line with its single-quoted segments blanked: nothing expands there"""
+    out, i, double = [], 0, False
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and double:
+            out.append(line[i:i + 2]); i += 2; continue
+        if c == '"':
+            double = not double
+        elif c == "'" and not double:
+            end = line.find("'", i + 1)
+            end = len(line) - 1 if end < 0 else end
+            out.append("''"); i = end + 1; continue
+        out.append(c); i += 1
+    return "".join(out)
+
+
+def _value_word(line, start):
+    """the shell word an assignment's value is: its expandable text, with a
+    command substitution kept only when it PRINTS (printf/echo/cat) rather than
+    derives (a pipe into a filter, any other command)"""
+    parts, i, double = [], start, False
+    while i < len(line):
+        c = line[i]
+        if c == "\\":
+            parts.append(line[i:i + 2]); i += 2; continue
+        if c == "'" and not double:
+            end = line.find("'", i + 1); end = len(line) - 1 if end < 0 else end
+            i = end + 1; continue
+        if c == '"':
+            double = not double; i += 1; continue
+        if c == "$" and line[i + 1:i + 2] == "(":
+            depth, j = 0, i + 1
+            while j < len(line):
+                if line[j] == "(":
+                    depth += 1
+                elif line[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            inner = line[i + 2:j].strip()
+            if inner.split(" ", 1)[0] in ("j", "jq") and not URL_DERIVES.search(inner):
+                parts.append(line[i:j + 1])             # a site field read: the URL itself
+            elif inner.split(" ", 1)[0] in ("printf", "echo", "cat") and not URL_DERIVES.search(inner):
+                parts.append(inner)
+            i = j + 1; continue
+        if not double and c in " \t;&|":
+            break
+        parts.append(c); i += 1
+    return "".join(parts)
+
+
+def _unwrapped(urlish, printed):
+    for found in urlish.finditer(printed):
+        before = printed[:found.start()]
+        if not (before.endswith('url_origin_only "') or before.endswith('url_origin_only "$(')):
+            yield found.group(0)
+
+
+def _printed_urls(directory):
+    """Every printed or recorded URL in the shell files of `directory` that did
+    not go through url_origin_only, as `file:line: text`. What prints: the text
+    after `log`, `fail`, `printf`, `echo`, the refusal wrappers (any *fail*,
+    lease_still_live) and an assignment later printed (RECOVERY_HINT, note,
+    hint, found, next, fresh, resume, message, line). What is a URL: the site's
+    URL fields through `j` or `jq`, a variable named url / base / *url /
+    *_server / URL -- and an ALIAS: any name assigned a URL's text unwrapped,
+    under any name, through any chain of assignments (`where=$url`, then
+    `fail "...$where"`), within its function when it is `local` there and
+    everywhere in the file otherwise. A backslash-continued line and a quoted
+    string that spans lines are scanned whole. A printf piped into a filter
+    that derives (cut, tr, sed, a digest...) does not print; one piped into
+    anything else (cat, tee, less, a function) does. Nothing expands inside
+    single quotes, so text there is not a URL."""
     hits = []
-    for path in sorted(INSTALLER.glob("*.sh")):
-        joined = path.read_text().replace("\\\n", " ")
-        for n, line in enumerate(joined.splitlines(), 1):
+    for path in sorted(Path(directory).glob("*.sh")):
+        lines, current = [], None
+        for n, line in _logical_lines(path.read_text()):
             if line.lstrip().startswith("#"):
                 continue
-            for sink in sinks.finditer(line):
+            m = URL_FUNCTION.match(line)
+            if m:
+                current = m.group(1)
+            lines.append((current, n, line))
+            if line == "}":
+                current = None
+        locals_of = {}
+        for fn, _, line in lines:
+            for m in URL_LOCAL.finditer(line):
+                for word in m.group(2).split():
+                    locals_of.setdefault(fn, set()).add(word.split("=", 1)[0])
+        aliases = set()                                 # (function or None, name)
+
+        def urlish_in(fn):
+            names = sorted({name for (scope, name) in aliases if scope is None or scope == fn})
+            return re.compile(URLISH + (r"|\$\{?(" + "|".join(names) + r")\b" if names else ""))
+        changed = True
+        while changed:
+            changed = False
+            for fn, n, line in lines:
+                urlish = urlish_in(fn)
+                for m in URL_ASSIGN.finditer(line):
+                    name = m.group(1)
+                    scope = fn if name in locals_of.get(fn, ()) else None
+                    if (scope, name) not in aliases and any(True for _ in _unwrapped(urlish, _value_word(line, m.end()))):
+                        aliases.add((scope, name)); changed = True
+        for fn, n, line in lines:
+            urlish = urlish_in(fn)
+            line = _expandable(line)
+            for sink in URL_SINKS.finditer(line):
                 printed = line[sink.start():]
-                if printed.startswith("printf") and "|" in printed and "| tee" not in printed:
-                    continue                                   # a printf piped into a filter derives, it does not print
-                for found in urlish.finditer(printed):
-                    before = printed[:found.start()]
-                    if not (before.endswith('url_origin_only "') or before.endswith('url_origin_only "$(')):
-                        hits.append(f"{path.name}:{n}: {found.group(0)}")
-    assert hits == [], hits
+                if printed.startswith("printf") and "|" in printed and URL_DERIVES.search(printed) and "| tee" not in printed:
+                    continue                            # a printf piped into a filter derives, it does not print
+                for found in _unwrapped(urlish, printed):
+                    hits.append(f"{path.name}:{n}: {found}")
+    return hits
+
+
+def test_no_printed_url_bypasses_url_origin_only():
+    """The bypass test [review B2]: in every shell file of the installer, the
+    text a line prints or records that names a URL must wrap it in
+    url_origin_only, immediately -- see _printed_urls for what prints, what
+    is a URL, and the three shapes the pre-release review proved past the
+    previous scan [review B2]: a quoted string continued on the next
+    line, an aliased URL under another name, and a printf piped into `cat`.
+    A new print that bypasses the function fails here by file and line; the
+    summary's jq is held by the canary test above to its six --arg origins."""
+    assert _printed_urls(INSTALLER) == []
+
+
+URL_SCAN_MUTANTS = {
+    "a quoted log line continued on the next line": 'mutant() {\n local url=$1\n log "the released vectors manifest could not be acquired from\n$url (transport exit 7)"\n}\n',
+    "a backslash-continued fail": 'mutant() {\n local url=$1\n fail "the released vectors manifest could not be acquired" \\\n   "from $url"\n}\n',
+    "an aliased error text": 'mutant() {\n local url=$1 where\n where=$url\n fail "cannot reach $where"\n}\n',
+    "an aliased error text under a global name": 'mutant() {\n MUTANT_WHERE="from $(j .corpus.vectors_url)"\n}\nmutant_print() {\n log "$MUTANT_WHERE"\n}\n',
+    "an alias of an alias": 'mutant() {\n local url=$1 first second\n first="at $url"\n second=$first\n printf \'%s\\n\' "$second"\n}\n',
+    "a printf piped into cat": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | cat\n}\n',
+    "a printf piped into tee": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | tee "$GSJ_WORK/x"\n}\n',
+    "a printf piped into a pager": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | less\n}\n',
+    "an echo of the site field": 'mutant() {\n echo "at $(j .llm.base_url)"\n}\n',
+}
+URL_SCAN_CLEAN = {
+    "the origin": 'clean() {\n local url=$1\n log "could not be acquired from $(url_origin_only "$url")"\n}\n',
+    "an alias of the origin": 'clean() {\n local url=$1 origin\n origin=$(url_origin_only "$url")\n fail "cannot reach $origin"\n}\n',
+    "a derivation": 'clean() {\n local url=$1 host\n host=$(printf \'%s\' "$url" | sed -E \'s#https://([^/:]+).*#\\1#\')\n log "host $host"\n}\n',
+    "a printf piped into a digest": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sha256sum\n}\n',
+    "a single-quoted literal": "clean() {\n log 'set corpus.vectors_url in the site file'\n}\n",
+    "a URL passed to a command": 'clean() {\n local url=$1 code\n code=$(curl --silent --output /dev/null --write-out \'%{http_code}\' "$url" || true)\n log "answered HTTP $code"\n}\n',
+    "a local of the same name in another function": 'other() {\n local where=$1\n where="registry.base ($(url_origin_only "$where"))"\n}\nclean() {\n local where=$1\n log "$where is not a plain file"\n}\n',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(URL_SCAN_MUTANTS))
+def test_the_url_scan_fails_on_the_shapes_the_review_planted(tmp_path, shape):
+    """Each shape the pre-release review emitted a canary through without
+    failing the previous scan -- and the neighbours of each -- is found by
+    file and line when planted into a copy of the installer's own files."""
+    for path in INSTALLER.glob("*.sh"):
+        shutil.copy(path, tmp_path / path.name)
+    (tmp_path / "runtime.sh").write_text((tmp_path / "runtime.sh").read_text() + "\n" + URL_SCAN_MUTANTS[shape])
+    hits = _printed_urls(tmp_path)
+    assert hits and all(h.startswith("runtime.sh:") for h in hits), (shape, hits)
+    assert all(int(h.split(":")[1]) > len((INSTALLER / "runtime.sh").read_text().splitlines()) for h in hits), hits
+
+
+@pytest.mark.parametrize("shape", sorted(URL_SCAN_CLEAN))
+def test_the_url_scan_passes_the_forms_the_code_uses(tmp_path, shape):
+    """The origin, an alias of the origin, a derivation through a filter, a
+    digest, a single-quoted literal, a URL handed to a command, and a local
+    that shares its name with another function's alias: no hit."""
+    for path in INSTALLER.glob("*.sh"):
+        shutil.copy(path, tmp_path / path.name)
+    (tmp_path / "runtime.sh").write_text((tmp_path / "runtime.sh").read_text() + "\n" + URL_SCAN_CLEAN[shape])
+    assert _printed_urls(tmp_path) == []
 
 
 # --- review finding M7: the guide names the key file the release carries ---

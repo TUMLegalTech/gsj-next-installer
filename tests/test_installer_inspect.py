@@ -61,7 +61,7 @@ def objects():
     }
 
 
-def inspect(runtime, data, unavailable=()):
+def inspect(runtime, data, unavailable=(), proxy=None):
     run, _, work = runtime
     source = work / "inspection-input.json"
     source.write_text(json.dumps(data))
@@ -83,7 +83,7 @@ kubectl() {{ {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"; }}
 helm() {{ printf 'v4.2.2+synthetic'; }}
 getconf() {{ printf '2'; }}
 inspect_cluster
-''', INSPECT_INPUT=str(source), INSPECT_UNAVAILABLE=json.dumps(list(unavailable)))
+''', INSPECT_INPUT=str(source), INSPECT_UNAVAILABLE=json.dumps(list(unavailable)), **({"HTTPS_PROXY": proxy} if proxy else {}))
     assert result.returncode == 0, result.stderr
     assert SENTINEL not in result.stdout + result.stderr
     return json.loads(result.stdout)
@@ -333,3 +333,24 @@ def test_a_denied_helm_read_yields_no_rows_rather_than_a_fabricated_one(tmp_path
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == []
+
+
+@pytest.mark.parametrize("proxy,origin", [
+    ("http://user:ZZSECRETCANARY@proxy.example:3128/ZZSECRETCANARY?token=ZZSECRETCANARY#ZZSECRETCANARY", "proxy.example:3128"),
+    ("proxy.example:3128?REVIEW_PROXY_QUERY_SECRET", "proxy.example:3128"),
+    ("https://proxy.example/path#ZZSECRETCANARY", "proxy.example"),
+    ("http://user:pw/ZZSECRETCANARY@proxy.example:3128", "(not a valid http(s) address)"),
+])
+def test_the_profile_keeps_only_the_origin_of_the_proxy(runtime, proxy, origin):
+    """review B2: the proxy field stripped userinfo, scheme and path by
+    hand and kept the QUERY and the FRAGMENT -- a full `init` run wrote
+    `proxy.example?REVIEW_PROXY_QUERY_SECRET` into the report's
+    .inspect.profile.networking.egress.proxy_origin. The field goes through
+    url_origin_only, the one function: the host and port of the proxy, a
+    scheme-less value lent one for the parse, an authority that is not a host
+    named by the fixed words, and never the query, the fragment, the path or
+    the userinfo."""
+    profile = inspect(runtime, profile_objects(), proxy=proxy)
+    assert profile["profile"]["networking"]["egress"] == {**profile["profile"]["networking"]["egress"],
+                                                          "proxy_configured": True, "proxy_origin": origin}
+    assert "ZZSECRETCANARY" not in json.dumps(profile) and "REVIEW_PROXY_QUERY_SECRET" not in json.dumps(profile)

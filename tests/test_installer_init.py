@@ -1105,9 +1105,11 @@ def test_help_lists_init_and_the_verifier_and_inspect_are_pinned(runtime):
     pinned = re.search(r"^INIT_VERIFIER_SHA256=([0-9a-f]{64})$", source, re.M).group(1)
     assert pinned == hashlib.sha256((INSTALLER / "verify-release.sh").read_bytes()).hexdigest(), \
         "verify-release.sh changed: update INIT_VERIFIER_SHA256 in runtime.sh (init executes only the published verifier)"
-    # inspect_cluster is byte-identical to the text init was built on (base 833fe99)
+    # inspect_cluster is byte-identical to the text init was built on: the
+    # fix-pass-installer head whose proxy field goes through url_origin_only
+    # (re-pinned deliberately at that merge; before it, base 833fe99's text)
     body = source[source.index("\ninspect_cluster() {"):source.index("\nquantity_bytes() {")]
-    assert hashlib.sha256(body.encode()).hexdigest() == "cc3e4e02631f4b4c1d259b1b7471c4cc6626f8ca3fa81d82594eaa829f3d93cd", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
+    assert hashlib.sha256(body.encode()).hexdigest() == "861eee2b780591f89ea8dc1b7c1d07082554717af04d98278aa337744c629788", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
 
 
 def test_the_guides_check_table_names_exactly_the_checks_init_writes():

@@ -195,7 +195,9 @@ def main():
     import pytest
     results = Results()
     files = suites()
-    rc = pytest.main(["-q", "-rs", "-p", "no:cacheprovider", *("tests/" + name for name in files)], plugins=[results])
+    # -ra: the short summary names every failure, error, skip and xfail -- a gate
+    # that printed skips alone lost the identity of a red it counted
+    rc = pytest.main(["-q", "-ra", "-p", "no:cacheprovider", *("tests/" + name for name in files)], plugins=[results])
     reasons = verdict(results, files, rc)
     pin = webpin.load()
     report = {"schema": "gsj.full-suite/1", "status": "passed" if not reasons else "failed", "reasons": reasons,

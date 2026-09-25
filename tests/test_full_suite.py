@@ -138,3 +138,12 @@ def test_the_gate_refuses_any_helm_but_the_engineered_client(tmp_path, monkeypat
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     lines = [line for line in full_suite.missing_prerequisites() if "helm" in line]
     assert lines and engineered in lines[0]
+
+
+def test_the_gate_names_every_failure_in_its_short_summary():
+    """The gate ran pytest with `-rs`, so its log named the skips
+    and not the failures -- one red of a 1,819-test run was counted and never
+    named. `-ra` prints every failure, error, skip and xfail by id."""
+    source = (ROOT / "ops/installer/ci/full-suite.py").read_text()
+    call = source[source.index("pytest.main(["):source.index("], plugins=[results])")]
+    assert '"-ra"' in call and '"-rs"' not in call, call
