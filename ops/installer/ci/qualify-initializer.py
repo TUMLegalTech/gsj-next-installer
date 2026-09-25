@@ -27,7 +27,11 @@ and passes only when all five hold:
            the verdict is bound to the staged content it judged, never to the shard alone
            (the pre-release review's interleaving);
   restage-valid
-           a VALID sidecar restaged after the initializer loaded the vectors manifest --
+           a VALID sidecar restaged after the initializer loaded the vectors manifest
+           and BEFORE it judged any shard -- the driver stops the initializer at that
+           point and proves it from the initializer's own checkpoint; a stop that
+           came after the import had completed judges nothing and the case is
+           "not exercised", never passed --
            the same vectors repacked, other digests, another fingerprint, installed by the
            release's own staging helper (blocks first, the manifest last) while the
            initializer is stopped right after `corpus-vector-source` -- is imported: each
@@ -81,7 +85,8 @@ EXPECTED = {
                 "restaged_exit": 0, "restaged_verdicts_lifted": 1, "restaged_complete": True,
                 "restaged_vector_source": "released", "restaged_rows_match": True, "restaged_vectors_match": True,
                 "restaged_shard_complete": True, "restaged_shard_imported": True, "restaged_chroma_count_matches": True},
-    "restage-valid": {"stopped_after": "corpus-vector-source", "failing_shard_imported_before_stop": False,
+    "restage-valid": {"stopped_after": "corpus-vector-source", "stopped_before_import": True,
+                      "shards_judged_at_stop": 0, "failing_shard_imported_before_stop": False,
                       "sidecar_differs": True, "staged_by_helper": True, "exit": 0, "complete": True,
                       "vector_source": "released", "rows_match": True, "vectors_match": True,
                       "volume_manifest_is_the_restaged": True, "chroma_count_matches": True,
@@ -350,7 +355,7 @@ path5 = root / "restage-valid" / "settings-first.json"; path5.write_text(json.du
 with open(root / "restage-valid" / "first.stderr", "w") as err5:
     proc5 = subprocess.Popen([sys.executable, "-B", "-m", "gsj_deploy.initialize", "--settings", str(path5)],
                              stdout=subprocess.PIPE, stderr=err5, text=True)
-    events5, before_stop, staged_ok = [], None, None
+    events5, before_stop, staged_ok, checkpoint_at_stop = [], None, None, None
     for line in proc5.stdout:
         try:
             event = json.loads(line)
@@ -360,6 +365,10 @@ with open(root / "restage-valid" / "first.stderr", "w") as err5:
         if before_stop is None and event.get("stage") == "corpus-vector-source":
             os.kill(proc5.pid, signal.SIGSTOP)       # frozen wherever it is: nothing of it runs while B lands
             before_stop = [e.get("stage") for e in events5]
+            # The precondition, read off the initializer's OWN checkpoint while it is
+            # frozen -- never off the events read so far, which lag the process:
+            # nothing judged yet means the restaged B is what gets judged.
+            checkpoint_at_stop = checkpoint_of(settings5) or {}
             staged_ok = stage_b()
             os.kill(proc5.pid, signal.SIGCONT)
     rc5 = proc5.wait(timeout=1800)
@@ -374,8 +383,18 @@ try:
     count5 = coll5.count() if coll5 is not None else None
 except Exception as exc:                                 # noqa: BLE001 -- reported, never hidden
     count5 = f"{type(exc).__name__}"
+shards_at_stop = (checkpoint_at_stop or {}).get("shards") or {}
+shards_judged_at_stop = sum(1 for r in shards_at_stop.values() if r.get("attempts") or r.get("complete") or r.get("terminal"))
+stopped_before_import = (checkpoint_at_stop is not None and checkpoint_at_stop.get("phase") != "complete"
+                         and shards_judged_at_stop == 0
+                         and not (Path(settings5["state"]) / "current.json").exists())
 report["restage-valid"] = {
     "stopped_after": (before_stop or [None])[-1],
+    "stopped_before_import": stopped_before_import, "shards_judged_at_stop": shards_judged_at_stop,
+    "checkpoint_phase_at_stop": (checkpoint_at_stop or {}).get("phase"),
+    **({} if stopped_before_import else {"not_exercised": "the initializer was stopped after it had judged "
+        + str(shards_judged_at_stop) + " shard(s) (checkpoint phase " + str((checkpoint_at_stop or {}).get("phase"))
+        + "): the restaged sidecar was not what it judged, so this run proves nothing about it -- run the qualification again"}),
     "failing_shard_imported_before_stop": any(e.get("stage") == "corpus-import" and e.get("shard") == failing
                                               for e in events5[:len(before_stop or [])]),
     "sidecar_differs": all(blocks_b[e["archive"]] != (vectors_dir / e["archive"]).read_bytes() for e in manifest_a["shards"])
@@ -400,8 +419,10 @@ def judge(observed):
     for name, expected in EXPECTED.items():
         seen = observed.get(name) if isinstance(observed.get(name), dict) else {}
         disagreements = sorted(k for k, v in expected.items() if seen.get(k) != v)
-        cases[name] = {"observed": seen, "expected": expected, "disagreements": disagreements,
-                       "status": "passed" if not disagreements else "failed"}
+        status = "passed" if not disagreements else "failed"
+        if seen.get("not_exercised"):
+            status = "not exercised"                  # the case's own precondition did not hold: nothing was proved
+        cases[name] = {"observed": seen, "expected": expected, "disagreements": disagreements, "status": status}
     return cases
 
 

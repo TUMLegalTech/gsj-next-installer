@@ -73,6 +73,32 @@ def test_the_judgement_lives_on_the_host_and_every_expected_value_is_load_bearin
     assert module.judge({})["import"]["status"] == "failed"
 
 
+def test_restage_valid_proves_its_own_precondition_or_is_not_exercised(module):
+    """The restage-valid case exists only while the initializer is stopped BEFORE
+    it judged any shard (A loaded, nothing imported): a stop that lands after the
+    import completed judges nothing and must not count as a pass. The driver
+    reports what the initializer's own checkpoint said at the stop; the judge
+    holds the case to it and names a stop that came too late "not exercised"."""
+    assert module.EXPECTED["restage-valid"]["stopped_before_import"] is True
+    late = {name: dict(expected) for name, expected in module.EXPECTED.items()}
+    late["restage-valid"]["stopped_before_import"] = False
+    late["restage-valid"]["not_exercised"] = "the initializer had completed the import when it was stopped"
+    cases = module.judge(late)
+    assert cases["restage-valid"]["status"] == "not exercised"
+    assert "stopped_before_import" in cases["restage-valid"]["disagreements"]
+    assert {n: c["status"] for n, c in cases.items() if n != "restage-valid"} == {n: "passed" for n in module.EXPECTED if n != "restage-valid"}
+    report = {"schema": module.SCHEMA, "cases": cases,
+              "pair": {"registered": True, "initialize_sha256": "a" * 64, "corpus_sha256": "b" * 64}}
+    assert module.verdict(report) == "failed"
+    # a stop that came in time, reported so, is judged as before
+    good = {name: dict(expected) for name, expected in module.EXPECTED.items()}
+    assert module.judge(good)["restage-valid"]["status"] == "passed"
+    # the driver reads the precondition off the checkpoint the initializer wrote,
+    # at the stop, never off the events the driver had read so far
+    for step in ("checkpoint_at_stop", "stopped_before_import", "not_exercised", "shards_judged_at_stop"):
+        assert step in module.DRIVER, step
+
+
 def test_the_verdict_needs_every_case_and_a_registered_measured_pair(module):
     assert module.verdict(_passed(module)) == "passed"
     for name in module.EXPECTED:
