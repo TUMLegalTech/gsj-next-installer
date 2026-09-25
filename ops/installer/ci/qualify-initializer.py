@@ -5,7 +5,7 @@ The initializer pair registered in startup-runtime-preflight.py (QUALIFIED_SOURC
 records a claim; this run is what backs it. It runs the release's web image -- the
 initializer's own code, library and embedding model -- against the release's Chroma image
 through Docker, on a synthetic corpus and vector sidecar the image's own generator builds,
-and passes only when all four hold:
+and passes only when all five hold:
 
   import   the released vectors are imported: `corpus-vector-source` says `released`,
            the initializer completes with the manifest's rows and vectors;
@@ -19,7 +19,13 @@ and passes only when all four hold:
            makes ONE import attempt on that shard, persists a terminal checkpoint, and the
            init container's restart names that cause again without a further attempt;
   block    the same shape for a released vector block whose ids disagree with the rows the
-           site derives (`source-verification-failed`, the product's own shard-level cause).
+           site derives (`source-verification-failed`, the product's own shard-level cause);
+  restage  a block MISSING at the first look (a failed install's leftover, read by the
+           initializer a repair starts before it restages the blocks) is terminal on those
+           bytes; the block restaged DAMAGED is judged afresh and terminal on its own bytes;
+           the block restaged intact is imported on the restart and the site completes --
+           the verdict is bound to the staged content it judged, never to the shard alone
+           (the pre-release review's interleaving).
 
 Only the release's images run; nothing here is mounted into them. The report binds what it
 proves: the images by digest (or, for an engineering image without one, its id, marked
@@ -42,7 +48,7 @@ import time
 from pathlib import Path
 
 SCHEMA = "gsj.initializer-qualification/1"
-CASES = ("import", "core", "block")
+CASES = ("import", "core", "block", "restage")
 REGISTRY = Path(__file__).resolve().parents[1] / "startup-runtime-preflight.py"
 # What a passing run observes; the driver measures, this module judges.
 EXPECTED = {
@@ -58,6 +64,13 @@ EXPECTED = {
               "first_shard_terminal": True, "checkpoint_terminal": True, "checkpoint_last_error": "source-verification-failed",
               "restart_exit": 1, "restart_reason": "source-verification-failed", "restart_shard_attempts": 1,
               "restart_import_events_on_failing_shard": 0},
+    "restage": {"missing_exit": 1, "missing_reason": "source-verification-failed", "missing_shard_attempts": 1,
+                "missing_shard_terminal": True, "missing_checkpoint_terminal": True,
+                "damaged_exit": 1, "damaged_reason": "source-verification-failed", "damaged_verdicts_lifted": 1,
+                "damaged_shard_attempts": 1, "damaged_checkpoint_terminal": True,
+                "restaged_exit": 0, "restaged_verdicts_lifted": 1, "restaged_complete": True,
+                "restaged_vector_source": "released", "restaged_rows_match": True, "restaged_vectors_match": True,
+                "restaged_shard_complete": True, "restaged_shard_imported": True, "restaged_chroma_count_matches": True},
 }
 # The driver runs INSIDE the web image, on its own python and library; it must import
 # nothing that image does not carry (gsj, gsj_deploy, chromadb, numpy). It measures and
@@ -232,6 +245,58 @@ next(x for x in value["shards"] if x["id"] == failing)["ids_sha256"] = corpus.sh
 value.pop("fingerprint"); value["fingerprint"] = corpus.sha(corpus.canonical(value))
 corpus.atomic_json(copied3 / "vectors.json", value)
 report["block"] = failure_case("block", copied3, hosts["block"], failing)
+
+# --- restage: a block missing at the first look, restaged damaged, restaged intact ------
+copied4 = root / "restage" / "copied"; copied4.parent.mkdir(parents=True)
+corpus.copy_payload(image, copied4, corpus.digest(image / "manifest.json"))
+sidecar_into(copied4, vectors_dir)
+block4 = copied4 / next(x for x in json.loads((copied4 / "vectors.json").read_bytes())["shards"] if x["id"] == failing)["archive"]
+intact = block4.read_bytes()
+settings4 = settings_for("restage", copied4, hosts["restage"])
+
+
+def lifted(events):
+    return sum(1 for e in events if e.get("stage") == "corpus-verdict-lifted")
+
+
+def reason_of(events):
+    failed = [e for e in events if e.get("stage") == "initialization-failed"]
+    return failed[-1].get("reason") if failed else None
+
+
+def record_of(settings):
+    return ((checkpoint_of(settings) or {}).get("shards") or {}).get(failing, {})
+
+
+block4.unlink()                                          # the failed install left the block missing
+rc1, events1 = run_initializer("restage", settings4, "missing")
+reason1, record1, checkpoint1 = reason_of(events1), record_of(settings4), checkpoint_of(settings4)
+block4.write_bytes(intact[:-7])                          # restaged, damaged: other bytes
+rc2, events2 = run_initializer("restage", settings4, "damaged")
+reason2, record2, checkpoint2 = reason_of(events2), record_of(settings4), checkpoint_of(settings4)
+block4.write_bytes(intact)                               # restaged intact
+rc3, events3 = run_initializer("restage", settings4, "restaged")
+complete3 = next((e for e in events3 if e.get("stage") == "corpus-complete"), None)
+source3 = next((e for e in events3 if e.get("stage") == "corpus-vector-source"), {})
+record3 = record_of(settings4)
+try:
+    import chromadb
+    coll4 = init.collection(chromadb.HttpClient(host=hosts["restage"], port=8000), manifest)
+    count4 = coll4.count() if coll4 is not None else None
+except Exception as exc:                                 # noqa: BLE001 -- reported, never hidden
+    count4 = f"{type(exc).__name__}"
+report["restage"] = {
+    "missing_exit": rc1, "missing_reason": reason1, "missing_shard_attempts": record1.get("attempts"),
+    "missing_shard_terminal": record1.get("terminal"), "missing_checkpoint_terminal": (checkpoint1 or {}).get("terminal"),
+    "damaged_exit": rc2, "damaged_reason": reason2, "damaged_verdicts_lifted": lifted(events2),
+    "damaged_shard_attempts": record2.get("attempts"), "damaged_checkpoint_terminal": (checkpoint2 or {}).get("terminal"),
+    "restaged_exit": rc3, "restaged_verdicts_lifted": lifted(events3), "restaged_complete": complete3 is not None,
+    "restaged_vector_source": source3.get("source"),
+    "restaged_rows_match": (complete3 or {}).get("rows") == manifest["rows"],
+    "restaged_vectors_match": (complete3 or {}).get("vectors") == manifest["chunks"],
+    "restaged_shard_complete": record3.get("complete"),
+    "restaged_shard_imported": any(e.get("stage") == "corpus-import" and e.get("shard") == failing for e in events3),
+    "restaged_chroma_count_matches": count4 == manifest["chunks"]}
 
 emit(stage="initializer-qualification", report=report)
 '''

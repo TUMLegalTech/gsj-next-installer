@@ -107,24 +107,39 @@ QUALIFIED_SOURCE_RUNTIMES = {
     # terminal at once too -- the volume does not change under a running
     # initializer (every block is published atomically, the vectors
     # manifest last); the copied shard's directory check before the import
-    # keeps its restart semantics. corpus.py is BYTE-IDENTICAL to the pair
-    # above. An intermediate message-pass initializer was registered and
-    # withdrawn before any deployment ran it. This pair is what the next
-    # product release ships. QUALIFICATION: ci/qualify-initializer.py, run
-    # against the RELEASED images, backs it -- the released vectors
-    # imported and read back from SQLite and Chroma with matching
-    # identities and no re-embedding, then two deliberate deterministic
-    # shard failures (a row whose parse disagrees with the manifest:
-    # core-mismatch; a released block whose ids disagree:
+    # keeps its restart semantics -- AND that verdict is bound to the exact
+    # staged content it judged: runtime.sh's repair applies the release (and
+    # starts this initializer) BEFORE it restages the blocks, so a block a
+    # failed install left missing or damaged is transient there; the shard's
+    # record keeps the staged manifest's digest and the block's bytes and
+    # digest as the failed attempt READ them (`judged`, taken before the
+    # read: a second look after it could see a restage that landed in
+    # between and bind the verdict to the intact block), a restart that
+    # finds the same bytes repeats the verdict, one that finds other bytes
+    # lifts it and judges them afresh on a fresh budget
+    # (`corpus-verdict-lifted`). corpus.py is BYTE-IDENTICAL
+    # to the pair above. Two intermediate initializers were registered and
+    # withdrawn before any deployment ran them: the message-pass one, and
+    # the one that made source-verification-failed terminal on the shard
+    # alone (9c8426), which stayed terminal after the restaged block matched
+    # its manifest. This pair is what the next product release ships.
+    # QUALIFICATION: ci/qualify-initializer.py, run against the RELEASED
+    # images, backs it -- the released vectors imported and read back from
+    # SQLite and Chroma with matching identities and no re-embedding; two
+    # deliberate deterministic shard failures (a row whose parse disagrees
+    # with the manifest: core-mismatch; a released block whose ids disagree:
     # source-verification-failed), each one import attempt, a terminal
-    # checkpoint, and the same cause on the restart; its report names the
+    # checkpoint, and the same cause on the restart; and the restage case:
+    # a block missing at the first look is terminal, restaged damaged it is
+    # judged afresh and terminal on its own bytes, restaged intact it is
+    # imported on the restart and the site completes. Its report names the
     # pair it measured inside the image and the release gate requires it
     # (README, the release step by step: before any deployment that runs
     # this initializer is upgraded, and before the installer is published).
     # The registration is checked against the PIN by tests/test_web_pin.py,
     # so a pin bump to a product whose pair is missing here fails the gate
     # by name.
-    ('9c8426dbcafc0916e180f4f06d94803726ce2a06882f66eb2d98bdaa60ac9487',
+    ('7b32ab049fda8a37b8d49a1bd6ebc332f8f98152db59d4ca35df149d0053ede1',
      'c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8'),
 }
 
