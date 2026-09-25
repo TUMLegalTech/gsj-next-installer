@@ -3857,11 +3857,25 @@ helm_apply() {
 initializer_failure() {
  # A failed corpus-copy/corpus-initialize leaves one allowlisted
  # code as its termination message. A running retry is still in progress.
- jq -r '[.items[]|select(.metadata.deletionTimestamp==null)|.status.initContainerStatuses[]?|
+ # One tab-separated line: KIND:CODE, then the name and the uid of the Pod
+ # whose verdict it is -- whatever acts on the verdict acts on THAT Pod, never
+ # on the first Pod the labels list (a foreign controller's Pod can carry them).
+ jq -r '[.items[]|select(.metadata.deletionTimestamp==null)|. as $pod|.status.initContainerStatuses[]?|
    select(.name=="corpus-copy" or .name=="corpus-initialize")|
    (if .state.terminated then (if .state.terminated.exitCode!=0 then .state.terminated.message else null end)
     elif .state.waiting then .lastState.terminated.message else null end)//""|
-   capture("^gsj-(?<kind>corpus|copy):(?<code>[a-z0-9]+(-[a-z0-9]+)*)\\s*$")|.kind+":"+.code][0]//empty' "$1"
+   capture("^gsj-(?<kind>corpus|copy):(?<code>[a-z0-9]+(-[a-z0-9]+)*)\\s*$")|[.kind+":"+.code,$pod.metadata.name,$pod.metadata.uid]][0]//empty|@tsv' "$1"
+}
+initializer_pod_owned() {
+ # The Pod named in $2 with the uid in $3, as listed in the Pod list $1, is
+ # this release's own application Pod: its controller is a ReplicaSet (by
+ # name and uid) whose controller is the Deployment $RELEASE-web with the uid
+ # in $4, the one the wait just read. Every link by uid; the two labels alone
+ # also fit a Pod of a foreign controller in the namespace.
+ local pods=$1 name=$2 uid=$3 deploy_uid=$4 rs='' rs_uid=''
+ IFS=$'\t' read -r rs rs_uid < <(jq -r --arg name "$name" --arg uid "$uid" '[.items[]|select(.metadata.name==$name and .metadata.uid==$uid)|.metadata.ownerReferences[]?|select(.controller==true and .kind=="ReplicaSet")|[.name,.uid]][0]//empty|@tsv' "$pods") || true
+ [[ -n $rs && -n $rs_uid ]] || return 1
+ k get replicasets "$rs" -o json 2>/dev/null | jq -e --arg rs_uid "$rs_uid" --arg name "$RELEASE-web" --arg uid "$deploy_uid" '.metadata.uid==$rs_uid and any(.metadata.ownerReferences[]?; .controller==true and .kind=="Deployment" and .name==$name and .uid==$uid)' >/dev/null
 }
 initializer_stop() {
  # Terminal codes never clear by waiting; the others retry inside the Pod.
@@ -3916,7 +3930,7 @@ initializer_stop() {
  esac
 }
 wait_application() {
- local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod state code
+ local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod state code verdict_pod verdict_uid
  while (( SECONDS < end )); do
    assert_owner
    helm_application_validate
@@ -3928,7 +3942,7 @@ wait_application() {
      jq -c '.items[0]|{pod:.metadata.name,phase:.status.phase,init:[.status.initContainerStatuses[]?|{name,state}],containers:[.status.containerStatuses[]?|{name,ready,state}]}' "$GSJ_WORK/application-pods.json"
      k logs "$pod" -c corpus-initialize --tail=3 2>/dev/null || true
    fi
-   code=$(initializer_failure "$GSJ_WORK/application-pods.json")
+   IFS=$'\t' read -r code verdict_pod verdict_uid <<< "$(initializer_failure "$GSJ_WORK/application-pods.json")"
    if [[ $code == corpus:source-verification-failed && ${VECTORS_STAGED_IN_THIS_RUN:-} == true && ${STAGED_RESTART:-} != done ]]; then
      # The initializer started at helm_apply and may have judged the released
      # vectors BEFORE stage_vectors put them in place [review, the major]:
@@ -3938,9 +3952,22 @@ wait_application() {
      # came. ONE fresh attempt on the staged bytes decides: the Pod is
      # recreated now (the Deployment brings it back; the checkpoint is on the
      # volume); a second such verdict is on the staged bytes and terminal.
-     STAGED_RESTART=done
+     # The Pod recreated is exactly the one whose verdict was read -- by name
+     # AND uid, as the API's precondition, so a replacement under the same
+     # name is never touched -- and only when its owner chain leads to this
+     # release's own Deployment: the two labels alone also list a foreign
+     # controller's Pod, and the first Pod listed is not the verdict's. A
+     # deletion the API refuses or that fails is an error, never a restart
+     # that is counted: the next verdict would be read as the terminal second.
+     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$(jq -r '.metadata.uid//""' <<< "$state")" \
+       || fail "Pod $verdict_pod reported the initializer's verdict but is not the application Pod of release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); it is not recreated and the verdict is not judged"
      log "corpus-initialize refused the released vectors with a verdict that may predate their staging in this run; restarting it once on the staged blocks"
-     k delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+     jq -n --arg uid "$verdict_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$GSJ_WORK/initializer-delete.json"
+     if ! k delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$verdict_pod" -f "$GSJ_WORK/initializer-delete.json" >/dev/null 2>&1; then
+       RECOVERY_HINT="resume --operation $OPERATION"
+       fail "the application Pod $verdict_pod that reported the verdict could not be recreated (its deletion by uid was refused or failed); no restart is counted and the verdict is not judged. After this tools process stops, run: gsj-install.sh resume --operation $OPERATION"
+     fi
+     STAGED_RESTART=done
      sleep 20; continue
    fi
    [[ -z $code ]] || initializer_stop "$code"

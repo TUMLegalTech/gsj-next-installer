@@ -257,13 +257,13 @@ def qualified_files(module, tmp_path, monkeypatch):
     import importlib.util
     spec = importlib.util.spec_from_file_location("gsj_startup_runtime_preflight", ROOT / "ops/installer/startup-runtime-preflight.py")
     registry = importlib.util.module_from_spec(spec); spec.loader.exec_module(registry)
-    pair = next(p for p in registry.QUALIFIED_SOURCE_RUNTIMES if p[0].startswith("7b32ab04"))
+    pair = next(p for p in registry.QUALIFIED_SOURCE_RUNTIMES if p[0].startswith("43785dcc"))
     (tmp_path / "initializer-qualification.json").write_text(json.dumps({
         "schema": "gsj.initializer-qualification/1", "status": "passed",
         "images": {name: {"reference": f"{images[name]['repository']}@{images[name]['digest']}", "digest": f"{images[name]['repository']}@{images[name]['digest']}",
                           "id": "sha256:" + "0" * 64, "local": False} for name in ("web", "chroma")},
         "pair": {"initialize_sha256": pair[0], "corpus_sha256": pair[1], "registered": True},
-        "cases": {name: {"status": "passed"} for name in ("import", "readback", "core", "block", "restage")}}))
+        "cases": {name: {"status": "passed"} for name in ("import", "readback", "core", "block", "restage", "restage-valid")}}))
     reports = []
     for mode, names in {"ordinary": ["fresh-full-corpus-install", "same-bundle-repeat"],
                         "upgrade": ["populated-source-created", "full-populated-source-to-target-upgrade", "source-backup-and-preservation",

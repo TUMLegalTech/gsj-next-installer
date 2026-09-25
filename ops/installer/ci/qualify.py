@@ -561,7 +561,7 @@ def check_initializer_qualification(directory, manifest):
             "the initializer pair the qualification measured is not a registered runtime")
     cases = report.get("cases") or {}
     require(all(isinstance(cases.get(name), dict) and cases[name].get("status") == "passed"
-                for name in ("import", "readback", "core", "block", "restage")), "an initializer qualification case did not pass")
+                for name in ("import", "readback", "core", "block", "restage", "restage-valid")), "an initializer qualification case did not pass")
 
 
 def gate(directory, reports):

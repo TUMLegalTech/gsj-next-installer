@@ -117,30 +117,47 @@ QUALIFIED_SOURCE_RUNTIMES = {
     # between and bind the verdict to the intact block), a restart that
     # finds the same bytes repeats the verdict, one that finds other bytes
     # lifts it and judges them afresh on a fresh budget
-    # (`corpus-verdict-lifted`). corpus.py is BYTE-IDENTICAL
-    # to the pair above. Two intermediate initializers were registered and
-    # withdrawn before any deployment ran them: the message-pass one, and
-    # the one that made source-verification-failed terminal on the shard
-    # alone (9c8426), which stayed terminal after the restaged block matched
-    # its manifest. This pair is what the next product release ships.
+    # (`corpus-verdict-lifted`) -- AND the verdict binds to exactly the bytes
+    # the attempt judged: the vectors manifest is read at the attempt, once,
+    # and the block is judged against THAT manifest's entry, never against
+    # the one loaded at `released-vectors`, and the block's record is what
+    # the read that judged it found (read_shard_vectors reads once and
+    # reports it), never a look at the volume before or after the read. A
+    # VALID restage -- the same corpus, the blocks repacked, other digests --
+    # landing after the manifest was loaded was judged against the old
+    # entries, terminal, bound to the new bytes, and every restart repeated
+    # it until another explicit repair; a restage landing between a look
+    # and the read bound the verdict to bytes it did not judge, so a volume
+    # changed back to them repeated a verdict it would pass. corpus.py
+    # changes with it (read_shard_vectors reads the block once and reports
+    # what it read; the manifest checks are callable on parsed bytes). Three
+    # intermediate initializers were registered and withdrawn before any
+    # deployment ran them: the message-pass one, the one that made
+    # source-verification-failed terminal on the shard alone (9c8426), which
+    # stayed terminal after the restaged block matched its manifest, and the
+    # one that bound the verdict to a look before the read against the
+    # manifest loaded earlier (7b32ab04). This pair is what the next product
+    # release ships.
     # QUALIFICATION: ci/qualify-initializer.py, run against the RELEASED
     # images, backs it -- the released vectors imported and read back from
     # SQLite and Chroma with matching identities and no re-embedding; two
     # deliberate deterministic shard failures (a row whose parse disagrees
     # with the manifest: core-mismatch; a released block whose ids disagree:
     # source-verification-failed), each one import attempt, a terminal
-    # checkpoint, and the same cause on the restart; and the restage case:
+    # checkpoint, and the same cause on the restart; the restage case:
     # a block missing at the first look is terminal, restaged damaged it is
     # judged afresh and terminal on its own bytes, restaged intact it is
-    # imported on the restart and the site completes. Its report names the
-    # pair it measured inside the image and the release gate requires it
-    # (README, the release step by step: before any deployment that runs
-    # this initializer is upgraded, and before the installer is published).
-    # The registration is checked against the PIN by tests/test_web_pin.py,
-    # so a pin bump to a product whose pair is missing here fails the gate
-    # by name.
-    ('7b32ab049fda8a37b8d49a1bd6ebc332f8f98152db59d4ca35df149d0053ede1',
-     'c51fb2d3d12862edef0055fd1ecba8e6ab7083d06fcb9dca35bf00fd892a30c8'),
+    # imported on the restart and the site completes; and the restage-valid
+    # case: a valid sidecar restaged by the release's own staging helper
+    # after the manifest was loaded is imported, and the site stays complete
+    # on the restart. Its report names the pair it measured inside the
+    # image and the release gate requires it (README, the release step by
+    # step: before any deployment that runs this initializer is upgraded,
+    # and before the installer is published). The registration is checked
+    # against the PIN by tests/test_web_pin.py, so a pin bump to a product
+    # whose pair is missing here fails the gate by name.
+    ('43785dcca030cc96fcaa8ebc66f2e4f586cd122e82117cd3bc77b0901397b507',
+     '2ee3f420432386ef549d98802182f0e681a86af7b37dcd1d242b9b70e1ae097b'),
 }
 
 
