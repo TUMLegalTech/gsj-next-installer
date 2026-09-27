@@ -167,8 +167,11 @@ behaviours are annotations on the Ingress object, which only the chart writes.
 One way out works for every controller this rules out, a cloud load balancer
 included: run ingress-nginx in the cluster yourself, send your load
 balancer's traffic to it, and `reuse` it — `ingress.class` its IngressClass,
-`ingress.namespace` the namespace its Pods run in. The installer's whole check
-on a reused class is that an IngressClass of that name exists.
+`ingress.namespace` the namespace its Pods run in. What the installer checks
+of a reused class is that an IngressClass of that name exists and, before the
+Lease of an `install` or `upgrade`, that `ingress.namespace` exists and runs a
+Pod it recognizes as an ingress controller by its name or its image; it does
+not check that this controller is the one behind the class.
 
 **A stock k3s box is the common case of this**, because k3s ships Traefik.
 `managed-traefik` is *not* your way out: it installs a second Traefik from a
@@ -253,10 +256,16 @@ what we measured:
   namespace with other workloads — `kube-system` does — every Pod there is
   admitted to the application's web port, and no field narrows it to the
   controller's Pods; a controller in a namespace of its own is the narrower
-  choice. `kubectl get pods -A | grep -i traefik` names it in its first column. (Read
-  from the chart and the installer, not measured: get it wrong on a CNI that
-  enforces policy and the install stops at its own public-route probe, after
-  the corpus import and before any acceptance check has run.)
+  choice. `kubectl get pods -A | grep -i traefik` names it in its first column.
+  An `install` or `upgrade` refuses, before its Lease, a namespace that does
+  not exist (*"ingress.namespace … does not exist"*) and one where none of the
+  Running Pods is an ingress controller by its name or its image — ingress,
+  traefik, nginx, haproxy, contour, istio (*"ingress.namespace … runs no
+  ingress controller: it holds … Pod(s), … of them Running, …"*). A namespace
+  that runs some other controller passes that check. (Read from the chart and
+  the installer, not measured: get it wrong that way on a CNI that enforces
+  policy and the install stops at its own public-route probe, after the corpus
+  import and before any acceptance check has run.)
 
 Traefik has no default request-body limit and does not buffer responses, so the
 other two behaviours hold unless you have added a buffering middleware. What
@@ -504,9 +513,9 @@ row settles:
 | check | PASS means | FAIL or UNKNOWN means |
 |---|---|---|
 | `release-verification` | this file's SHA-256 and length match the descriptor signed for it, under the key it carries, and the published verifier agreed; the row says where the downloaded files were kept | UNKNOWN: a companion file could not be obtained — the row names the origin's answer, the proxy's, or the missing file; the release is **not verified**, do not install from it, and nothing was saved. A file that fails a check is a refusal (exit 1), never a row |
-| `helm` | at or above the floor (3.13), version and path named | missing, no version, or below the floor; the fix names what to install and whether `--fetch-tools` (the other commands) can supply it |
-| `kubectl` | at or above the floor (1.24) | as for helm |
-| `jq` | at or above the floor (1.6) | as for helm |
+| `helm` | at or above the floor (3.13), version and path named | missing, no version, or below the floor; the fix names what to install and, where this release pins a helm for your platform, that any other command accepts `--fetch-tools=helm`, which fetches Helm alone and keeps this box's kubectl and jq; where it pins none, *"--fetch-tools cannot help here"* |
+| `kubectl` | at or above the floor (1.24) | as for helm, naming `--fetch-tools=kubectl` and the note on kubectl and your server's version ([Client tools and versions](#client-tools-and-versions)) first |
+| `jq` | at or above the floor (1.6) | as for helm, naming `--fetch-tools=jq` |
 | `kubectl-skew` | the client is within one minor of the server | more than one minor apart; UNKNOWN when either version is unknown |
 | `openssl` | OpenSSL 3.0 or newer, named | never: a missing or LibreSSL `openssl` was refused before `init` ran |
 | `bash` | present, version named | never: refused before `init` ran |
@@ -591,8 +600,9 @@ kubectl config current-context
 All three clients are yours to install, the way your distribution installs
 anything: the release ships none of them, and `--fetch-tools` equips the
 *installer* for one run, not the blocks you paste into your own shell — steps 2
-to 7 use your own `jq` and `kubectl`. `--fetch-tools=helm` equips it with Helm
-alone and keeps your own kubectl and jq.
+to 7 use your own `jq` and `kubectl`. `--fetch-tools=TOOL[,TOOL]` equips it
+with only the clients it names: `--fetch-tools=helm` with Helm alone, keeping
+your own kubectl and jq.
 
 Helm 3.13 installs, upgrades and removes. **Helm 4 is required by four
 recovery paths only: `addon-repair`; `repair --operation` of a *restore* that
@@ -604,7 +614,7 @@ does not); and the startup continuation, `repair --operation
 --continue-helm-installer`** — paths you reach when something has already
 gone wrong. Each refuses a Helm 3 in its first seconds, before it reads the
 cluster and before it takes or renews the Lease, naming the path, the Helm
-it found and `--fetch-tools`. `install`, `upgrade`, `upgrade --to`, `resume`
+it found and `--fetch-tools=helm`. `install`, `upgrade`, `upgrade --to`, `resume`
 and `repair` outside those recovery paths, `backup`, `backup-repair`,
 `restore`, `restore-repair`, `sweep` and `abandon` run on Helm 3.13 and
 later. You do not need Helm 4 today; know that you will need it for those
@@ -757,7 +767,11 @@ The block waits up to five minutes for the Pod to finish, prints its status and
 removes it. `Completed` is the pass. `ImagePullBackOff` or `ErrImagePull` is
 the failure this step exists to find; `ContainerCreating` means the pull was
 still running when the wait gave up — raise `--timeout` and paste the block
-again. It waits instead of watching on purpose. Measured on bash 5.2: Ctrl-C
+again. A pull that takes minutes here is a warning for step 8: the installer
+waits for all six images, the corpus image included, only as long as
+`deadlines.dependencies_seconds` allows — 900 s by default — so on such a link
+raise it in the site file before you install
+([why](#make-your-nodes-able-to-pull-the-images)). It waits instead of watching on purpose. Measured on bash 5.2: Ctrl-C
 ends the whole pasted block and discards whatever was pasted after it, so an
 interrupted watch leaves the Pod behind — and, in the credentialed probe below,
 the Secret. If you do interrupt one of these blocks, run its last line
@@ -987,7 +1001,7 @@ report; it is marked `you` in the table.
 | `storage.transfer_path` | `storage.claim_backing`, `host.filesystems` | a filesystem that is **not** the claims'; or leave empty to stage in an `emptyDir`, which is still the node's ephemeral filesystem — and a `backup` stages its archive through it twice, budgeted at about 2.5× your data ([why](#two-site-values-that-are-about-your-machine-not-gsjs)). Nothing but its shape is checked before a Pod mounts it — absolute, its first segment not beginning with a dot; you make the directory beforehand, `0700` ([why](#preserve-and-restore-backups)). It is one of the two storage values that may change later — a later `install`, `upgrade` or `backup` adopts a changed `transfer_path` or `storage.minimum_free_bytes` — while the class, the node, `backend_path`, the sizes and `existing_claim` stay what the first install made them |
 | which filesystem the claims land on | `storage.claim_backing` | `profile=reuse` takes whatever directory your existing class already writes to — it does **not** let you choose, and `storage.node` picks a node, not a disk. To place the data yourself: repoint the directory your own provisioner writes to — that is its configuration, not a site value; this installer never writes it, and reads it only to report `storage.claim_backing` and `storage.local_path_node_paths` (run `inspect` again afterwards) — or use `profile=managed-local-path` with `storage.backend_path` (default `/var/local-path-provisioner/gsj-managed`) after reading step 0's warning about disposable nodes — it does **not** collide with a local-path provisioner you already run, because it builds its own in namespace `gsj-storage` under provisioner `rancher.io/gsj-local-path`, `WaitForFirstConsumer`, `Retain`, with a node path map of exactly your `storage.node` and that one path — or bring claims of your own: [Installing onto claims that already exist](#installing-onto-claims-that-already-exist) |
 | whether `public_url` resolves **inside** the cluster | you | The acceptance check dials it from the `gsj-web` container. Where a cloud load balancer's public name does not resolve or hairpin from inside the cluster — the normal case on managed Kubernetes — set `verification.connect_host` and `verification.connect_port` to a host and port the Pod can reach — one address that the machine you install from can reach as well, because the installer's own HTTPS check is redirected to it too. The complete example carries no `verification` block; add one. [The five values only you can supply](#the-five-values-only-you-can-supply) dials this route from a Pod before you install |
-| ingress class and namespace | `ingress.classes` | `reuse` the ingress-nginx step 0 qualified; `namespace` is the namespace that controller runs in. If step 0 ruled your controller out, this row is where that verdict lands |
+| ingress class and namespace | `ingress.classes` | `reuse` the ingress-nginx step 0 qualified; `namespace` is the namespace that controller runs in — an `install` refuses, before its Lease, one that does not exist or runs no controller Pod. If step 0 ruled your controller out, this row is where that verdict lands |
 | TLS profile | `networking.tls.cert_manager_present` | four choices, below |
 
 **The TLS rule.** `cert_manager_present` **true** and you already issue
@@ -1229,31 +1243,66 @@ the refusal says so. It is asked only for `install` and `upgrade`; the recovery
 verbs run against Pods that are already placed.
 
 **Before the Lease, an `install` or an `upgrade` also refuses — read-only,
-before anything is written —** five things that would otherwise surface after
-it, some of them hours in:
+before anything is written —** six things that would otherwise surface after
+it, some of them hours in. Each refusal begins with the words quoted here:
 
-- under `tls.profile=existing`, a TLS Secret that is missing or wrong: not of
-  type `kubernetes.io/tls`, without both keys, a certificate that does not name
-  `public_url`'s host, or one that has expired
+- the certificate. Under `tls.profile=existing`, a Secret that is missing
+  (*"TLS Secret is unavailable: tls.profile existing serves the Secret …"*,
+  with the commands that create it) or could not be read (*"TLS Secret is
+  unavailable: … could not be read"*), one not of type `kubernetes.io/tls` or
+  without both keys (*"TLS Secret is incomplete: …"*) or whose `tls.crt` is no
+  PEM certificate (*"TLS Secret is incomplete: the tls.crt of …"*), a
+  certificate that does not name `public_url`'s host (*"TLS certificate host
+  mismatch: …"*), and one that has expired (*"TLS certificate expired: …"*).
+  Under `tls.profile=files`, a certificate file that is no PEM certificate
+  (*"tls.certificate_file is not a readable PEM certificate …"*) or does not
+  name the host (*"TLS certificate host mismatch: tls.certificate_file …"*),
+  and a Secret of that name already in the namespace that holds another
+  certificate or key (*"Secret … differs from supplied credential; …"*)
   ([A certificate you already issue](#a-certificate-you-already-issue-tlsprofileexisting));
-- under `ingress.profile=reuse`, an `ingress.namespace` that does not exist or
-  holds no running ingress controller Pod; under `managed-traefik`, one that is
-  the deployment's own namespace, since Traefik gets a namespace of its own;
-- another Ingress on the cluster that already serves `public_url`'s host,
-  naming it;
-- an operator Secret already in the namespace whose password differs from
-  `operator.password_file`;
+- the controller namespace. Under `ingress.profile=reuse`, an
+  `ingress.namespace` that does not exist (*"ingress.namespace … does not
+  exist"*) or holds no running ingress controller Pod (*"ingress.namespace …
+  runs no ingress controller"*); under `managed-traefik`, one that is the
+  deployment's own namespace (*"ingress.namespace … is the namespace this
+  deployment is installed in (target.namespace)"*), since Traefik gets a
+  namespace of its own;
+- another Ingress on the cluster that already serves `public_url`'s host
+  (*"public_url's host … is already served by Ingress …"*), naming it;
+- the operator password: an operator Secret already in the namespace whose
+  password differs from `operator.password_file` (*"Secret … differs from
+  supplied credential; use explicit credential repair/rotation, never implicit
+  overwrite"*), and a password file that holds a control character or nothing
+  but newlines (*"operator.password_file holds a control character …"*);
 - for a managed add-on profile, that add-on's CustomResourceDefinitions left on
-  the cluster without the owner record that would admit them, each named, with
-  the teardown that removes them ([Remove a deployment](#remove-a-deployment)).
-  Those of the add-on the site does not select are named the same way in a log
-  line, and the run goes on: they are not what the selected add-on creates.
+  the cluster without the owner record that would admit them (*"managed add-on
+  CustomResourceDefinitions are left without their owner record: …"*), each
+  named, with the teardown that removes them
+  ([Remove a deployment](#remove-a-deployment)). Those of the add-on the site
+  does not select are named the same way in a log line (*"Managed add-on
+  CustomResourceDefinitions of an add-on this site does not select are left
+  without their owner record: … The run goes on"*): they are not what the
+  selected add-on creates;
+- a kubectl that `--fetch-tools` downloaded for this run and that is more than
+  one minor from the server (*"kubectl version skew: the kubectl --fetch-tools
+  downloaded for this run is …"*). Your own kubectl, skewed the same way, is
+  named in a log line and the run goes on with it (*"kubectl … is more than one
+  minor from the server (…), and kubectl is supported within one minor of the
+  server. The run goes on with it; …"*).
 
-Two of these read beyond the namespace — every Ingress on the cluster, and the
-CRDs. Where your kubeconfig may not list those, that check is skipped and the
-log says so; the rest still run. The recovery verbs do not ask: they continue
-what an install or upgrade already admitted. Then the storage node proves it
-can pull every image, Helm applies, the corpus is fetched and staged, and the
+Three of these read beyond the namespace — `ingress.namespace` and its Pods,
+every Ingress on the cluster, and the CRDs with the ConfigMaps that record
+their owners. Where your kubeconfig may not read those, that check is skipped
+and the log says so — *"ingress.namespace … was not checked: …"*,
+*"public_url's host … was not checked against other Ingresses: …"*,
+*"Leftover managed add-on CustomResourceDefinitions were not checked: …"* — and
+the rest still run. The two Secrets are read in the namespace itself, where a
+read that fails is refused (*"… could not be read"*), naming the file in the
+state directory that keeps kubectl's output. The recovery verbs do not ask:
+they continue what an install or upgrade already admitted. Then the storage
+node proves, within `deadlines.dependencies_seconds`, that it can pull all six
+images ([Make your nodes able to pull the images](#make-your-nodes-able-to-pull-the-images)),
+Helm applies, the corpus is fetched and staged, and the
 import runs — about `corpus.chunks / 150` seconds on an otherwise idle node.
 
 → **If it stops**, the installer prints the command to run;
@@ -1367,9 +1416,10 @@ The archive lands **on this machine** already encrypted, in
 `backup.directory`, beside a separately encrypted resource archive and their
 receipts. While the backup runs the archive is also staged on the
 node, behind `storage.transfer_path`, twice: once as it is written, and once
-decrypted back for verification. Once the archive is verified both plaintext
-copies are removed inside the Pod, and the directory is made private (`0700`)
-and handed back to you; a backup that stops keeps them for its repair.
+decrypted back for verification. The backup Pod makes that directory private
+(`0700`) before it writes there; once the archive is verified both plaintext
+copies are removed inside the Pod and the directory is handed back to you; a
+backup that stops keeps them for its repair.
 **Budget for what the capacity check demands,
 not for what you end up with** — it assumes your data will not compress.
 Measured on this guide's test deployment, from the installer's own report
@@ -1475,7 +1525,10 @@ when it is unset) must have an architecture the release has images for —
 today — and the installer refuses otherwise. Bash, curl, OpenSSL **3.0 or newer** (not
 LibreSSL — the installer refuses it by name, in the first seconds, like a
 too-old client; `--fetch-tools` does not supply OpenSSL), tar/gzip, base64, a
-SHA256 implementation, `sync`, and the three clients in the next section. About
+SHA256 implementation, `sync`, and the three clients in the next section. Every
+verb refuses a machine without one of those utilities in its first second, one
+at a time, naming it — *"bootstrap utility required: tar"*, and for the SHA256
+implementation *"bootstrap utility required: sha256sum or shasum"*. About
 **3.5 GB free** for the corpus cache and its staging envelope, on whatever
 filesystem carries `$HOME` and `TMPDIR`.
 
@@ -1498,9 +1551,11 @@ not ask beforehand: `get` nodes; `get` storageclasses and ingressclasses;
 `create` namespaces (the application namespace when it is missing, and a
 managed add-on's); `get` and `patch` persistentvolumes (the storage check marks
 the volume its temporary claim bound as `Delete`, and a restore reads the
-volumes its claims bind); and `list` ingresses in every namespace and `list`
-customresourcedefinitions, which the checks before the Lease read — where those
-two are refused, that check is skipped and the log says so. A managed add-on
+volumes its claims bind); and, for the checks an `install` or `upgrade` makes
+before the Lease, `get` the namespace `ingress.namespace` names and `list` its
+Pods, `list` ingresses in every namespace, and `list` customresourcedefinitions
+and the configmaps in every namespace that record their owners — where one of
+those is refused, that check is skipped and the log says so. A managed add-on
 profile needs more: it installs cluster-scoped objects, among them CRDs, an
 IngressClass or StorageClass, and cluster roles.
 
@@ -1560,24 +1615,26 @@ it found:
 
 ```
 GSJ: requires helm >= 3.13, found 3.12.3 (/usr/local/bin/helm). Upgrade helm,
-or re-run with --fetch-tools to download this release's pinned clients for
+or re-run with --fetch-tools=helm to download this release's pinned helm for
 this run only.
 ```
 
 <!-- init: begin -->
 `init` is the exception to "refuses at the first one": it checks helm,
 kubectl and jq in one run and names every one that is missing or too old,
-with its floor and what was found, and which of them `--fetch-tools` can
-supply for the other commands; the rows for OpenSSL, bash, curl, tar, gzip,
-base64 and the SHA-256 tool record what was found, because a box that lacks
-one of those is refused before `init` can run, one at a time. `init` itself
+with its floor and what was found, and, for each one this release pins for
+your platform, the `--fetch-tools=TOOL` that fetches it alone for the other
+commands (*"--fetch-tools cannot help here"* where it pins none); the rows for
+OpenSSL, bash, curl, tar, gzip, base64 and the SHA-256 tool record what was
+found, because a box that lacks one of those is refused before `init` can run,
+one at a time. `init` itself
 refuses `--fetch-tools`, which would download and run three clients.
 <!-- init: end -->
 
 | client | floor | why that number |
 |---|---|---|
 | `helm` | **3.13** | Two things meet here, and the higher one is the floor. The add-on step passes `--labels gsj.io/addon-owner=…` — the ownership label the add-on repair and rollback paths fence on — and `--labels` does not exist before Helm 3.13 (3.12 answers `unknown flag: --labels`). Separately, the chart declares `kubeVersion: ">=1.27.0-0"`, and the installer renders it with `helm template`, which checks that against Helm's own built-in default Kubernetes version rather than your server's: Helm 3.11 defaults to 1.26 and refuses the chart, 3.12 defaults to 1.27 and renders it. Helm 3.12 through 3.22 and Helm 4 render this chart identically. |
-| `kubectl` | **1.24**, and within **one minor of your API server** | 1.24 is where `kubectl patch --subresource=scale` arrives, which the startup-recovery path uses (1.23 answers `unknown flag: --subresource`); nothing the installer runs needs a newer client. But 1.24 is a *flag-availability* floor, not the whole answer: kubectl is supported within ±1 minor of the API server, so a 1.24 client against a 1.33 server is far outside that window even though every flag exists. In practice this takes care of itself — the installer uses the kubectl you already have, and on both environments measured so far that was the cluster's own matching version. If yours is not, `inspect`'s profile reports `host.installed_clients.kubectl.version` beside `kubernetes.server_version`, and the installer warns, before it takes the Lease, when the kubectl it runs is more than one minor from the server — and refuses when that kubectl is one `--fetch-tools` brought (below). |
+| `kubectl` | **1.24**, and within **one minor of your API server** | 1.24 is where `kubectl patch --subresource=scale` arrives, which the startup-recovery path uses (1.23 answers `unknown flag: --subresource`); nothing the installer runs needs a newer client. But 1.24 is a *flag-availability* floor, not the whole answer: kubectl is supported within ±1 minor of the API server, so a 1.24 client against a 1.33 server is far outside that window even though every flag exists. In practice this takes care of itself — the installer uses the kubectl you already have, and on both environments measured so far that was the cluster's own matching version. If yours is not, `inspect`'s profile reports `host.installed_clients.kubectl.version` beside `kubernetes.server_version`, and an `install` or `upgrade` warns, before it takes the Lease, when the kubectl it runs is more than one minor from the server (*"kubectl … is more than one minor from the server (…), and kubectl is supported within one minor of the server. The run goes on with it; if a step fails on it, install a kubectl within one minor of …"*) — and refuses when that kubectl is one `--fetch-tools` brought (below). |
 | `jq` | **1.6** | All 734 distinct jq programs the installer runs were compiled under jq 1.6, 1.7, 1.7.1, 1.8.0 and 1.8.2 — and because compiling is not running, `inspect` was then executed end to end under 1.6, 1.7 and 1.8.2 against the same cluster and produced the same document. 1.6 is what Debian 12 and RHEL 9 ship. |
 
 Your **cluster** must be Kubernetes **1.27 or newer**: the chart's NetworkPolicy
@@ -1609,10 +1666,12 @@ other verb — an ordinary install and upgrade, `upgrade --to`, `resume` and
 `restore-repair`, `sweep`, `abandon` — needs only the floor above. On Helm 3
 the four paths refuse in their first seconds, after the site file is read
 and before the cluster is read or the Lease taken or renewed, naming the
-path, the Helm found and `--fetch-tools` (`GSJ: addon-repair serializes a
+path, the Helm found and `--fetch-tools=helm` (`GSJ: addon-repair serializes a
 release without contacting the cluster, which only Helm 4 can do (found helm
 3.22.0 at /usr/local/bin/helm). Install Helm 4 alongside, or re-run this
-command with --fetch-tools …`); nothing has been written when they do.
+command with --fetch-tools=helm (this release's pinned Helm 4 for this run
+only, beside your own kubectl and jq); every other command runs on Helm >=
+3.13`); nothing has been written when they do.
 
 **`--fetch-tools`** — accepted by every command but `init` — restores the old behaviour:
 the installer downloads this release's own checksum-pinned Helm, kubectl and jq
@@ -1624,17 +1683,32 @@ two-line `payload()` helper from "Before you start" in whatever shell you are
 in; it does not survive a new one. **Read them before you let `--fetch-tools`
 run:** its kubectl is pinned for the release, not for your cluster, and it can
 sit well outside the +/-1 window the kubectl row above makes a rule. When it
-does, the installer refuses it before the Lease rather than run it — a skew you
-brought with the flag is one you can take back — and your own kubectl, skewed
-the same way, is only warned about. Upgrade your own kubectl rather than
-fetching that one.
+does, an `install` or `upgrade` refuses it before the Lease rather than run it
+— a skew you brought with the flag is one you can take back:
 
-**`--fetch-tools=helm`** fetches Helm alone — this release's pinned Helm 4 —
-and keeps the kubectl and jq on your machine, whose floors are still checked.
-It is the form for the four recovery paths that require Helm 4: it brings the
-one client they need and leaves your kubectl, matched to your cluster, in
-place. Either form downloads before the site file is read, so a proxy or
-custom CA needed for it must already be available to `curl`.
+```
+GSJ: kubectl version skew: the kubectl --fetch-tools downloaded for this run is
+1.35.8 and the server is 1.31.5, more than one minor apart, and kubectl is
+supported within one minor of the server. Run without --fetch-tools to use this
+machine's kubectl, or with --fetch-tools=helm, which fetches only Helm and keeps
+this machine's kubectl
+```
+
+Your own kubectl, skewed the same way, is only warned about, in the log line
+the kubectl row quotes. Upgrade your own kubectl rather than fetching that one.
+
+**`--fetch-tools=TOOL[,TOOL]`** fetches only the clients it names —
+`helm`, `kubectl`, `jq`, comma-separated — and keeps the others on your
+machine, whose floors are still checked in the same first seconds. Any other
+name is refused before anything is downloaded (*"unknown --fetch-tools client:
+…. It fetches helm, kubectl and jq: name the ones this run needs,
+comma-separated (--fetch-tools=helm), or give --fetch-tools alone for all
+three"*). **`--fetch-tools=helm`** fetches Helm alone — this release's pinned
+Helm 4 — and keeps the kubectl and jq on your machine. It is the form for the
+four recovery paths that require Helm 4: it brings the one client they need
+and leaves your kubectl, matched to your cluster, in place. Every form
+downloads before the site file is read, so a proxy or custom CA needed for it
+must already be available to `curl`.
 
 ## Obtain and verify a release
 
@@ -1805,13 +1879,30 @@ before anything is applied, for every site: before Helm applies anything the
 installer starts one Pod on your storage node with one container per image, by
 digest — at the repositories the release names, or relocated under
 `registry.base` when you set it — using your pull Secret, and waits for the
-node's own container runtime to pull all six. A wrong prefix, a digest that was
-not copied, a registry the node cannot reach and a credential that does not
-apply all stop there, in about two minutes, in the runtime's own words:
+node's own container runtime to pull all six. The log names both ends:
+*"Proving node … can pull all 6 images from … before anything is applied"*,
+then *"All 6 images pulled from … by digest"*. A wrong prefix, a digest that
+was not copied, a registry the node cannot reach and a credential that does
+not apply all stop there, once a pull has kept failing for 90 seconds. The
+refusal names the images that fail and what the container runtime reported of
+the first, in the installer's words — the registry refused the pull, does not
+hold that name and digest, could not be reached, has a certificate the node
+does not trust, rate-limited the pull, the node's disk is full, or *"a
+condition this installer does not classify"*. The runtime's own message is
+kept in the state directory, never printed:
 
 ```
-GSJ: the node cannot pull this release from registry.base (registry.example.org/team/wrong): 6 of 6 images: ... The container runtime said, of the first: ... not found. ... Helm has applied nothing in this run
+GSJ: the node cannot pull this release from registry.base (registry.example.org/team/wrong): 6 of 6 images: ... The container runtime reported, of the first, the registry does not hold that name and digest (not found); its own words are kept in .../pull-probe-status.json. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's ... Helm has applied nothing in this run
 ```
+
+What it asks you to check follows the site. With `registry.base`, the copy and
+the prefix, as above, and the credential for that host. Without one it begins
+*"the node cannot pull this release from the release's own repositories"* and
+asks for the credential alone: *"The repositories and digests are the signed
+release's own. Check that registry.pull_secret (or the registry.config_file it
+is made from) carries a credential that can read every one of them; a node that
+cannot reach those registries at all needs a mirror it can reach, named in
+registry.base."*
 
 On a first install nothing exists yet at that point. On an upgrade the probe
 runs **before** the backup quiesces your application, so what was running is
@@ -1824,6 +1915,27 @@ file (a repair would complete a first install without its storage check).
 node's side — a registry CA it does not trust, its DNS or proxy, a full disk —
 needs no site change: the refusal names `resume --operation ID` for it, once the
 node can pull.
+
+**It waits `deadlines.dependencies_seconds` at most — 900 s by default — for
+all six images together, the corpus image included.** An earlier installer
+ran this probe only for a site that set `registry.base` (or had just dropped
+it); without one, the corpus image was pulled by the corpus initializer, under
+the initialization deadline, 24 hours by default. On a slow link to the
+registry the six may not all arrive within 900 s although nothing is wrong,
+and a site that installed that way under an earlier installer can now be
+refused here:
+
+```
+GSJ: the node did not finish pulling this release's images from the release's own repositories within deadlines.dependencies_seconds (900 s): ...; the Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
+```
+
+Its closing line names `resume --operation ID once the registry answers, or
+repair --operation ID … after raising deadlines.dependencies_seconds`. On such
+a link, raise `deadlines.dependencies_seconds` in the site file before you
+install or upgrade, and nothing has to be recovered. Once it has stopped a
+first install, `abandon` and `install` again from the raised file rather than
+take that repair, for the reason above. A pull that is still failing when that
+deadline arrives is refused as *cannot pull*, above.
 
 **It covers a location that changed**, in either direction. An upgrade whose
 site file has *lost* `registry.base` — a stale copy, a deleted line — would
@@ -2363,9 +2475,25 @@ and owner. A copy does not follow the original's renewals; copy it again when
 the original is renewed.
 
 Before the Lease, an `install` or `upgrade` reads that Secret and refuses —
-before anything is written — one that does not exist, is not of type
-`kubernetes.io/tls`, or lacks either key, a certificate that does not name
-`public_url`'s host, and one that has expired. Whether a client trusts it is
+before anything is written — one that does not exist (*"TLS Secret is
+unavailable: tls.profile existing serves the Secret gsj-tls, and namespace …
+holds none of that name"*, followed by the commands above), one it could not
+read (*"TLS Secret is unavailable: gsj-tls in namespace … could not be read"*),
+one not of type `kubernetes.io/tls` or lacking either key (*"TLS Secret is
+incomplete: gsj-tls in namespace … must be of type kubernetes.io/tls and hold a
+non-empty tls.crt and tls.key"*), a `tls.crt` that is no PEM certificate
+(*"TLS Secret is incomplete: the tls.crt of gsj-tls …"*), a certificate that
+does not name `public_url`'s host (*"TLS certificate host mismatch: the
+certificate in Secret gsj-tls … does not name public_url's host …"*), and one
+that has expired (*"TLS certificate expired: the certificate in Secret gsj-tls
+… is past its expiry date"*). A `tls.crt` that holds the leaf followed by its
+issuer is judged by the leaf. With `verification.ca_file` set it also verifies the
+certificate against that CA as strictly as the acceptance check will
+(`openssl verify -x509_strict`), and one that does not pass is said in a log
+line, not refused — *"The certificate in Secret gsj-tls does not pass strict
+verification (openssl verify -x509_strict) against verification.ca_file (…).
+… The run goes on"* — because the chain the controller serves, and the Pod's
+route to it, decide that, not the Secret alone. Whether a client trusts it is
 checked later, by the installer's own `public_https` probe — a `curl` from the
 machine you run the installer on, so `verification.ca_file` must be readable there and that machine
 must reach the route: `public_url` itself, or
@@ -2387,7 +2515,8 @@ kubectl -n NAMESPACE get secret NAME -o jsonpath='{.data.tls\.crt}' | base64 -d 
 
 and set `"verification": {"ca_file": "certificates/self-signed.pem"}`. The
 check from inside the `gsj-web` container applies strict X.509 rules, which
-some self-signed certificates do not meet;
+some self-signed certificates do not meet — the strict-verification line above
+is the early word on it;
 [Select infrastructure and trust profiles](#select-infrastructure-and-trust-profiles)
 has the reasons it names.
 
@@ -2578,9 +2707,14 @@ application proxies model calls itself. Set it only if you have been told to.
 
 **`public_url` must be a hostname no other release on the cluster serves.**
 An `install` or `upgrade` refuses, before its Lease, a host that another
-Ingress on the cluster already serves, and names that Ingress (where your
+Ingress on the cluster already serves, and names that Ingress: *"public_url's
+host … is already served by Ingress NAMESPACE/NAME: two deployments cannot
+share one host. Remove that Ingress, or choose another public_url, before
+installing"*. The host is compared without its port and regardless of case,
+and this deployment's own Ingress, on an upgrade, is not a collision. Where your
 kubeconfig may not list Ingresses in every namespace, the check is skipped and
-logged). A host served some other way — a controller's own routes, a load
+logged: *"public_url's host … was not checked against other Ingresses: this
+credential could not list Ingresses cluster-wide …"*. A host served some other way — a controller's own routes, a load
 balancer rule — is no Ingress and goes unseen, and that failure is not obvious:
 two deployments behind one hostname serve each other's certificate, and each
 one's acceptance verifier is pinned to its own CA, so the second install fails
@@ -2673,7 +2807,13 @@ larger corpus or storage you know to be slow; a much larger corpus, far fewer or
 lower `resources.initializer.requests.cpu` or slower storage all eat into that.
 Raising the deadline does not extend an initialization already in progress; that
 takes the named repair described below. Other defaults are 900 seconds for
-dependencies and 1,800 seconds for verification.
+dependencies and 1,800 seconds for verification. The dependencies deadline
+also bounds the pull proof before Helm applies anything: all six images, the
+corpus image included, must arrive on the node within it, or the run stops
+with *"the node did not finish pulling this release's images from … within
+deadlines.dependencies_seconds (900 s)"* — on a slow link to your registry,
+raise it
+([Make your nodes able to pull the images](#make-your-nodes-able-to-pull-the-images)).
 
 **What initialization costs in memory, and why the installer checks it first.**
 The initializer holds **one shard at a time**, so its memory need is a property
@@ -2757,10 +2897,10 @@ agent and never started).
 |---|---|
 | `storage.profile=reuse` | A qualified existing local-path or static-local StorageClass, selected Node, and optional existing claim names. Current installer admission permits `rancher.io/local-path`, `rancher.io/gsj-local-path`, and `kubernetes.io/no-provisioner`; other drivers need qualification. |
 | `storage.profile=managed-local-path` | Create the pinned provisioner and a `Retain`, `WaitForFirstConsumer` class at the explicit Node/backend path. Here **`storage.class` is not a class you pick from `inspect`'s list — it is the name of the class the installer creates**, so give it a name no existing StorageClass uses; `storage.node` and `storage.backend_path` say where that new class writes. An existing class of that name that this site does not already own is refused (*managed dependency differs or has another owner*) — including one an earlier GSJ install created for a different namespace or release name, because ownership is a hash of the namespace's UID and the release name; re-running this same site converges on the class it created. To keep using a class some other install made, name it under `storage.profile=reuse` instead: its provisioner, `rancher.io/gsj-local-path`, is admitted there, and that class's own node path map — not `storage.backend_path`, which `reuse` does not read — goes on deciding where it writes. Use `reuse` for an existing shared controller. |
-| `ingress.profile=reuse` | Supply the existing class and controller namespace. Its networking and TLS must support the configured public URL and the installer checks — see "What a reused controller must do" below. |
-| `ingress.profile=managed-traefik` | Create the pinned dedicated controller/class. Choose `LoadBalancer` with a working load-balancer implementation, or `NodePort` with explicit reachability. Kubernetes alone does not provide a public address. New installs' entrypoints allow 3,600 seconds to read one request, so an upload at the default 64 MiB cap needs about 19 KB/s, and never time out a streaming response. |
-| `tls.profile=existing` | An existing `kubernetes.io/tls` Secret with certificate and key. |
-| `tls.profile=files` | Certificate chain and private-key files for the public hostname; the installer creates the selected TLS Secret. |
+| `ingress.profile=reuse` | Supply the existing class and controller namespace. Its networking and TLS must support the configured public URL and the installer checks — see "What a reused controller must do" below. Before the Lease an `install` or `upgrade` refuses a namespace that does not exist (*"ingress.namespace … does not exist"*) or in which no Running Pod is an ingress controller by its name or its image (*"ingress.namespace … runs no ingress controller"*); one this kubeconfig may not read is logged as not checked (*"ingress.namespace … was not checked: …"*). |
+| `ingress.profile=managed-traefik` | Create the pinned dedicated controller/class in `ingress.namespace`, a namespace of its own that it creates: `target.namespace` there is refused before the Lease (*"ingress.namespace … is the namespace this deployment is installed in (target.namespace), and ingress.profile managed-traefik installs Traefik in a namespace of its own, which it creates"*). Choose `LoadBalancer` with a working load-balancer implementation, or `NodePort` with explicit reachability. Kubernetes alone does not provide a public address. New installs' entrypoints allow 3,600 seconds to read one request, so an upload at the default 64 MiB cap needs about 19 KB/s, and never time out a streaming response. |
+| `tls.profile=existing` | An existing `kubernetes.io/tls` Secret with certificate and key, checked before the Lease ([A certificate you already issue](#a-certificate-you-already-issue-tlsprofileexisting)). |
+| `tls.profile=files` | Certificate chain and private-key files for the public hostname; the installer creates the selected TLS Secret. Before the Lease an `install` or `upgrade` refuses a certificate file that is no PEM certificate (*"tls.certificate_file is not a readable PEM certificate (…); the host was not checked"*) or does not name `public_url`'s host (*"TLS certificate host mismatch: tls.certificate_file (…) does not name public_url's host …"*), and a Secret of that name already there that holds another certificate or key (*"Secret … differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite"*). |
 | `tls.profile=managed-acme` | Pinned cert-manager plus an ACME Issuer/Certificate. Set issuer name/email, real DNS and externally reachable HTTP01 validation through the ingress class. |
 | `tls.profile=managed-local-ca` | Generate a persistent private CA and hostname certificate for practice environments. The installer saves the CA path in the site file before an operation starts, and prints it. Browser trust requires an explicit operator action. |
 
@@ -3041,6 +3181,24 @@ reset or storage relocation. A changed corpus requires explicit
 currently refused until both case and decision indexes have a qualified
 migration path.
 
+`corpus.allow_update=true` admits one corpus change, not every later one. Once
+the operation that completed that change — the upgrade, or the `resume` or
+`repair` that finished it — is recorded complete, the installer sets
+`corpus.allow_update` back to `false` in the site file you gave it, in the
+operation's saved site and in the installed record, and says so in one line:
+*"The corpus change this operation admitted is complete (fingerprint … to …);
+corpus.allow_update is set back to false in …, the operation's saved site and
+the installed record, so a later release's corpus change is refused until it is
+admitted again after its own pre-migration backup"*. The next corpus change
+then asks again, after its own backup. It rewrites only a regular file: a site
+file that is a symbolic link is never written through, and then nothing is
+changed and the line says so instead — *"The corpus change this operation
+admitted is complete (fingerprint … to …), but … is a symbolic link or no
+longer a regular file, so corpus.allow_update stays true there and in the
+installed record: set it to false in the file the link names, or a later
+release's corpus change is admitted without being asked for"*; set it there
+yourself. A `true` with no corpus change, and a restore, leave it as it is.
+
 Sign-in sessions live only in the web process memory. An upgrade, repair,
 restore, backup or any Pod restart ends them, and users sign in again. Saved
 cases, notes, annotations and conversations persist.
@@ -3133,7 +3291,8 @@ recorded as its result; if it ever does not, it writes the
 **complete merged** site instead — every default spelled out — and logs that it
 did. (Releases before this one always wrote the complete site, and the
 interactive wizard still writes a complete file, because it builds the file for
-you.) The number is written *before* Helm applies the generation, so a repair
+you.) A repair that completes a corpus change also sets `corpus.allow_update`
+back to `false` there, as above. The number is written *before* Helm applies the generation, so a repair
 that stops ahead of the apply leaves your file naming a
 `corpus.repair_generation` the cluster is not yet running. Continue it with
 `resume --operation ID` and that file, which is exactly the saved configuration
@@ -3308,7 +3467,9 @@ re-derive these vectors, refreshing a corpus means a new tag here, a new
 manifest, and every site re-importing from it.
 `corpus-update-required` means the stored corpus differs from this release:
 after a verified backup, set `corpus.allow_update=true` in the saved site and
-run the same repair. `model-change-blocked` means the stored index uses another
+run the same repair; once the change completes, the installer sets it back to
+`false` ([Upgrade and recover](#upgrade-and-recover-a-named-operation)).
+`model-change-blocked` means the stored index uses another
 embedding model: keep the previous release or restore its verified backup.
 `manifest-mismatch`, `core-mismatch` and `invalid-settings` are release defects
 that need `repair --to` with a corrected signed release. These refusals fail at
@@ -3628,11 +3789,24 @@ installer hands each per-operation directory back to the user that ran it
 paths that keep the Pod for `resume`. If a handback is refused the installer
 says so and names the directory that still needs root.
 
-**What stays in it.** Once a backup's archive is verified, the two plaintext
-staging files — the archive as it was written and its copy decrypted back for
-verification — are removed inside the Pod, and the directory is made private
-(`0700`) and handed back to you; a restore's decrypted archive is removed the
-same way once the restore has used it. A stopped operation keeps them, because
+**What stays in it.** Every maintenance Pod that stages there — backup,
+restore, vector staging — makes its per-operation directory private (`0700`)
+inside the Pod as soon as it is running, before it writes anything: a
+directory the kubelet made is root's with mode `0755`. Once a backup's archive
+is verified, the two plaintext staging files — `snapshot.tar.gz`, the archive
+as it was written, and `roundtrip.tar.gz`, its copy decrypted back for
+verification — are removed inside the Pod, and the directory is handed back to
+you; a restore's decrypted archive, `snapshot-<sha256>.tar.gz`, is removed the
+same way once the restored files are verified. Neither the removal nor the
+`chmod` ever fails the operation. One the Pod refuses is said in the log, with
+the directory and the node — *"The plaintext copies this backup staged,
+snapshot.tar.gz and roundtrip.tar.gz, could not be removed from … on node …;
+the encrypted archive is verified, so remove them there by hand"*, for a restore *"The decrypted restore archive …
+could not be removed from … on node …; the restored files are verified, so
+remove it there by hand"*, and *"The transfer directory … on node … could not
+be made private (mode 0700), so other accounts on that node may read …"* — and
+kubectl's own words are kept in the state directory, in `transfer-remove.err`
+and `transfer-private.err`. A stopped operation keeps them, because
 its repair reads them: remove nothing under an operation's directory until that
 operation has completed or been abandoned. The install itself leaves one
 directory there as well, `<transfer_path>/<operation>`, empty, from the Pod
@@ -3642,7 +3816,15 @@ operation belongs to you, and `rm -rf <transfer_path>/<operation>` needs no
 `storage.transfer_path` empty and each Pod stages in an `emptyDir` instead — the
 node's own ephemeral filesystem, deleted with the Pod: the archive is on the
 node while the operation runs and nothing of it survives afterwards, so there
-is no directory to hand back and none to remove.
+is no directory to make private, to hand back or to remove.
+
+Before a restore streams its decrypted archive into that directory, or into
+its `emptyDir`, it measures the free space there inside the restore Pod and
+refuses, having streamed nothing, when the archive and a margin — the larger
+of 256 MiB and a tenth of the archive — would not fit: *"restore staging space
+is insufficient: … has … bytes free and the decrypted archive needs …"*. Make
+room there, then run the `restore-repair --operation ID` the closing line
+names; the operation stays retained for it.
 
 **`TMPDIR` belongs on the data disk too.** The installer's own working
 directory, and the corpus envelope inside it, sit under `TMPDIR` (else `/tmp`)
@@ -3943,16 +4125,20 @@ initializer container that already ran; missing or unreadable local evidence;
 no recorded Helm target or pre-startup capacity pass; or a pending revision,
 which an interrupted Helm client leaves and which has no continuation. Keep the operation retained and its site directory
 as it is: the directory holds the operation's evidence, and its unfinished
-restore checkpoint refuses a fresh restore there. Restore the same verified
+restore checkpoint refuses a fresh restore there (*"restore checkpoint already
+exists; use restore-repair --operation ID for its recorded resource/file phase
+or resume for application startup"*). Restore the same verified
 archive into an empty namespace of the same name (restore keeps the archive's
 namespace and release names) from a new site directory: on another cluster,
 keeping this namespace too, or, with one cluster, on this one once the
 deployment is removed (`abandon --operation`, `helm uninstall` of the release,
-`sweep`, then delete the namespace; with `local-path` that erases the claims):
+`sweep`, then delete the namespace; under a class that deletes on release that
+erases the claims' data), in the order
+[Restore onto the same cluster](#restore-onto-the-same-cluster) gives:
 
 ```sh
 bash source-gsj-install.sh restore --archive "$GSJ_BACKUP_ARCHIVE" \
-  --config "$HOME/gsj-fresh-restore/site.json" --non-interactive
+  --config "$HOME/gsj-operator/restore-1/site.json" --non-interactive
 ```
 
 The repair command itself never uninstalls or rolls back Helm; recreates claims,
@@ -3973,7 +4159,7 @@ from a fixed list, so quote it verbatim when you report it.
 | exit | what happened | what to do |
 |---|---|---|
 | `0` | the verb finished | — |
-| `1` | a **named refusal**: one line starting `GSJ: `, on stderr | read that line. If an operation was under way the very next line is `Operation ID incomplete; retained state at DIR. Use …` — and the verb it names is the one to run. It is not always `resume` |
+| `1` | a **named refusal**: one line starting `GSJ: `, on stderr | read that line. If an operation was under way the very next line is `Operation ID incomplete; retained state at DIR. Use …` — and the verb it names is the one to run. It is not always `resume`: after a failed Helm apply of an install, upgrade or restore it is `repair --operation ID --config … --non-interactive after fixing the cause` |
 | `3` | `init` only: its report was written and names something to fix — a FAIL row, or a release it could not verify | read its closing lines; send the report |
 | `129`, `130`, `143` | the installer was sent HUP, INT (Ctrl-C) or TERM | nothing is lost: the state directory and the operation's Lease are retained. Wait 180 s for the Lease to go stale, then run the `resume --operation ID` the closing line names |
 | anything else | a child's status passed through unchanged | read the last lines of the log; section 2 lists the ones with a meaning |
@@ -4105,11 +4291,29 @@ first install, or its recovery, realistically meets:
 | `… is still live` — worded *the prior installer*, *the previous installer* or *the prior installer lease*, depending on the verb | the operation's Lease was renewed less than 180 s ago | make sure no installer process is still running against this target, wait out the 180 s, and run the same command again. With nothing running it is a clock, not a fault |
 | `resume configuration changed; use an explicit repair` | the site file differs from the one the operation was started with | `repair --operation ID --config …` — `repair` re-reads the file, `resume` never does. A `resume` refused for this reason has already renewed the Lease — it does so before it compares the file, and a failed run keeps its Lease. Measured: more than four minutes after the installer had exited, such a `resume` was refused, and a `repair` run straight after it was refused, nine seconds later, as *still live* with nothing running. Wait the 180 s again, from that refusal |
 | `target release does not declare this source-to-target transition` | this executable is a different release from the one that installed, or started the operation on, this target | use the executable that did; or `abandon`, `helm uninstall` (claims are kept), `sweep`, and install afresh onto the kept claims with `storage.*.existing_claim` |
+| `bootstrap utility required` | a utility every verb needs before anything else is missing — `curl`, `tar`, `gzip`, `base64`, `openssl`, `awk`, `cut`, `uname`, `mktemp`, `date` or `sync`, named — or, as *bootstrap utility required: sha256sum or shasum*, a SHA-256 tool | install it, then run the same command |
+| `requires helm >= …`, `requires kubectl >= …`, `requires jq >= …` | that client is missing, reported no version, or is below its floor | install or upgrade it, or re-run with the `--fetch-tools=TOOL` the refusal names |
+| `kubectl version skew` | an `install` or `upgrade` would run on a kubectl that `--fetch-tools` downloaded, more than one minor from the server | run without `--fetch-tools`, or with `--fetch-tools=helm`, to keep your own kubectl |
+| `TLS Secret is unavailable` | under `tls.profile=existing`, `tls.secret` is not in the target namespace — or, *… could not be read*, your kubeconfig could not read it there | create it there, the namespace first (the refusal names the commands), or correct the access; then the same command |
+| `TLS Secret is incomplete` | `tls.secret` is not of type `kubernetes.io/tls`, lacks `tls.crt` or `tls.key`, or its `tls.crt` is not a PEM certificate | replace it with one that is (the refusal names the commands) |
+| `TLS certificate host mismatch` | the certificate — in `tls.secret`, or in `tls.certificate_file` — does not name `public_url`'s host | a certificate for that host, or the right `public_url` |
+| `TLS certificate expired` | the certificate in `tls.secret` is past its expiry date | a current certificate in that Secret, then the same command |
+| `tls.certificate_file is not a readable PEM certificate` | under `tls.profile=files`; the host was not checked | point it at the PEM certificate for the host |
+| `Secret … differs from supplied credential` | a Secret of that name is already in the namespace — the operator Secret, or the `files` profile's TLS Secret — and holds other bytes than your file. The installer never overwrites one | put back the file that matches the Secret, then the same command |
+| `operator.password_file holds a control character` | the password file holds a tab, a carriage return or another byte below 32, or nothing but newlines | write the password as one line of printable characters, then the same command |
+| `ingress.namespace … does not exist`, `ingress.namespace … runs no ingress controller` | under `ingress.profile=reuse`, the namespace is missing, or none of its Running Pods is an ingress controller by its name or its image | set `ingress.namespace` to the namespace the controller's Pods run in — the first column of `kubectl get pods -A` — then the same command |
+| `ingress.namespace … is the namespace this deployment is installed in` | under `managed-traefik`, `ingress.namespace` is `target.namespace`; Traefik gets a namespace of its own | another `ingress.namespace` (`gsj-ingress` is the default), or `ingress.profile` `reuse` for a controller that already runs |
+| `public_url's host … is already served by Ingress` | another deployment's Ingress serves that host, named in the refusal | remove that Ingress, or choose another `public_url` |
+| `managed add-on CustomResourceDefinitions are left without their owner record` | CRDs of an add-on this site selects, left by an earlier install of it without its owner record | the teardown the refusal names — this installer deletes nothing — then the same command |
+| `the operator Secret … could not be read`, `TLS Secret … could not be read` | your kubeconfig could not read that Secret in the target namespace | correct the access — kubectl's output is kept in the state-directory file the refusal names — then the same command |
 | `no node has room for this deployment` | the scheduler's arithmetic over what other Pods have *reserved* | free requests on a node or name another in `storage.node`; this is not about free memory |
 | `the corpus initializer needs …Mi` | `resources.initializer.limits.memory` is below what this release's corpus needs | raise it in the site file to at least the figure named |
 | `backup cannot change application settings` | the site file differs from the installed one outside its `backup`, `delivery` and `verification` blocks and `storage.transfer_path` and `storage.minimum_free_bytes` — an edited `registry.base` counts | put the installed values back, or run the operation that adopts the edit — an upgrade, or `install` again with the same installer — then back up |
 | `temporary storage backend cleanup incomplete` | the storage check's temporary claim bound a volume and marked it `Delete`, and 120 s after that claim was deleted the volume was still there. The message names the volume and its phase, and the phase is the whole difference | *…and it is now Failed*: nothing on this cluster deletes a volume of that class. Name your own claim in `storage.data.existing_claim`; wait until the operation's Lease has gone 180 s unrenewed, `abandon --operation ID --reason "…"`, install again. The volume it names accepts no claim until that PersistentVolume object is deleted and created again — do that only if you still want it. *…was still present (phase …)*, any other phase, `unknown` if it could not be read: whatever removes volumes of that class is slow or stuck. Do **not** delete the volume; look at that provisioner or deleter, then continue with the command the closing line names |
 | `the node cannot pull this release from` | the pull proof failed: `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
+| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again — or `resume` once the registry answers |
+| `Helm provisioning failed; persistent state was retained` | the Helm apply of an install, upgrade or restore exited non-zero; the last 25 lines of Helm's log precede it. The operation stays in its Helm phase, where `resume` refuses | fix the cause, wait 180 s, then the `repair --operation ID --config … --non-interactive` the closing line names |
+| `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin; nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
 | `the operation Lease is already free; nothing to abandon` | `abandon` on a target with no live operation — normal after a completed install | carry on; it exits `1` while doing no harm, so do not let a script stop on it |
 | `a Helm release named … exists … sweep never removes a deployment` | `sweep` clears residue, never a deployment | `helm uninstall` first (its claims are kept), then `sweep` |
 
@@ -4250,8 +4454,12 @@ Only once every line reads `0 objects` — `kubectl get <kind> -A` lists no obje
 of that kind in any namespace — delete them, each by name:
 `kubectl delete crd NAME`. A set left behind is not harmless: the next install
 on this cluster that selects the same add-on finds CRDs without the owner record
-that would admit them and is refused before its Lease, each one named; one that
-selects only the other add-on names them in its log and goes on.
+that would admit them and is refused before its Lease, each one named with this
+teardown (*"managed add-on CustomResourceDefinitions are left without their
+owner record: …"*); one that selects only the other add-on names them in its
+log and goes on. Which add-on a CRD belongs to is its API group: `traefik.io`,
+`hub.traefik.io` and `traefik.containo.us` are Traefik's, `cert-manager.io` and
+`acme.cert-manager.io` cert-manager's.
 
 Beyond the cluster, two things outlive all of this and are yours to remove:
 the operator state directory under `$STATE/...` (keep it if you want the audit
@@ -4262,11 +4470,15 @@ at any time and re-fetchable.
 
 ## Restore onto the same cluster
 
-The fresh restores this guide names elsewhere go into another Kubernetes
-context whose namespace of the same name is empty. With one cluster, that
-namespace can be emptied instead, by removing the deployment first. That takes
-the deployment's data off the cluster before the restore puts it back, so it
-has an order, and the first step is the one that makes the others safe.
+A fresh restore goes into an empty namespace of the same name, from a new
+site directory, and the installer's refusals name both places it can be:
+*"… into an empty namespace … from a new site directory: on another cluster,
+or on this one once the deployment is removed (abandon --operation …, helm
+uninstall …, sweep, then delete namespace …)"*. This section is the second.
+With one cluster, the namespace is emptied by removing the deployment first.
+That takes the deployment's data off the cluster before the restore puts it
+back, so it has an order, and the first step is the one that makes the others
+safe.
 
 **1. Copies off the box, first.** Before anything is removed, copy to storage
 that does not fail with this cluster or with the machine you install from:
@@ -4297,7 +4509,7 @@ section says: their ownership is recorded against the identity of the
 namespace you have just deleted, the recreated namespace is a new identity, and
 the restore's add-on step refuses add-ons that another identity owns. Where
 another site on the cluster uses them, this route is closed to you: restore
-into another Kubernetes context. (Read from the installer, not run.)
+on another cluster. (Read from the installer, not run.)
 
 **3. Restore from a new site directory**, whose site file names the same
 namespace and release, with the exact source installer. The copy of the site
@@ -4325,10 +4537,20 @@ and the private inputs, and ends with the ordinary acceptance.
 under `.gsj/<sha256 of the context name>/<namespace>/<release>`, so the same
 context, namespace and release lead a restore from the old directory into the
 old deployment's records: its canonical operation, the checkpoint of an earlier
-restoration, the records of earlier verification runs. The installer retires a
-completed restoration checkpoint and a finished verification record of another
-operation by itself; anything else there either refuses the fresh restore or
-strands it partway, where only that state's own recovery continues it. A
+restoration, the records of earlier verification runs. The installer retires two
+of these by itself and says so in the log. A completed restoration checkpoint
+whose operation has ended:
+*"Retired the completed restore checkpoint of ended operation … to
+…/retired-restoration.json; this restore records its own"*. And the
+verification record of an ended operation whose namespace has since been
+replaced — or, under a restore, one whose run had finished:
+*"Retired verification run … of ended operation … to
+…/retired-verification-active.json: its ledger went with the claims this
+operation replaced; this operation starts its own run"*. Anything else there
+either refuses the fresh restore — an unfinished checkpoint with *"restore
+checkpoint already exists; …"* — or strands it partway, at verification with
+*"verification ownership ledger is missing after launch"*, where only that
+state's own recovery continues it. A
 directory no installer has used holds nothing of the kind. Keep the old one: its
 `abandoned-*.json` and `swept-*.json` records are the account of what was done.
 

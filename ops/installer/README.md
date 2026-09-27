@@ -30,7 +30,9 @@ the same first seconds and never downloaded: OpenSSL 3.0 or newer, not LibreSSL
 refusal happens before the payload is unpacked, so it costs nothing and touches
 nothing. `--fetch-tools`, accepted by every command, restores the download:
 `gsj_client_info` then supplies the pinned URL and SHA256 per tool, and
-verified clients are cached in the runtime's private bin directory. Neither
+verified clients are cached in the runtime's private bin directory;
+`--fetch-tools=TOOL[,TOOL]` downloads only the clients it names and holds the
+others to their floors. Neither
 
 <!-- init: begin -->
 `init` is the one command that names every missing or too-old client at
@@ -457,16 +459,31 @@ no private input.
 7. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
    and populated upgrade/restore): the populated upgrade acquires the
    candidate from the staged version URL and holds the read-back receipt to
-   the staged bytes; the gate (`ci/qualify.py gate`) then requires every
-   report and receipt. The harness reads the verifier's check list from the
+   the staged bytes; the gate (`ci/qualify.py gate`) then refuses, before
+   any other check, a candidate that is not signed for the permanent release
+   key (`RELEASE_TRUST_KEY_SHA256`) — every installed release verifies its
+   successor under the key it carries — with *"the candidate is not signed
+   for the permanent release key; every installed release would refuse it as
+   an upgrade target, so sign it with that key and qualify it again"*, and
+   requires every report and receipt, each report naming the helm, kubectl,
+   jq and Kubernetes server versions it ran with (its `clients`; qualification
+   never passes `--fetch-tools`, so those are the PATH clients the installer
+   ran on, and a run that cannot read one stops before its first phase). The
+   harness reads the verifier's check list from the
    pinned product commit, so the machine it runs on needs a Git directory
    that carries that commit — `GSJ_NEXT_WEB_GIT_DIR`, the staged
    `ops/.build/gsj-next-web.git`, or the `../gsj-next-web` sibling — and
    refuses in its first second, naming that recipe, when none does. Give
    every run a fresh site directory: the installer's state lives beside the
-   site file, and a second run over the first run's state (its namespace
-   already deleted by the harness) stops at verification with *"verification
-   ownership ledger is missing after launch"*.
+   site file, and a second run over the first run's state meets that run's
+   records. It retires the first run's verification record by itself
+   (*"Retired verification run … of ended operation …"*) when the namespace
+   the first operation recorded in its intent has since been replaced — the
+   harness deletes it — and, under a restore, when that run had finished.
+   Where neither holds — no intent saved for the first operation, or the same
+   namespace with any other run — the record is resumed, and with its ledger
+   gone the second run stops at verification with *"verification ownership
+   ledger is missing after launch"*.
 8. **Publication**: the release assets (below) — `verify-release.sh`, the
    public key, the descriptor, its signature and the installer — after the
    gate has passed for these exact signed bytes.

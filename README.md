@@ -45,7 +45,8 @@ install and when you would find out.
   corpus import and before any acceptance check has run. Every pull of the
   release's images is proven on the storage node before anything is applied,
   for every site, so nodes that cannot pull stop an install in its first
-  minutes.
+  minutes; all six must arrive within `deadlines.dependencies_seconds`
+  (900 s by default), which a slow link to the registry may need raised.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has
@@ -56,11 +57,13 @@ install and when you would find out.
   LibreSSL or an OpenSSL below the floor, are named with the tool, the floor
   and what was found; an `openssl` absent from the PATH altogether is refused
   by name alone, as a required utility. `--fetch-tools` downloads its own
-  pinned clients instead (it does not supply OpenSSL); `--fetch-tools=helm`
+  pinned clients instead (it does not supply OpenSSL), and
+  `--fetch-tools=TOOL[,TOOL]` only the ones it names: `--fetch-tools=helm`
   downloads Helm alone — the pinned Helm 4 that four recovery paths need —
-  and keeps your own kubectl and jq, floors still checked. A kubectl more
-  than one minor from the API server is warned about before the operation
-  Lease, and refused when it is the one `--fetch-tools` brought. `init` is the
+  and keeps your own kubectl and jq, floors still checked. An `install` or
+  `upgrade` warns, before the operation Lease, about a kubectl more than one
+  minor from the API server, and refuses one that `--fetch-tools` brought
+  (*kubectl version skew*). `init` is the
   one command that does not stop at the first: it names them all at once, in
   its report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible
@@ -117,10 +120,10 @@ unverified run keeps none.
 
 Then it checks the box, all at once, and writes every result as PASS, FAIL
 or UNKNOWN with the reason and the fix: helm, kubectl (and its skew
-against the cluster) and jq against their floors, saying what to install and
-which of them `--fetch-tools` can supply for the other commands (never
-OpenSSL), with OpenSSL, bash, curl, tar, gzip, base64 and the SHA-256 tool
-recorded as found (a box that lacks one of those is refused before `init`
+against the cluster) and jq against their floors, saying what to install and,
+for each one this release pins for the platform, the `--fetch-tools=TOOL` that
+fetches it alone for the other commands (never OpenSSL), with OpenSSL, bash,
+curl, tar, gzip, base64 and the SHA-256 tool recorded as found (a box that lacks one of those is refused before `init`
 can run, one at a time); the
 cluster its kubeconfig points at, named by its context, and its version
 against the floor; `github.com`, where the corpus release lives, and
@@ -155,9 +158,9 @@ published verifier; it refuses `--fetch-tools`, which would download and
 run three clients. Without a network it still produces its report from what
 is on the box, and says what the no-egress route needs instead. A missing or
 LibreSSL `openssl`, a missing bash, curl, tar, gzip or base64, or a machine
-without `sha256sum` or `shasum`, is refused by name before `init` runs, one
-at a time, like before every other command: those are the tools `init`
-cannot report around.
+without `sha256sum` or `shasum` (*bootstrap utility required: sha256sum or
+shasum*), is refused by name before `init` runs, one at a time, like before
+every other command: those are the tools `init` cannot report around.
 
 **The honest limit.** `init` proves that the installer arrived intact and
 matches its published descriptor. It cannot prove that the installer is
