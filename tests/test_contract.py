@@ -12,11 +12,12 @@ guide expect; and the deadline, controller and released-vectors mappings hold.
 
 Skip-guarded on the pinned Git objects (a public runner has no product), on
 helm where a test renders the chart, and on jq, like the product's own chart
-tests. One contract needs neither the product nor helm: a site file written
-for the previous release keeps its meaning under this one. It reads that
-release's installer files from this repository's own Git tags, so it runs on
-the public runner too, and skips only where the tag is absent (a shallow
-clone).
+tests. The contracts on the installer's own files need neither the product
+nor helm: the synthetic site's compiled keys, the contract document's names,
+and above all that a site file written for the previous release keeps its
+meaning under this one. That one reads the previous release's installer
+files from this repository's own Git tags, so it runs on the public runner
+too, and skips only where the tag is absent (a shallow clone).
 """
 import ast
 import inspect
@@ -36,8 +37,8 @@ from tests.pinned_web import needs_web
 from tests.test_installer import INSTALLER, ROOT, _release, _site
 
 # needs_web marks each test that reads the pinned product and needs_helm each
-# test that renders it, not the module: the continuity test at the end reads
-# only this repository's Git and runs jq.
+# test that renders it, not the module: a test of the installer's own files,
+# the continuity test at the end among them, runs without either.
 needs_helm = pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
 pytestmark = [pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")]
 
@@ -157,7 +158,6 @@ def test_every_compiled_leaf_is_a_value_the_pinned_chart_declares(tmp_path, exam
     assert unknown == [], f"compile.jq emits values the pinned chart does not declare: {unknown}"
 
 
-@needs_web
 def test_the_synthetic_site_compiles_to_the_documented_keys(tmp_path):
     values = compiled(tmp_path, _site())
     assert set(values) == {"fullnameOverride", "deployment", "image", "corpus", "startup", "web", "ingress", "networkPolicy",
@@ -362,18 +362,29 @@ def _helm_skips(item):
             if m.name == "skipif" and "helm" in m.kwargs.get("reason", "")]
 
 
-def test_only_the_tests_that_render_the_pinned_chart_skip_without_helm():
+def _web_skips(item):
+    marks = getattr(item, "pytestmark", [])
+    return [m for m in (marks if isinstance(marks, list) else [marks]) if m == needs_web.mark]
+
+
+def test_only_the_tests_that_read_the_pinned_product_skip_without_it_and_only_those_that_render_it_without_helm():
     """A runner without helm still holds every contract no render needs, the
     previous release's site continuity above all: it reads Git and runs jq.
-    The helm skip sits on each test that renders, never on the module."""
+    The helm skip sits on each test that renders, never on the module. A
+    public runner has no product: the product skip sits on each test that
+    reads the pinned product -- its files, its chart or a render of it --
+    and on no other, so a test of the installer's own files runs there."""
     assert _helm_skips(sys.modules[__name__]) == [], "the module skips every test on a runner without helm"
+    assert _web_skips(sys.modules[__name__]) == [], "the module skips every test on a runner without the product"
     for name, test in sorted(globals().items()):
         if name.startswith("test_"):
-            renders = re.search(r"\brendered\(|\bhelm\b.*\btemplate\b", inspect.getsource(test)) is not None
+            source = inspect.getsource(test)
+            renders = re.search(r"\brendered\(|\bhelm\b.*\btemplate\b", source) is not None
             assert bool(_helm_skips(test)) == renders, name
+            reads = re.search(r"\bpinned_web\.|\brendered\(|\bchart\(\)|\bshow\(", source) is not None
+            assert bool(_web_skips(test)) == reads, name
 
 
-@needs_web
 def test_the_contract_document_names_this_module_and_the_pin_test():
     text = (INSTALLER / "CONTRACT.md").read_text()
     assert "tests/test_contract.py" in text and "tests/test_web_pin.py" in text
