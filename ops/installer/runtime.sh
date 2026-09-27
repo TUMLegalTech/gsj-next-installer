@@ -60,18 +60,25 @@ validator_words() {
 }
 pull_failure_condition() {
  # The CONDITION a container runtime's pull message establishes, in this
- # installer's words. The message itself is untrusted text -- a registry or
+ # installer's words, printed after the word that says whether the kubelet's
+ # retries can change it and a tab. "definitive": the registry's answer about
+ # this credential or this name, or a reference that is not a name, which
+ # every retry gets again. "retryable": the rest -- a connection, a rate
+ # limit, a certificate or a disk the node's side can put right while the
+ # kubelet retries, and words this installer does not classify, which a
+ # retry may clear. The message itself is untrusted text -- a registry or
  # a proxy composes it, a bearer can ride in it -- and is never repeated
  # [review B2]; it is kept in the state directory for the operator.
  local m; m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
  case $m in
-   *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'the registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
-   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'the registry does not hold that name and digest (not found)';;
-   *"no such host"*|*"server misbehaving"*|*"lookup "*|*"i/o timeout"*|*"connection refused"*|*"no route"*|*"dial tcp"*|*"network is unreachable"*|*"connection reset"*) printf 'the node could not connect to the registry (DNS, a route, a proxy, or a refused or timed-out connection)';;
-   *x509*|*certificate*|*"tls handshake"*) printf 'the node does not trust the registry'"'"'s certificate (a CA the container runtime does not know)';;
-   *toomanyrequests*|*"too many requests"*|*"rate limit"*) printf 'the registry rate-limited the pull (a limit or an outage on its side)';;
-   *"no space"*|*"disk pressure"*) printf 'the node'"'"'s disk is full';;
-   *) printf 'a condition this installer does not classify';;
+   *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'definitive\tthe registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
+   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'definitive\tthe registry does not hold that name and digest (not found)';;
+   *"invalid reference format"*|*"couldn't parse image"*|*invalidimagename*) printf 'definitive\tthe reference is not a valid image name (an invalid name)';;
+   *"no such host"*|*"server misbehaving"*|*"lookup "*|*"i/o timeout"*|*"connection refused"*|*"no route"*|*"dial tcp"*|*"network is unreachable"*|*"connection reset"*) printf 'retryable\tthe node could not connect to the registry (DNS, a route, a proxy, or a refused or timed-out connection)';;
+   *x509*|*certificate*|*"tls handshake"*) printf 'retryable\tthe node does not trust the registry'"'"'s certificate (a CA the container runtime does not know)';;
+   *toomanyrequests*|*"too many requests"*|*"rate limit"*) printf 'retryable\tthe registry rate-limited the pull (a limit or an outage on its side)';;
+   *"no space"*|*"disk pressure"*) printf 'retryable\tthe node'"'"'s disk is full';;
+   *) printf 'retryable\ta condition this installer does not classify';;
  esac
 }
 kubectl_failure_condition() {
@@ -3192,19 +3199,23 @@ relocated_images_probe() {
  # deleted line -- renders the release's original repositories, the ones this
  # site said its nodes cannot reach, and the words say so.
  #
- # HOW LONG. A container that REPORTS a pull failure is refused once the
- # failure has outlived 90 s of retries, on every site. A pull still in
- # progress is bounded by deadlines.dependencies_seconds when registry.base is
- # set or changed, as it always was for those sites. Otherwise the images come
- # from where the previous release pulled them, and that release pulled web,
- # runner, mcp and the corpus image under the initialization deadline (24 h by
- # default): a slow link it installed over must not be refused by 900 s now, so
- # the wait goes on to dependencies_seconds + initialization_seconds, said once
- # when the first is spent. The Pod's activeDeadlineSeconds follows the bound.
+ # HOW LONG. A container that REPORTS a definitive pull failure -- the
+ # registry refused the credential or does not hold the name, or the name is
+ # not one -- is refused once the failure has outlived 90 s of retries, on
+ # every site. Any other failure can clear on one of the kubelet's retries: it
+ # is said once and waited out to the bound below, and one still reported
+ # there is refused by its class. A pull still in progress is bounded by
+ # deadlines.dependencies_seconds when registry.base is set or changed, as it
+ # always was for those sites. Otherwise the images come from where the
+ # previous release pulled them, and that release pulled web, runner, mcp and
+ # the corpus image under the initialization deadline (24 h by default): a
+ # slow link it installed over must not be refused by 900 s now, so the wait
+ # goes on to dependencies_seconds + initialization_seconds, said once when
+ # the first is spent. The Pod's activeDeadlineSeconds follows the bound.
  #
  # WHERE IN THE CHAIN. Before backup quiesces a running deployment: a refusal
  # here leaves whatever was running, running.
- local base recorded='' pod spent=0 failing_since=-1 status verdict words='' where deadline want bound within slow=false refuse
+ local base recorded='' pod spent=0 failing_since=-1 status verdict words='' words_rank=-1 said rank condition where deadline want bound within slow=false retrying=false refuse
  base=$(j '.registry.base // ""')
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
  # registry.base has no scheme (the schema holds it to host[:port][/path]), so
@@ -3261,7 +3272,8 @@ relocated_images_probe() {
    status=$(k get pod "$pod" -o json 2>/dev/null) || status='{}'
    # pulled: the runtime reports the image's ID, or the container got as far as
    # being created. `terminated` alone is NOT proof -- a Pod evicted before its
-   # pull reports terminated/ContainerStatusUnknown with no imageID.
+   # pull reports terminated/ContainerStatusUnknown with no imageID. failing:
+   # the verdict, then each failing container's words on a line of its own.
    verdict=$(jq -r --argjson want "$want" '
      [(.status.containerStatuses // [])[] | {image,
         failed: ((.state.waiting.reason // "") | test("^(ErrImage|ImagePull|ImageInspect|InvalidImageName|RegistryUnavailable)")),
@@ -3271,7 +3283,7 @@ relocated_images_probe() {
                  or ((.state.waiting.reason // "") | IN("RunContainerError","CreateContainerError","CrashLoopBackOff")))}] as $c
      | if ($c|length) == $want and all($c[]; .pulled) then "pulled"
        elif any($c[]; .failed) then ([$c[]|select(.failed)]) as $f |
-         "failing " + ($f|length|tostring) + " of " + ($want|tostring) + " images: " + ([$f[].image]|join(", ")) + " SAID " + $f[0].words
+         ("failing " + ($f|length|tostring) + " of " + ($want|tostring) + " images: " + ([$f[].image]|join(", "))), $f[].words
        else "waiting" end' <<< "$status")
    case "$verdict" in
      pulled) break;;
@@ -3279,16 +3291,27 @@ relocated_images_probe() {
        (( failing_since >= 0 )) || failing_since=$spent
        # The cause is in the FIRST failure message (ErrImagePull: "not found",
        # "unauthorized", "no such host"); ImagePullBackOff replaces it with
-       # "Back-off pulling image". Keep the informative one.
-       if [[ -z $words || ( $words == Back-off* && ${verdict#* SAID } != Back-off* ) ]]; then words=${verdict#* SAID }; fi;;
-     *) failing_since=-1;;
+       # "Back-off pulling image". Keep the most telling cause any failing
+       # container reported: a definitive one over one a retry can clear, so an
+       # image whose pull times out never hides one the registry refuses, and
+       # either over that back-off.
+       while IFS= read -r said; do
+         rank=1; [[ $(pull_failure_condition "$said") != definitive* ]] || rank=2
+         [[ $rank == 2 || ( -n $said && $said != Back-off* ) ]] || rank=0
+         if (( rank > words_rank )); then words=$said; words_rank=$rank; fi
+       done <<< "${verdict#*$'\n'}"
+       verdict=${verdict%%$'\n'*};;
+     *) failing_since=-1; words=''; words_rank=-1;;
    esac
    # The kubelet retries a failed pull with backoff, and a registry can stumble
-   # once: refuse only a failure that has outlived 90 s of retries -- or one that
-   # is still failing when the bound arrives, which a short
+   # once: refuse a definitive failure once it has outlived 90 s of retries.
+   # Wait out any other: a large image on a slow link can time out once and
+   # pull on the next attempt, and that attempt takes minutes with the first
+   # failure on the Pod all along. A failure still reported when the bound
+   # arrives is refused by its class, which a short
    # deadlines.dependencies_seconds would otherwise turn into a nameless timeout.
    refuse=''
-   if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 || spent >= bound )); then refuse=failing
+   if [[ $verdict == failing* ]] && (( (words_rank == 2 && spent - failing_since >= 90) || spent >= bound )); then refuse=failing
    elif (( spent >= bound )); then refuse=deadline; fi
    if [[ -n $refuse ]]; then
      # the Pod's status, kept 0600 for the operator: the runtime's own words
@@ -3344,8 +3367,9 @@ relocated_images_probe() {
        RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $when"
      fi
      if [[ $refuse == failing ]]; then
-       verdict=${verdict%% SAID *}
-       fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. $advice The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
+       local after=''; (( spent < bound )) || after=", still failing at the end of $within while the kubelet retried"
+       condition=$(pull_failure_condition "$words")
+       fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, for one of them, ${condition#*$'\t'}$after; its own words are kept in $STATE_DIR/pull-probe-status.json. $advice The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
      fi
      # the conditions' types and REASONS, each repeated only when it is a
      # value this installer knows (the API does not constrain a reason
@@ -3358,9 +3382,14 @@ relocated_images_probe() {
      done < <(jq -r '(.status.conditions // [])[]|select(.status=="False")|[.type, (.reason // "unknown")]|@tsv' <<< "$status")
      fail "the node did not finish pulling this release's images from $where within $within: $conditions; the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
    fi
+   if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 )) && ! $retrying; then
+     retrying=true
+     condition=$(pull_failure_condition "$words")
+     log "The node's pull of this release's images from $where is failing and being retried, for ${verdict#failing }. The container runtime reported, for one of them, ${condition#*$'\t'}, which a retry can clear, so the wait goes on up to $within while the kubelet retries, and a failure still reported then is refused"
+   fi
    if (( spent >= deadline )) && ! $slow; then
      slow=true
-     log "The node is still pulling this release's images from $where at deadlines.dependencies_seconds ($deadline s), as on a slow link to the registry; the wait goes on for up to deadlines.initialization_seconds more ($(( bound - deadline )) s), the time the previous release gave these pulls, and a pull that reports a failure is still refused after 90 s"
+     log "The node is still pulling this release's images from $where at deadlines.dependencies_seconds ($deadline s), as on a slow link to the registry; the wait goes on for up to deadlines.initialization_seconds more ($(( bound - deadline )) s), the time the previous release gave these pulls, and a pull that fails definitively (a refused credential, a name or digest the registry does not hold, an invalid name) is still refused after 90 s"
    fi
    sleep 5; spent=$(( spent + 5 ))
  done

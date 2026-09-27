@@ -775,12 +775,13 @@ def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, t
 CREATING = {"waiting": {"reason": "ContainerCreating"}}
 
 
-def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix=""):
-    """The probe over containers that are still pulling (no failure reported):
-    each poll is 5 s, so poll n sees spent = 5*(n-1). pulled_at: the poll whose
-    status has all six pulled; None: they never finish. recorded: the base
-    the installed deployment was recorded with (None: no installed record)."""
-    (work / "status.json").write_text(_statuses([CREATING] * 6))
+def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix="", states=None):
+    """The probe over containers that are still pulling (no failure reported,
+    unless states says otherwise): each poll is 5 s, so poll n sees
+    spent = 5*(n-1). pulled_at: the poll whose status has all six pulled;
+    None: they never finish. recorded: the base the installed deployment was
+    recorded with (None: no installed record)."""
+    (work / "status.json").write_text(_statuses(states or [CREATING] * 6))
     if pulled_at:
         (work / f"status-after-{pulled_at}.json").write_text(_statuses([PULLED] * 6))
     if recorded is not None:
@@ -835,6 +836,86 @@ def test_a_set_or_changed_base_still_pulling_is_refused_at_the_dependency_deadli
     assert "did not finish pulling" in line and "within deadlines.dependencies_seconds (10 s)" in line, line
     assert "still pulling" not in result.stderr
     assert json.loads((work / "probe-pod.json").read_text())["spec"]["activeDeadlineSeconds"] == 10 + 300
+
+
+# --- a pull failure: refused after 90 s only when a retry cannot change it ------
+
+TIMEOUT = {"waiting": {"reason": "ErrImagePull", "message": "failed to pull and unpack image: failed to copy: read tcp: i/o timeout"}}
+UNAUTHORIZED = {"waiting": {"reason": "ErrImagePull", "message": "failed to authorize: failed to fetch anonymous token: 401 Unauthorized"}}
+
+
+def _polls(work):
+    return int((work / "polls").read_text())
+
+
+def test_a_pull_failure_a_retry_can_clear_is_waited_out_on_a_plain_site_and_said_once(runtime, tmp_path):
+    """The 90 s window ran from the first failing sighting and never reset while
+    the kubelet retried, so on a slow link one timed-out pull of a large image
+    was refused while its retry was still pulling. A connection, a rate limit
+    or words this installer does not classify can clear on a retry: said once,
+    and waited out to the bound."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [TIMEOUT], pulled_at=31,       # 150 s in
+                   dependencies=100, initialization=200)
+    assert result.returncode == 0, result.stderr
+    assert "All 6 images pulled" in result.stderr
+    retried = [l for l in result.stderr.splitlines() if "is failing and being retried" in l]
+    assert len(retried) == 1, result.stderr
+    assert "could not connect to the registry" in retried[0] and "a retry can clear" in retried[0], retried[0]
+    assert "deadlines.dependencies_seconds plus deadlines.initialization_seconds (300 s)" in retried[0], retried[0]
+    assert "i/o timeout" not in result.stderr, "the runtime's words are classified, never repeated"
+
+
+@pytest.mark.parametrize("waiting, condition", [
+    (UNAUTHORIZED, "the registry refused the pull (unauthorized or forbidden"),
+    ({"waiting": {"reason": "ErrImagePull", "message": "rpc error: code = NotFound desc = failed to resolve reference: not found"}},
+     "the registry does not hold that name and digest (not found)"),
+    ({"waiting": {"reason": "InvalidImageName", "message": "Failed to apply default image tag: couldn't parse image reference: invalid reference format"}},
+     "the reference is not a valid image name (an invalid name)"),
+], ids=["unauthorized", "not-found", "invalid-name"])
+def test_a_definitive_pull_failure_is_still_refused_after_90_s_on_a_plain_site(runtime, tmp_path, waiting, condition):
+    """The registry's answer about the credential or the name, and a name that
+    is not one, are the same on every retry: refused once they have outlived
+    90 s, as before, and never waited out to a bound of hours."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [waiting], dependencies=100, initialization=200)
+    assert result.returncode != 0
+    assert _polls(work) == 19, "refused at 90 s, not at the 300 s bound"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "cannot pull this release" in line and condition in line, line
+    assert "(300 s)" not in line and "being retried" not in result.stderr
+
+
+def test_a_definitive_failure_of_one_image_is_not_masked_by_a_retried_failure_of_another(runtime, tmp_path):
+    """The first failing container's words decided the class: an image whose
+    pull times out ahead of one the registry refuses would have waited the
+    refusal out to the bound."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 4 + [TIMEOUT, UNAUTHORIZED], dependencies=100, initialization=200)
+    assert result.returncode != 0
+    assert _polls(work) == 19, "refused at 90 s"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "2 of 6 images" in line and "the registry refused the pull (unauthorized" in line, line
+    assert "could not connect" not in line
+
+
+@pytest.mark.parametrize("base, polls, within", [
+    ("", 61, "deadlines.dependencies_seconds plus deadlines.initialization_seconds (300 s)"),
+    (BASE, 21, "deadlines.dependencies_seconds (100 s)"),
+], ids=["plain", "relocated"])
+def test_a_retried_pull_failure_still_failing_at_the_bound_is_refused_by_its_class(runtime, tmp_path, base, polls, within):
+    """At the bound a failure the kubelet kept retrying is refused as a failure,
+    named by its class and by the deadline it outlived -- never as a pull that
+    did not finish."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=base, states=[PULLED] * 5 + [TIMEOUT], dependencies=100, initialization=200)
+    assert result.returncode != 0
+    assert _polls(work) == polls, "refused at the bound, not at 90 s"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "cannot pull this release" in line and "1 of 6 images" in line, line
+    assert "the node could not connect to the registry" in line and "still failing at the end of " + within in line, line
+    assert "did not finish pulling" not in line and "i/o timeout" not in result.stderr
+    assert result.stderr.count("is failing and being retried") == 1
 
 
 @pytest.mark.parametrize("status, verb, absent", [
