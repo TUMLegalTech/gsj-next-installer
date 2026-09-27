@@ -265,7 +265,10 @@ k() {{
     create) cat > "$TEST_WORK/probe-pod.json";;
     get) n=$(cat "$TEST_WORK/polls" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$TEST_WORK/polls"
          if [ -f "$TEST_WORK/status-after-$n.json" ]; then cp "$TEST_WORK/status-after-$n.json" "$TEST_WORK/status.json"; fi
-         cat "$TEST_WORK/status.json";;
+         # each container's status reports the image its own container in the Pod asked for, as the kubelet
+         # does for a pull it has not finished: a refusal can only name the reference the probe composed
+         jq --slurpfile pod "$TEST_WORK/probe-pod.json" '($pod[0].spec.containers|map({{key:.name,value:.image}})|from_entries) as $asked
+           | if .status.containerStatuses then .status.containerStatuses[] |= (.image = $asked[.name]) else . end' "$TEST_WORK/status.json";;
     delete) echo deleted >> "$TEST_WORK/deletes";;
   esac
 }}
@@ -274,7 +277,7 @@ k() {{
 
 def _statuses(states):
     return json.dumps({"status": {"containerStatuses": [
-        {"name": "pull-" + role.lower(), "image": BASE + "/x@sha256:" + "a" * 64, "state": state}
+        {"name": "pull-" + role.lower(), "state": state}
         for role, state in zip(ROLES, states)]}})
 
 
@@ -369,6 +372,25 @@ def test_six_failures_are_one_fact_said_once_not_six_times(runtime, tmp_path):
     assert refusal.count("rpc error") == 0 and refusal.count("does not hold") == 1, "the condition once; the runtime's words never"
     assert words in (work / "pull-probe-status.json").read_text()
     assert len(refusal) < 1800
+
+
+@pytest.mark.parametrize("base", ["", BASE], ids=["release-repositories", "relocated"])
+def test_a_pull_failure_names_the_failing_container_s_own_reference(runtime, tmp_path, base):
+    """Each container's status reports the image its own container asked for,
+    so the refusal names the reference the probe composed for the one image
+    that failed -- relocated under registry.base or the release's own -- and
+    none of the five that pulled."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED, BACKOFF] + [PULLED] * 4))      # the runner's pull fails
+    release, result = _probe(run, work, tmp_path, base=base)
+    assert result.returncode != 0
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    runner = release["images"]["runner"]
+    own = (BASE + "/gsj-agent-runner" if base else runner["repository"]) + "@" + runner["digest"]
+    assert "1 of 6 images: " + own + ". " in refusal, refusal
+    for role in ROLES:
+        if role != "runner":
+            assert release["images"][role]["digest"] not in refusal, role
 
 
 def test_a_registry_that_stumbles_once_is_not_refused(runtime, tmp_path):
