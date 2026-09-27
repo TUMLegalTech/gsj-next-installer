@@ -16,6 +16,8 @@ import tarfile
 
 import pytest
 
+from tests.pinned_web import chart, needs_web
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "ops/installer"
@@ -2228,15 +2230,47 @@ def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path
     assert "byte-order mark" in line and str(config) in line
 
 
+# The label families that have reached shipped text: review rounds, phase and
+# record names, and the words that name one machine. A reader of this public
+# repository, of the installer it ships or of the chart inside it can resolve
+# none of them. The product's reserved account name is legitimate prose (the
+# schema and the guide's login rules name it) and is deliberately not here.
+# Every alternative is spelled apart by concatenation, so this file never
+# matches itself; the three scans below import this one list.
+INTERNAL_LABEL = re.compile(
+    "(?i:" + "|".join(["audit" + r" rounds?", "misattribution" + "[- ]pass", "FIX" + "-PASS", "PR" + "-FIXES",
+                       "PR" + "-DISSECT", "SAFETY" + "-FIVE", "INSTALLER" + "-SNOWFLAKE", "INSTALL" + "-GSJ-ADMIN"]) + ")|"
+    + "|".join([r"\bPROMO" + r"TION\b", r"\bWEB" + r"NEXT\b", r"\bINIT" + r"-VERB\b", r"\bPILOT" + r"-MOVE\b",
+                r"\bRELEASE" + "-BETA", r"\bBETA" + "[0-9]", r"\bQA" + r"D\b", r"\bPATCH" + "-?[0-9]"]))
+
+
+def internal_labels(name, text):
+    """NAME:LINE for every line of TEXT that carries an internal label."""
+    return [f"{name}:{n}" for n, line in enumerate(text.splitlines(), 1) if INTERNAL_LABEL.search(line)]
+
+
 def test_the_public_tree_carries_no_internal_review_labels():
     """The installer repository is public and runtime.sh is the header of the
-    shipped installer: a reader there cannot resolve a review round or a
-    phase record by name."""
-    hits = []
-    for path in sorted(list((INSTALLER).glob("*.sh")) + list((INSTALLER).glob("*.md")) + list((INSTALLER.parent.parent / "tests").glob("*.py"))):
-        for n, l in enumerate(path.read_text(errors="replace").splitlines(), 1):
-            if re.search("audit" + " rounds?|FIX" + "-PASS|misattribution" + "[- ]pass", l, re.I):   # spelled apart: this line must not match itself
-                hits.append(f"{path.name}:{n}")
+    shipped installer: a reader there cannot resolve a review round, a phase
+    record or a machine by name. Every text file under ops/installer (its
+    programs, jq, schemas, examples, guides and the release tooling in ci/),
+    the tests, the workflow and the root README."""
+    paths = [p for p in INSTALLER.rglob("*") if p.is_file() and p.suffix in (".sh", ".md", ".py", ".jq", ".json", ".txt")]
+    paths += list((ROOT / "tests").glob("*.py")) + list((ROOT / ".github").rglob("*.yml")) + [ROOT / "README.md"]
+    hits = [hit for path in sorted(paths) for hit in internal_labels(str(path.relative_to(ROOT)), path.read_text(errors="replace"))]
+    assert not hits, hits
+
+
+@needs_web
+def test_the_pinned_chart_carries_no_internal_review_labels():
+    """The pinned chart is public text as well: every installer packages it
+    (chart.tgz) and every release attaches it as an audit copy. The scan
+    reads each of its files with the same list. Red while the pinned chart's
+    comments still carry the product's own record names; the product's next
+    cut removes them and the pin that follows it turns this green."""
+    root = chart()
+    hits = [hit for path in sorted(root.rglob("*")) if path.is_file()
+            for hit in internal_labels(str(path.relative_to(root)), path.read_text(errors="replace"))]
     assert not hits, hits
 
 

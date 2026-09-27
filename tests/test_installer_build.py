@@ -13,6 +13,8 @@ import tarfile
 
 import pytest
 
+from tests.test_installer import internal_labels
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "ops/installer/build.py"
@@ -498,3 +500,41 @@ def test_a_wrong_key_and_a_tampered_descriptor_are_still_refused(release, tmp_pa
     descriptor.write_bytes(descriptor.read_bytes() + b"\n")
     result = _verify_shell(output, descriptor, signature, keypair[1])
     assert result.returncode == 1 and "Descriptor signature is invalid" in result.stderr
+
+
+def _shipped_labels(installer: Path) -> list[str]:
+    """Every internal label in what an installer ships, as MEMBER:LINE: its
+    runtime header, each payload member, and each file of the chart archive
+    inside the payload (chart.tgz!FILE:LINE)."""
+    runtime, payload = installer.read_bytes().split(b"\n__GSJ_PAYLOAD_BELOW__\n")
+    hits = internal_labels("runtime", runtime.decode(errors="replace"))
+    with tarfile.open(fileobj=io.BytesIO(base64.decodebytes(payload)), mode="r:gz") as archive:
+        members = {member.name: archive.extractfile(member).read() for member in archive if member.isfile()}
+    for name, data in sorted(members.items()):
+        hits += internal_labels(name, data.decode(errors="replace"))
+        if name == "chart.tgz":
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as chart:
+                for member in chart:
+                    if member.isfile():
+                        hits += internal_labels(f"{name}!{member.name}", chart.extractfile(member).read().decode(errors="replace"))
+    return hits
+
+
+@pytest.mark.parametrize("planted", [False, True])
+def test_the_built_installer_ships_no_internal_review_label(release, tmp_path, planted):
+    """Whoever runs the installer can read all of it: the runtime, every
+    payload member and every file of the chart it packages. The scan decodes
+    the payload as the installer does (the base64 after the marker line, then
+    the tar.gz), opens the chart archive inside it, and uses the one list the
+    tree and pinned-chart scans use. Clean inputs ship nothing; a record name
+    planted in a chart template is found, by member and line."""
+    manifest, value = release
+    if planted:
+        Path(value["_build"]["chart"]).write_bytes(builder.compressed_tar({
+            "gsj/Chart.yaml": (b"apiVersion: v2\nname: gsj\nversion: 0.10.0-beta.1\nappVersion: 0.10.0-beta.1\n", 0o644),
+            "gsj/templates/job.yaml": (("# a comment that kept its " + "PR" + "-FIXES" + " record name\n").encode(), 0o644)}))
+    output = tmp_path / "installer.sh"
+    result = run("--manifest", manifest, "--output", output)
+    assert result.returncode == 0, result.stderr
+    hits = _shipped_labels(output)
+    assert hits == (["chart.tgz!gsj/templates/job.yaml:1"] if planted else []), hits
