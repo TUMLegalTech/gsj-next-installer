@@ -49,7 +49,10 @@ install and when you would find out.
   must arrive within `deadlines.dependencies_seconds` (900 s by default),
   which a slow link to the mirror may need raised; without it a pull still
   under way then is waited for up to `deadlines.initialization_seconds` more.
-  A pull that reports a failure is refused after 90 s either way.
+  A pull that fails in a way no retry changes (a refused credential, a name
+  or digest the registry does not hold, an invalid name) is refused after
+  90 s either way; any other failure is waited out to the same bound, and
+  refused if it is still reported then.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has

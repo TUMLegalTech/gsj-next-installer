@@ -483,9 +483,14 @@ no private input.
    records. It retires the first run's verification record by itself
    (*"Retired verification run … of ended operation …"*) when the namespace
    the first operation recorded in its intent has since been replaced — the
-   harness deletes it — and, under a restore, when that run had finished.
-   Where neither holds — no intent saved for the first operation, or the same
-   namespace with any other run — the record is resumed, and with its ledger
+   harness deletes it — and that run's ledger is absent from the new volume,
+   and, under a restore, when that run had finished. A restore into the
+   replaced namespace brings the ledger back with the archive's claims; then
+   the first run's own reconciliation runs under its old binding (for a run
+   still active, the cleanup of its test accounts) and the record is retired
+   after it. Where neither holds — no intent saved for the first operation,
+   or the same namespace with any other run — the record is resumed, and with
+   its ledger
    gone the second run stops at verification with *"verification ownership
    ledger is missing after launch"*.
 8. **Publication**: the release assets (below) — `verify-release.sh`, the
