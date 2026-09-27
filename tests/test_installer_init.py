@@ -1064,6 +1064,32 @@ def test_an_installer_folder_that_cannot_be_written_keeps_the_verified_copies_in
         assert box.beside() == []
 
 
+def test_an_installer_folder_without_hard_links_is_named_as_that_and_the_copies_go_to_the_working_folder(tmp_path, keypair):
+    """A FAT or exFAT stick, or some network shares, take the temporary copy
+    but refuse the hard link that puts it in place (link(2) fails with EPERM
+    or ENOTSUP). That folder was reported as not writable, though init had
+    just written there; it is named for what it lacks, and the checked
+    copies still go to the working folder's releases/<version>/."""
+    box = Box(tmp_path, keypair)
+    fake, real = Path(box.path) / "link", shutil.which("link", path=SYSTEM_PATH)
+    fake.unlink()
+    fake.write_text('#!/bin/sh\ncase "$2" in "$TEST_NO_LINKS"/*) echo "link: cannot create link: Operation not permitted" >&2; exit 1;; esac\n'
+                    f'exec {real} "$@"\n')
+    fake.chmod(0o755)
+    result = box.run(TEST_NO_LINKS=str(box.installer.parent))
+    assert result.returncode == 0, result.stderr + result.stdout
+    report = _report(result)
+    kept = box.home / "gsj-operator" / "releases" / VERSION
+    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_saved"] == 4
+    assert report["verification"]["saved_in"] == str(kept) and sorted(p.name for p in kept.iterdir()) == sorted(COMPANIONS)
+    here = box.installer.parent
+    lines = [l for l in result.stderr.splitlines() if "not saved in" in l]
+    assert len(lines) == 1 and lines[0].endswith(f"not saved in {here}: {here} is on a file system without hard links (FAT, exFAT, "
+                                                  "some network shares), and init puts a checked copy in place only by linking it"), result.stderr
+    assert "not writable" not in result.stderr and "Operation not permitted" not in result.stderr
+    assert box.beside() == []                                           # no temporary copy is left beside the installer
+
+
 def test_a_file_that_appears_beside_the_installer_during_the_download_is_never_replaced(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     result = box.run(TEST_CURL_PLANT=str(box.installer.parent))

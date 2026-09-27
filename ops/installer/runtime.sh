@@ -6335,8 +6335,9 @@ init_publish() {
  # A checked download, put create-only where the release lives: an existing
  # name of any kind is left alone, and only a file this call created is ever
  # removed. $1 name, $2 the directory. Returns 2 (INIT_WHY set) when a name
- # was already there, 1 when the directory could not be written; the checked
- # copy under $GSJ_WORK still serves this run either way. The destination is
+ # was already there, 1 when the directory could not be written or takes no
+ # hard link; the checked copy under $GSJ_WORK still serves this run either
+ # way, and on 1 the caller tries the working folder. The destination is
  # never opened: noclobber refuses only an existing REGULAR file, so a FIFO
  # planted there (or a link to one) was opened for writing -- the run blocked
  # on it -- and the write that followed opened the name a second time. The
@@ -6355,7 +6356,10 @@ init_publish() {
  if ! link "$temp" "$dest" 2>/dev/null; then
    rm -f "$temp"
    if [[ -e $dest || -L $dest ]]; then INIT_WHY="$dest appeared during the download and was not replaced"; return 2; fi
-   INIT_WHY="$2 is not writable"; return 1
+   # The copy was just written there, so the folder is writable: what failed
+   # is the link itself, which a FAT or exFAT file system and some network
+   # shares refuse (EPERM, ENOTSUP)
+   INIT_WHY="$2 is on a file system without hard links (FAT, exFAT, some network shares), and init puts a checked copy in place only by linking it"; return 1
  fi
  rm -f "$temp"
 }
