@@ -4710,6 +4710,15 @@ acquire_target() {
    [[ -z ${CONTINUE_FROM_PROGRAM:-} ]] || next+=(--continue-from-program "$CONTINUE_FROM_PROGRAM")
  fi
  if $INTERACTIVE; then next+=(--interactive); else next+=(--non-interactive); fi
+ # The child runs the preflight this run skipped, and with it the refusal
+ # of a fetched kubectl skewed from the server. Without the set it fetched
+ # nothing and took this run's fetched clients, first on the PATH it
+ # inherits, for this box's own: that skew was only warned about. The same
+ # pins come from the cache by checksum, so nothing downloads twice. All
+ # three go as the bare flag, the one form a release older than
+ # --fetch-tools=TOOL parses.
+ if [[ ${FETCH_SET:-} == 'jq kubectl helm' ]]; then next+=(--fetch-tools)
+ elif [[ -n ${FETCH_SET:-} ]]; then next+=("--fetch-tools=${FETCH_SET// /,}"); fi
  log "Verified target $version; executing that release's installer"
  bash "$target" "${next[@]}"
 }

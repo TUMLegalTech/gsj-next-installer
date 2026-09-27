@@ -58,6 +58,52 @@ main "$TEST_COMMAND" --to "$SELECTED" --config "$SITE" --non-interactive
     assert not (work / "unexpected-preflight").exists()
 
 
+@pytest.mark.parametrize("command", ["upgrade", "repair"])
+@pytest.mark.parametrize("flags,handed", [
+    ("", None),
+    ("--fetch-tools=kubectl", "--fetch-tools=kubectl"),
+    ("--fetch-tools=helm,jq", "--fetch-tools=jq,helm"),
+    ("--fetch-tools", "--fetch-tools"),
+    ("--fetch-tools=helm --fetch-tools", "--fetch-tools"),
+])
+def test_the_verified_child_fetches_the_clients_this_run_fetched(runtime, command, flags, handed):
+    """Every --to hands off to the target's own installer before preflight, so
+    the child alone runs the checks a fetched client answers to -- among them
+    the refusal of a fetched kubectl more than one minor from the server. The
+    child's argv carried no --fetch-tools: its fetched set was empty while the
+    parent's fetched kubectl sat first on the PATH it inherited, and that skew
+    was only warned about. The child now receives the set this run fetched
+    (the archives are cached by checksum, so nothing downloads twice, and it
+    verifies them itself); all three stay the bare flag, the one form a target
+    that predates the per-client form parses. Nothing fetched, no flag."""
+    run, _, work = runtime
+    payload = work / "payload"
+    (payload / "helpers").mkdir(parents=True)
+    (payload / "release.json").write_text(json.dumps({"version": "1.2.3", "release_base_url": "https://releases.example"}))
+    for name in ("verification-cleanup.sh", "startup-recovery.sh"):
+        (payload / "helpers" / name).write_text("")
+    operation = "--operation synthetic-operation" if command == "repair" else ""
+    result = run(f'''GSJ_PAYLOAD="$TEST_WORK/payload"
+bootstrap() {{ :; }}
+install_exit_traps() {{ :; }}
+load_site() {{ :; }}
+inspect_cluster() {{ printf '{{}}\\n'; }}
+preflight() {{ touch "$TEST_WORK/unexpected-preflight"; exit 91; }}
+download_curl() {{ [[ ${{*: -1}} != *.json.partial ]] || jq -n '{{version:"1.2.4",installer:{{name:"gsj-install.sh",sha256:"synthetic"}}}}' > "${{*: -1}}"; : >> "${{*: -1}}"; }}
+openssl() {{ :; }}; fetch() {{ :; }}; verify_target() {{ :; }}
+bash() {{ shift; printf '%s\\n' "$@" > "$TEST_WORK/child-argv"; }}
+main {command} --to 1.2.4 {operation} --config "$SITE" --non-interactive {flags}
+''')
+    assert result.returncode == 0, result.stderr
+    assert not (work / "unexpected-preflight").exists()
+    argv = (work / "child-argv").read_text().splitlines()
+    expected = [command, "--config", str(work / "site.json"), "--expected-version", "1.2.4"]
+    if command == "repair":
+        expected += ["--operation", "synthetic-operation"]
+    expected += ["--non-interactive"] + ([handed] if handed else [])
+    assert argv == expected, argv
+
+
 def test_target_version_mismatch_refuses_before_wizard_or_site_access(runtime):
     run, _, work = runtime
     payload = work / "payload"
