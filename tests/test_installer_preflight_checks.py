@@ -916,24 +916,41 @@ def test_preflight_refuses_install_and_upgrade_on_the_site_checks(runtime, tmp_p
 
 
 # What preflight asks `kubectl auth can-i` in the target namespace, in order.
-# ReplicaSets are read to prove the initializer Pod's owner.
+# ReplicaSets are read to prove the initializer Pod's owner, so only the verbs
+# that wait for the initializer ask for them; the others ask what the previous
+# release asked, and a Role that ran them then runs them now.
 PERMISSIONS = ["get pods", "create pods", "create secrets", "create configmaps", "create leases.coordination.k8s.io",
                "patch deployments.apps", "get replicasets.apps", "create jobs.batch", "get persistentvolumeclaims",
                "create persistentvolumeclaims", "create networkpolicies.networking.k8s.io"]
+INITIALIZING = ["install", "upgrade", "resume", "repair", "restore", "restore-repair"]
+NOT_INITIALIZING = ["backup", "backup-repair", "sweep", "abandon", "lease-repair", "credential-repair", "tls-repair",
+                    "addon-repair"]
 
 
-def test_preflight_asks_for_every_namespace_permission_in_its_first_seconds(runtime, tmp_path):
+@pytest.mark.parametrize("command", INITIALIZING + NOT_INITIALIZING)
+def test_preflight_asks_for_every_namespace_permission_in_its_first_seconds(runtime, tmp_path, command):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
-    _admitted(_preflight(run, work, "install"), state)
-    assert (work / "can-i").read_text().splitlines() == PERMISSIONS
+    _admitted(_preflight(run, work, command), state)
+    expected = PERMISSIONS if command in INITIALIZING else [p for p in PERMISSIONS if p != "get replicasets.apps"]
+    assert (work / "can-i").read_text().splitlines() == expected
 
 
-def test_a_credential_that_may_not_read_replicasets_is_refused_by_name(runtime, tmp_path):
+@pytest.mark.parametrize("command", INITIALIZING)
+def test_a_credential_that_may_not_read_replicasets_is_refused_by_name(runtime, tmp_path, command):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
-    _refusal(_preflight(run, work, "install", denied="get replicasets.apps"), state,
+    _refusal(_preflight(run, work, command, denied="get replicasets.apps"), state,
              "missing deployment permission: get replicasets.apps")
+
+
+@pytest.mark.parametrize("command", NOT_INITIALIZING)
+def test_a_verb_that_never_waits_for_the_initializer_runs_without_replicasets(runtime, tmp_path, command):
+    """A least-privilege Role that ran these verbs on the previous release,
+    without get on replicasets.apps, still runs them."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _admitted(_preflight(run, work, command, denied="get replicasets.apps"), state)
 
 
 EXEMPT = ["restore", "restore-repair", "backup", "backup-repair", "resume", "repair", "sweep", "abandon",

@@ -1287,7 +1287,7 @@ endpoint_preflight() {
 }
 preflight() {
  k cluster-info >/dev/null
- local platform nodes pull server versions
+ local platform nodes pull server versions permissions
  # The server floor, asserted HERE so a too-old cluster is refused before the
  # first write rather than by Helm after the Lease, the Secrets and the add-ons.
  # `|| true` inside the substitution: under `set -Eeuo pipefail` a kubectl that
@@ -1305,8 +1305,14 @@ preflight() {
  [[ -n $platform ]] || fail 'selected storage node is unavailable'
  while IFS= read -r nodes; do jq -e --arg p "$nodes" '.platforms | index($p)' "$GSJ_PAYLOAD/release.json" >/dev/null || fail "release has no qualified native images for $nodes"; done <<< "$platform"
  # get replicasets.apps: the initializer wait proves its Pod is this release's
- # own through the ReplicaSet that owns it, and is named here with the rest.
- for permission in 'get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps' 'get replicasets.apps' 'create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io'; do
+ # own through the ReplicaSet that owns it, and is named here with the rest --
+ # by the verbs that reach that wait, and by them alone: the other verbs never
+ # get a ReplicaSet, and a Role that ran them on the previous release, which
+ # asked for none, must still run them.
+ permissions=('get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps')
+ if [[ $COMMAND =~ ^(install|upgrade|resume|repair|restore|restore-repair)$ ]]; then permissions+=('get replicasets.apps'); fi
+ permissions+=('create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io')
+ for permission in "${permissions[@]}"; do
    read -r verb resource <<< "$permission"; [[ $(k auth can-i "$verb" "$resource") == yes ]] || fail "missing deployment permission: $permission"
  done
  # A referenced pull Secret is never created here. Refuse before the first
