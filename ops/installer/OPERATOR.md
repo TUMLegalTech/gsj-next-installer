@@ -767,11 +767,13 @@ The block waits up to five minutes for the Pod to finish, prints its status and
 removes it. `Completed` is the pass. `ImagePullBackOff` or `ErrImagePull` is
 the failure this step exists to find; `ContainerCreating` means the pull was
 still running when the wait gave up — raise `--timeout` and paste the block
-again. A pull that takes minutes here is a warning for step 8: the installer
-waits for all six images, the corpus image included, only as long as
-`deadlines.dependencies_seconds` allows — 900 s by default — so on such a link
-raise it in the site file before you install
-([why](#make-your-nodes-able-to-pull-the-images)). It waits instead of watching on purpose. Measured on bash 5.2: Ctrl-C
+again. A pull that takes minutes here is a warning for step 8 on a site that
+sets `registry.base`: the installer then waits for all six images, the corpus
+image included, only as long as `deadlines.dependencies_seconds` allows — 900 s
+by default — so on such a link raise it in the site file before you install
+([why](#make-your-nodes-able-to-pull-the-images)). Without `registry.base` the
+wait goes on past that deadline for up to `deadlines.initialization_seconds`
+more. It waits instead of watching on purpose. Measured on bash 5.2: Ctrl-C
 ends the whole pasted block and discards whatever was pasted after it, so an
 interrupted watch leaves the Pod behind — and, in the credentialed probe below,
 the Secret. If you do interrupt one of these blocks, run its last line
@@ -1300,7 +1302,9 @@ the rest still run. The two Secrets are read in the namespace itself, where a
 read that fails is refused (*"… could not be read"*), naming the file in the
 state directory that keeps kubectl's output. The recovery verbs do not ask:
 they continue what an install or upgrade already admitted. Then the storage
-node proves, within `deadlines.dependencies_seconds`, that it can pull all six
+node proves, within `deadlines.dependencies_seconds` (plus
+`deadlines.initialization_seconds` on a site that neither sets nor changes
+`registry.base`), that it can pull all six
 images ([Make your nodes able to pull the images](#make-your-nodes-able-to-pull-the-images)),
 Helm applies, the corpus is fetched and staged, and the
 import runs — about `corpus.chunks / 150` seconds on an otherwise idle node.
@@ -1916,26 +1920,37 @@ node's side — a registry CA it does not trust, its DNS or proxy, a full disk �
 needs no site change: the refusal names `resume --operation ID` for it, once the
 node can pull.
 
-**It waits `deadlines.dependencies_seconds` at most — 900 s by default — for
-all six images together, the corpus image included.** An earlier installer
-ran this probe only for a site that set `registry.base` (or had just dropped
-it); without one, the corpus image was pulled by the corpus initializer, under
-the initialization deadline, 24 hours by default. On a slow link to the
-registry the six may not all arrive within 900 s although nothing is wrong,
-and a site that installed that way under an earlier installer can now be
-refused here:
+**How long it waits depends on whether the image location moved.** An earlier
+installer ran this probe only for a site that set `registry.base` (or had just
+dropped it); without one, the corpus image — and web, runner and mcp — were
+pulled under the initialization deadline, 24 hours by default. So a site that
+neither sets nor changes `registry.base` keeps that time: a pull still under
+way when `deadlines.dependencies_seconds` (900 s by default) is spent is logged
+once — *"The node is still pulling this release's images from … at
+deadlines.dependencies_seconds (900 s), as on a slow link to the registry; the
+wait goes on …"* — and waited for up to `deadlines.initialization_seconds`
+more. A site that sets or changes `registry.base` waits
+`deadlines.dependencies_seconds` at most for all six images together, the
+corpus image included. Either way, a still-unfinished pull at the end is
+refused:
 
 ```
-GSJ: the node did not finish pulling this release's images from the release's own repositories within deadlines.dependencies_seconds (900 s): ...; the Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
+GSJ: the node did not finish pulling this release's images from registry.base (registry.example.org/team) within deadlines.dependencies_seconds (900 s): ...; the Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
 ```
 
-Its closing line names `resume --operation ID once the registry answers, or
-repair --operation ID … after raising deadlines.dependencies_seconds`. On such
-a link, raise `deadlines.dependencies_seconds` in the site file before you
-install or upgrade, and nothing has to be recovered. Once it has stopped a
-first install, `abandon` and `install` again from the raised file rather than
-take that repair, for the reason above. A pull that is still failing when that
-deadline arrives is refused as *cannot pull*, above.
+(*"… within deadlines.dependencies_seconds plus
+deadlines.initialization_seconds (87300 s)"* without `registry.base`.) Its
+closing line names the verbs the operation's state accepts, as for *cannot
+pull*: over an installed deployment `repair --operation ID … after raising
+deadlines.dependencies_seconds`, or `resume` once the registry answers; on a
+first install `abandon` and `install` again from the raised file (a repair
+would complete it without its storage check), or `resume`; for a restore,
+whose site is kept byte for byte and takes no raised deadline, the one verb its
+phase accepts, once the registry answers.
+On a slow link to a mirror, raise `deadlines.dependencies_seconds` in the site
+file before you install or upgrade, and nothing has to be recovered. A pull
+that reports a failure is refused as *cannot pull*, above, after 90 s of
+retries, whatever the deadline.
 
 **It covers a location that changed**, in either direction. An upgrade whose
 site file has *lost* `registry.base` — a stale copy, a deleted line — would
@@ -2808,11 +2823,12 @@ lower `resources.initializer.requests.cpu` or slower storage all eat into that.
 Raising the deadline does not extend an initialization already in progress; that
 takes the named repair described below. Other defaults are 900 seconds for
 dependencies and 1,800 seconds for verification. The dependencies deadline
-also bounds the pull proof before Helm applies anything: all six images, the
-corpus image included, must arrive on the node within it, or the run stops
-with *"the node did not finish pulling this release's images from … within
-deadlines.dependencies_seconds (900 s)"* — on a slow link to your registry,
-raise it
+also bounds the pull proof before Helm applies anything on a site that sets
+or changes `registry.base`: all six images, the corpus image included, must
+arrive on the node within it, or the run stops with *"the node did not finish
+pulling this release's images from … within deadlines.dependencies_seconds
+(900 s)"* — on a slow link to your mirror, raise it (a site without
+`registry.base` waits the initialization deadline beyond it)
 ([Make your nodes able to pull the images](#make-your-nodes-able-to-pull-the-images)).
 
 **What initialization costs in memory, and why the installer checks it first.**
@@ -4311,7 +4327,7 @@ first install, or its recovery, realistically meets:
 | `backup cannot change application settings` | the site file differs from the installed one outside its `backup`, `delivery` and `verification` blocks and `storage.transfer_path` and `storage.minimum_free_bytes` — an edited `registry.base` counts | put the installed values back, or run the operation that adopts the edit — an upgrade, or `install` again with the same installer — then back up |
 | `temporary storage backend cleanup incomplete` | the storage check's temporary claim bound a volume and marked it `Delete`, and 120 s after that claim was deleted the volume was still there. The message names the volume and its phase, and the phase is the whole difference | *…and it is now Failed*: nothing on this cluster deletes a volume of that class. Name your own claim in `storage.data.existing_claim`; wait until the operation's Lease has gone 180 s unrenewed, `abandon --operation ID --reason "…"`, install again. The volume it names accepts no claim until that PersistentVolume object is deleted and created again — do that only if you still want it. *…was still present (phase …)*, any other phase, `unknown` if it could not be read: whatever removes volumes of that class is slow or stuck. Do **not** delete the volume; look at that provisioner or deleter, then continue with the command the closing line names |
 | `the node cannot pull this release from` | the pull proof failed: `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
-| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again — or `resume` once the registry answers |
+| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers |
 | `Helm provisioning failed; persistent state was retained` | the Helm apply of an install, upgrade or restore exited non-zero; the last 25 lines of Helm's log precede it. The operation stays in its Helm phase, where `resume` refuses | fix the cause, wait 180 s, then the `repair --operation ID --config … --non-interactive` the closing line names |
 | `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin; nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
 | `the operation Lease is already free; nothing to abandon` | `abandon` on a target with no live operation — normal after a completed install | carry on; it exits `1` while doing no harm, so do not let a script stop on it |

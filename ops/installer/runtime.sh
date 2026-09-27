@@ -81,6 +81,9 @@ kubectl_failure_condition() {
  local m; m=$(tr '[:upper:]' '[:lower:]' < "$1")
  case $m in
    *podsecurity*|*"admission webhook"*|*"denied the request"*|*admission*) printf 'an admission policy refused it';;
+   # LimitRange and ResourceQuota answer "forbidden" too, and their cure is
+   # the namespace's policy, never the kubeconfig's permissions.
+   *"exceeded quota"*|*"failed quota"*|*limitrange*|*"minimum "*|*"maximum "*|*"limit to request ratio"*) printf 'an admission policy (LimitRange or ResourceQuota) refused the Pod';;
    *forbidden*) printf 'the API server refused it as forbidden (the kubeconfig'"'"'s permissions in this namespace)';;
    *"already exists"*) printf 'a Pod of that name already exists';;
    *"connection refused"*|*"unable to connect"*|*"no such host"*|*"i/o timeout"*|*"timed out"*) printf 'the API server could not be reached';;
@@ -3158,9 +3161,19 @@ relocated_images_probe() {
  # deleted line -- renders the release's original repositories, the ones this
  # site said its nodes cannot reach, and the words say so.
  #
+ # HOW LONG. A container that REPORTS a pull failure is refused once the
+ # failure has outlived 90 s of retries, on every site. A pull still in
+ # progress is bounded by deadlines.dependencies_seconds when registry.base is
+ # set or changed, as it always was for those sites. Otherwise the images come
+ # from where the previous release pulled them, and that release pulled web,
+ # runner, mcp and the corpus image under the initialization deadline (24 h by
+ # default): a slow link it installed over must not be refused by 900 s now, so
+ # the wait goes on to dependencies_seconds + initialization_seconds, said once
+ # when the first is spent. The Pod's activeDeadlineSeconds follows the bound.
+ #
  # WHERE IN THE CHAIN. Before backup quiesces a running deployment: a refusal
  # here leaves whatever was running, running.
- local base recorded='' pod spent=0 failing_since=-1 status verdict words='' where deadline want
+ local base recorded='' pod spent=0 failing_since=-1 status verdict words='' where deadline want bound within slow=false refuse
  base=$(j '.registry.base // ""')
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
  # registry.base has no scheme (the schema holds it to host[:port][/path]), so
@@ -3174,6 +3187,11 @@ relocated_images_probe() {
  local advice="The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host."
  [[ -n $base || -n $recorded ]] || advice="The repositories and digests are the signed release's own. Check that registry.pull_secret (or the registry.config_file it is made from) carries a credential that can read every one of them; a node that cannot reach those registries at all needs a mirror it can reach, named in registry.base."
  deadline=$(j .deadlines.dependencies_seconds)
+ bound=$deadline; within="deadlines.dependencies_seconds ($deadline s)"
+ if [[ -z $base && $base == "$recorded" ]]; then
+   bound=$(( deadline + $(j .deadlines.initialization_seconds) ))
+   within="deadlines.dependencies_seconds plus deadlines.initialization_seconds ($bound s)"
+ fi
  want=$(jq '.images|length' "$GSJ_PAYLOAD/release.json")
  pod="gsj-pull-${OPERATION:0:12}"
  registry_secret_input
@@ -3186,15 +3204,24 @@ relocated_images_probe() {
  # of the deployment. cleanup_exit removes it on any exit, the line above
  # removes a predecessor, and sweep removes one a killed installer left behind.
  PROBE_POD=$pod
- if ! jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$(j .storage.node)" --arg base "$base" --argjson deadline "$deadline" --argjson pulls "$(jq '(.image.pullSecrets // [])|map({name:.})' "$GSJ_WORK/values.pending.json")" --slurpfile r "$GSJ_PAYLOAD/release.json" "$JQ_IMAGE"'
+ # What each container asks for. They never run, so the numbers only have to
+ # pass admission: 1m CPU and 1Mi memory under a 16Mi limit fell below a
+ # LimitRange minimum, or above its maxLimitRequestRatio, and the Pod was
+ # refused. The limit equals the request (ratio 1); six of them are 60m and
+ # 96Mi, which still schedule beside a running deployment.
+ local cpu=10m memory=16Mi
+ if ! jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$(j .storage.node)" --arg base "$base" --argjson deadline "$bound" --arg cpu "$cpu" --arg memory "$memory" --argjson pulls "$(jq '(.image.pullSecrets // [])|map({name:.})' "$GSJ_WORK/values.pending.json")" --slurpfile r "$GSJ_PAYLOAD/release.json" "$JQ_IMAGE"'
    {apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"gsj.io/pull-probe":$release}},
     spec:{restartPolicy:"Never",automountServiceAccountToken:false,enableServiceLinks:false,imagePullSecrets:$pulls,
           activeDeadlineSeconds:($deadline+300),
           nodeSelector:(if $node=="" then {} else {"kubernetes.io/hostname":$node} end),
-          containers:[$r[0].images|to_entries[]|{name:("pull-"+(.key|ascii_downcase)),image:(.value|image_ref($base)),imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:"1m",memory:"1Mi"},limits:{memory:"16Mi"}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
+          containers:[$r[0].images|to_entries[]|{name:("pull-"+(.key|ascii_downcase)),image:(.value|image_ref($base)),imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:$cpu,memory:$memory},limits:{memory:$memory}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
    PROBE_POD=''
    atomic "$STATE_DIR/pull-probe-create.err" < "$GSJ_WORK/pull-probe-create.err"
-   fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $(kubectl_failure_condition "$GSJ_WORK/pull-probe-create.err"); kubectl's own words are kept in $STATE_DIR/pull-probe-create.err. If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
+   local why next="If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
+   why=$(kubectl_failure_condition "$GSJ_WORK/pull-probe-create.err")
+   [[ $why != *LimitRange* ]] || next="Each of its $want containers requests cpu $cpu and memory $memory with a memory limit of $memory: the namespace's LimitRange must admit that (its minimum, maximum and maxLimitRequestRatio) and its ResourceQuota must leave room for it"
+   fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $why; kubectl's own words are kept in $STATE_DIR/pull-probe-create.err. $next"
  fi
  while :; do
    status=$(k get pod "$pod" -o json 2>/dev/null) || status='{}'
@@ -3224,13 +3251,14 @@ relocated_images_probe() {
    esac
    # The kubelet retries a failed pull with backoff, and a registry can stumble
    # once: refuse only a failure that has outlived 90 s of retries -- or one that
-   # is still failing when the deadline arrives, which a short
+   # is still failing when the bound arrives, which a short
    # deadlines.dependencies_seconds would otherwise turn into a nameless timeout.
-   if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 || spent >= deadline )); then
-     verdict=${verdict%% SAID *}
+   refuse=''
+   if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 || spent >= bound )); then refuse=failing
+   elif (( spent >= bound )); then refuse=deadline; fi
+   if [[ -n $refuse ]]; then
      # the Pod's status, kept 0600 for the operator: the runtime's own words
-     # live there, never in the refusal (the block below re-declares
-     # `status` for the operation's) [review B2]
+     # and the scheduler's live there, never in the refusal [review B2]
      printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
      # The same ImagePullBackOff comes from a changed site (a wrong base, digest or
      # pull Secret: a repair after the correction) and from the node's side (a
@@ -3253,38 +3281,52 @@ relocated_images_probe() {
      # In main and resume's owned phase this probe runs BEFORE the backup, so
      # the status is "owned" for an upgrade too: a first install is "owned"
      # WITHOUT an installed record (read before the probe on both paths).
-     local kind status; kind=$(jq -r '.kind // ""' "$STATE_DIR/operation.json" 2>/dev/null || true); status=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
-     local nodeside="once the node can pull (a registry CA the node does not trust, node DNS or a proxy, a full node disk, a rate limit or an outage)"
+     # The deadline takes the same dispatch: its site change is a raised
+     # deadline, which a restore cannot take either, and a registry that
+     # answers late needs none.
+     local kind opstatus fix when kept verb
+     kind=$(jq -r '.kind // ""' "$STATE_DIR/operation.json" 2>/dev/null || true); opstatus=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
+     if [[ $refuse == failing ]]; then
+       fix="after correcting registry.base, the registry's contents or registry.pull_secret"
+       when="once the node can pull (a registry CA the node does not trust, node DNS or a proxy, a full node disk, a rate limit or an outage)"
+       kept=", or after correcting the registry's contents (wait 180 s first: this operation's Lease must go unrenewed that long); a changed registry.base or registry.pull_secret"
+     else
+       fix="after raising deadlines.dependencies_seconds"
+       when="once the registry answers and the probe Pod can be scheduled"
+       kept=" (wait 180 s first: this operation's Lease must go unrenewed that long); a raised deadlines.dependencies_seconds"
+     fi
      if [[ $kind == restore ]]; then
-       local verb
        if [[ ${RESTORE_PROGRAM_ACTIVE:-false} == true ]]; then
-         case $status in applying) verb="repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; *) verb="restore-repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; esac
-       else case $status in restoring-resources|restoring-files) verb="restore-repair --operation $OPERATION with the exact saved target";; applying) verb="repair --operation $OPERATION with the exact saved target";; *) verb="resume --operation $OPERATION with the exact source installer";; esac; fi
-       RECOVERY_HINT="$verb $nodeside, or after correcting the registry's contents (wait 180 s first: this operation's Lease must go unrenewed that long); a changed registry.base or registry.pull_secret cannot continue this restore, whose site is retained byte for byte"
-     elif [[ ( $status == owned || -z $status ) && ! -s $GSJ_WORK/installed.json ]]; then
-       RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file after correcting registry.base, the registry's contents or registry.pull_secret (a repair would complete this first install without the storage check), or resume --operation $OPERATION $nodeside"
-     elif [[ $status == owned || -z $status ]]; then
+         case $opstatus in applying) verb="repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; *) verb="restore-repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; esac
+       else case $opstatus in restoring-resources|restoring-files) verb="restore-repair --operation $OPERATION with the exact saved target";; applying) verb="repair --operation $OPERATION with the exact saved target";; *) verb="resume --operation $OPERATION with the exact source installer";; esac; fi
+       RECOVERY_HINT="$verb $when$kept cannot continue this restore, whose site is retained byte for byte"
+     elif [[ ( $opstatus == owned || -z $opstatus ) && ! -s $GSJ_WORK/installed.json ]]; then
+       RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file $fix (a repair would complete this first install without the storage check), or resume --operation $OPERATION $when"
+     elif [[ $opstatus == owned || -z $opstatus ]]; then
        # the operation's own verb again: an interrupted upgrade is not told to install
        local again="run install again"; [[ $kind != upgrade ]] || again="run upgrade --to VERSION again"
-       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and $again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $nodeside"
+       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and $again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $when"
      else
-       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
+       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $when"
      fi
-     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. $advice The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
-   fi
-   if (( spent >= deadline )); then
-     RECOVERY_HINT="resume --operation $OPERATION once the registry answers, or repair --operation $OPERATION --config $CONFIG --non-interactive after raising deadlines.dependencies_seconds"
+     if [[ $refuse == failing ]]; then
+       verdict=${verdict%% SAID *}
+       fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. $advice The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
+     fi
      # the conditions' types and REASONS, each repeated only when it is a
      # value this installer knows (the API does not constrain a reason
      # string); their messages are the scheduler's free text and are kept,
      # never repeated [review sweep B2]
-     printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
      local conditions='' ctype creason
      while IFS=$'\t' read -r ctype creason; do
        [[ -n $ctype ]] || continue
        conditions+="${conditions:+; }$(known_word "$ctype" PodScheduled Initialized ContainersReady Ready PodReadyToStartContainers DisruptionTarget): $(known_word "$creason" Unschedulable SchedulerError ContainersNotReady ContainersNotInitialized PodCompleted PodFailed ReadinessGatesNotReady unknown)"
      done < <(jq -r '(.status.conditions // [])[]|select(.status=="False")|[.type, (.reason // "unknown")]|@tsv' <<< "$status")
-     fail "the node did not finish pulling this release's images from $where within deadlines.dependencies_seconds ($deadline s): $conditions; the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
+     fail "the node did not finish pulling this release's images from $where within $within: $conditions; the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
+   fi
+   if (( spent >= deadline )) && ! $slow; then
+     slow=true
+     log "The node is still pulling this release's images from $where at deadlines.dependencies_seconds ($deadline s), as on a slow link to the registry; the wait goes on for up to deadlines.initialization_seconds more ($(( bound - deadline )) s), the time the previous release gave these pulls, and a pull that reports a failure is still refused after 90 s"
    fi
    sleep 5; spent=$(( spent + 5 ))
  done

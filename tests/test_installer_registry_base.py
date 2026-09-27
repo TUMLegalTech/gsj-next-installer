@@ -746,3 +746,150 @@ def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, t
     assert "did not finish pulling" in line and "PodScheduled: other" in line and "ZZSECRETCANARY" not in result.stderr and "pull-probe-status.json" in line
     assert marker not in result.stdout + result.stderr
     assert marker in (work / "pull-probe-status.json").read_text()
+
+
+# --- how long a pull in progress may take, and what the deadline names -------------
+
+CREATING = {"waiting": {"reason": "ContainerCreating"}}
+
+
+def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix=""):
+    """The probe over containers that are still pulling (no failure reported):
+    each poll is 5 s, so poll n sees spent = 5*(n-1). pulled_at: the poll whose
+    status has all six pulled; None: they never finish. recorded: the base
+    the installed deployment was recorded with (None: no installed record)."""
+    (work / "status.json").write_text(_statuses([CREATING] * 6))
+    if pulled_at:
+        (work / f"status-after-{pulled_at}.json").write_text(_statuses([PULLED] * 6))
+    if recorded is not None:
+        _installed(work, recorded)
+    if operation:
+        (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", **operation}))
+    release = _public_release(); payload = _payload(tmp_path, release)
+    site = _site(); site["registry"].update(base=base, pull_secret="corp-pull")
+    site["deadlines"].update(dependencies_seconds=dependencies, initialization_seconds=initialization)
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    return run(PROBE_PRELUDE.format(payload=payload) + prefix + "relocated_images_probe")
+
+
+def test_a_plain_site_still_pulling_at_the_dependency_deadline_is_not_refused_and_the_log_says_why(runtime, tmp_path):
+    """A plain site the previous release installed pulled four of its six images
+    under the initialization deadline (24 h by default); the probe bounded all
+    six by deadlines.dependencies_seconds and refused a slow link that had
+    installed before. With the location unchanged, a pull still in progress
+    goes on past that deadline, once said, up to the initialization deadline
+    beyond it."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", pulled_at=6)          # spent 25 s: past the 10 s deadline
+    assert result.returncode == 0, result.stderr
+    assert "did not finish pulling" not in result.stderr
+    assert result.stderr.count("still pulling") == 1, "said once, at deadlines.dependencies_seconds"
+    line = next(l for l in result.stderr.splitlines() if "still pulling" in l)
+    assert "deadlines.dependencies_seconds (10 s)" in line and "slow link" in line and "wait goes on" in line, line
+    assert "All 6 images pulled" in result.stderr
+    pod = json.loads((work / "probe-pod.json").read_text())
+    assert pod["spec"]["activeDeadlineSeconds"] == 10 + 20 + 300, "the Pod outlives the wait it serves"
+
+
+def test_a_plain_site_still_pulling_is_refused_at_both_deadlines_together(runtime, tmp_path):
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="")
+    assert result.returncode != 0
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "did not finish pulling" in line
+    assert "deadlines.dependencies_seconds plus deadlines.initialization_seconds (30 s)" in line, line
+    assert json.loads((work / "probe-pod.json").read_text())["spec"]["activeDeadlineSeconds"] == 30 + 300
+
+
+@pytest.mark.parametrize("base, recorded", [(BASE, None), ("", BASE)], ids=["set", "removed"])
+def test_a_set_or_changed_base_still_pulling_is_refused_at_the_dependency_deadline(runtime, tmp_path, base, recorded):
+    """A relocated site, or one whose base changed, keeps the dependency
+    deadline: its images were proven under it before."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=base, pulled_at=6, recorded=recorded)
+    assert result.returncode != 0
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "did not finish pulling" in line and "within deadlines.dependencies_seconds (10 s)" in line, line
+    assert "still pulling" not in result.stderr
+    assert json.loads((work / "probe-pod.json").read_text())["spec"]["activeDeadlineSeconds"] == 10 + 300
+
+
+@pytest.mark.parametrize("status, verb, absent", [
+    ("restoring-resources", "restore-repair --operation", ("resume --operation", " repair --operation")),
+    ("restore-files-verified", "resume --operation", ("restore-repair",)),
+    ("applying", "repair --operation", ("restore-repair", "resume --operation")),
+])
+def test_the_pull_deadline_during_a_restore_names_the_verb_its_state_accepts(runtime, tmp_path, status, verb, absent):
+    """The deadline named one hint for every kind and phase -- resume, or repair
+    after raising the deadline -- and both refuse a restore stopped in
+    restoring-*; a restore's site is retained byte for byte, so no raised
+    deadline continues it."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=BASE, operation={"kind": "restore", "status": status}, prefix='STATE_DIR="$TEST_WORK"; ')
+    assert result.returncode != 0 and "did not finish pulling" in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith(verb + " aaaaaaaaaaaabbbbbbbbbbbb"), hint
+    for word in absent:
+        assert word not in hint, (word, hint)
+    assert "a raised deadlines.dependencies_seconds cannot continue this restore" in hint, hint
+    assert "after raising" not in hint
+
+
+def test_the_pull_deadline_on_a_first_install_names_abandon_and_install_again_never_repair(runtime, tmp_path):
+    """A repair of an owned first install completes it without the storage check."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=BASE, operation={"kind": "install", "status": "owned"}, prefix='STATE_DIR="$TEST_WORK"; ')
+    assert result.returncode != 0 and "did not finish pulling" in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith("abandon --operation aaaaaaaaaaaabbbbbbbbbbbb"), hint
+    assert "install again from the corrected file after raising deadlines.dependencies_seconds" in hint, hint
+    assert "resume --operation aaaaaaaaaaaabbbbbbbbbbbb" in hint and "repair --operation" not in hint
+
+
+@pytest.mark.parametrize("status, kind, abandon", [("backup-verified", "upgrade", False), ("owned", "upgrade", True)])
+def test_the_pull_deadline_over_an_installed_source_names_repair_after_raising_it_and_resume(runtime, tmp_path, status, kind, abandon):
+    run, _, work = runtime
+    (work / "installed.json").write_text(json.dumps({"status": "complete"}))
+    result = _slow(run, work, tmp_path, base=BASE, operation={"kind": kind, "status": status}, prefix='STATE_DIR="$TEST_WORK"; ')
+    assert result.returncode != 0 and "did not finish pulling" in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith("repair --operation aaaaaaaaaaaabbbbbbbbbbbb --config") and "after raising deadlines.dependencies_seconds" in hint, hint
+    assert "resume --operation aaaaaaaaaaaabbbbbbbbbbbb" in hint and "first install" not in hint
+    assert ("run upgrade --to VERSION again" in hint) == abandon and "install again" not in hint
+
+
+# --- the probe Pod's resources, and a LimitRange or ResourceQuota that refuses it ---
+
+def test_every_probe_container_requests_what_a_limit_range_admits_with_its_limit_equal_to_the_request(runtime, tmp_path):
+    """1m CPU and 1Mi memory under a 16Mi limit: a LimitRange minimum above
+    either, or a maxLimitRequestRatio below 16, refused the Pod. 10m and 16Mi,
+    limited to 16Mi (ratio 1): six are 60m and 96Mi beside a running deployment."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    _, result = _probe(run, work, tmp_path)
+    assert result.returncode == 0, result.stderr
+    pod = json.loads((work / "probe-pod.json").read_text())
+    assert [c["resources"] for c in pod["spec"]["containers"]] == [
+        {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "16Mi"}}] * 6
+
+
+@pytest.mark.parametrize("words", [
+    'Error from server (Forbidden): error when creating "STDIN": pods "gsj-pull-aaaaaaaaaaaa" is forbidden: minimum memory usage per Container is 32Mi, but request is 16Mi',
+    'Error from server (Forbidden): error when creating "STDIN": pods "gsj-pull-aaaaaaaaaaaa" is forbidden: [maximum cpu usage per Container is 5m, but limit is 10m]',
+    'Error from server (Forbidden): error when creating "STDIN": pods "gsj-pull-aaaaaaaaaaaa" is forbidden: exceeded quota: compute, requested: requests.memory=96Mi, used: requests.memory=4Gi, limited: requests.memory=4Gi',
+], ids=["limitrange-minimum", "limitrange-maximum", "resourcequota"])
+def test_a_limit_range_or_quota_that_refuses_the_probe_is_not_blamed_on_permissions(runtime, tmp_path, words):
+    """Their verdict reads 'forbidden', and the refusal called it the
+    kubeconfig's permissions: the operator was sent to RBAC."""
+    run, _, work = runtime
+    release = _public_release(); payload = _payload(tmp_path, release); site = _site()
+    site["registry"].update(base=BASE, pull_secret="corp-pull")
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    result = run(PROBE_PRELUDE.format(payload=payload) + "k() { if [[ $1 == create ]]; then echo " + json.dumps(words) + " >&2; return 1; fi; command kubectl \"$@\"; }\nrelocated_images_probe")
+    assert result.returncode != 0
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "an admission policy (LimitRange or ResourceQuota) refused the Pod" in line, line
+    assert "permissions" not in line and "32Mi" not in line and "exceeded" not in line
+    assert "cpu 10m and memory 16Mi" in line and "LimitRange" in line and "ResourceQuota" in line

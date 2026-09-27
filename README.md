@@ -45,8 +45,10 @@ install and when you would find out.
   corpus import and before any acceptance check has run. Every pull of the
   release's images is proven on the storage node before anything is applied,
   for every site, so nodes that cannot pull stop an install in its first
-  minutes; all six must arrive within `deadlines.dependencies_seconds`
-  (900 s by default), which a slow link to the registry may need raised.
+  minutes. With `registry.base` all six must arrive within
+  `deadlines.dependencies_seconds` (900 s by default), which a slow link to
+  the mirror may need raised; without it a pull still under way then is
+  waited for up to `deadlines.initialization_seconds` more.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has
