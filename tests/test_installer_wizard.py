@@ -9,6 +9,8 @@ import subprocess
 import termios
 import time
 
+import pytest
+
 from tests.test_installer import INSTALLER, runtime  # noqa: F401
 
 
@@ -114,3 +116,62 @@ wizard
         assert expected not in config.read_bytes()
     assert config.stat().st_mode & 0o077 == 0
     assert any("authentication" in prompt for prompt in answered)
+
+
+def _workload(kind, namespace, name, image):
+    return {"kind": kind, "metadata": {"namespace": namespace, "name": name},
+            "spec": {"template": {"spec": {"containers": [{"name": "main", "image": image}]}}}}
+
+
+NGINX = _workload("Deployment", "ingress-nginx", "ingress-nginx-controller",
+                  "registry.k8s.io/ingress-nginx/controller:v1.12.1@sha256:" + "c" * 64)
+BUNDLED_TRAEFIK = _workload("Deployment", "kube-system", "traefik", "rancher/mirrored-library-traefik:3.3.6")
+
+
+@pytest.mark.parametrize("controller,annotation,workloads,expected", [
+    # the controller's Pods run in its own namespace; no Helm annotation on the class
+    ("k8s.io/ingress-nginx", None, [BUNDLED_TRAEFIK, NGINX], "ingress-nginx"),
+    # the class's Helm record names another namespace than the one the Pods run in
+    ("traefik.io/ingress-controller", "platform-charts",
+     [_workload("DaemonSet", "edge", "edge-proxy", "docker.io/library/traefik:v3.3.6"), NGINX], "edge"),
+    # no controller of the class's family: the Helm annotation, then the default
+    ("haproxy.org/ingress-controller/haproxy", "haproxy-controller", [NGINX], "haproxy-controller"),
+    ("projectcontour.io/ingress-controller", None, [NGINX], "gsj-ingress"),
+    # two of the family in two namespaces decide nothing
+    ("k8s.io/ingress-nginx", "helm-home",
+     [NGINX, _workload("Deployment", "second", "ingress-nginx-controller", "registry.k8s.io/ingress-nginx/controller:v1.12.1")],
+     "helm-home"),
+    # the workloads cannot be listed: the annotation still answers
+    ("k8s.io/ingress-nginx", "helm-home", None, "helm-home"),
+])
+def test_wizard_takes_the_ingress_namespace_from_where_the_class_s_controller_runs(runtime, controller, annotation,
+                                                                                  workloads, expected):
+    """With exactly one IngressClass, ingress.namespace is the namespace the
+    application's NetworkPolicy admits, so it must be where the controller's
+    Pods run: the Deployment or DaemonSet inspect recognizes as a controller
+    whose image is of the class's family. The class's Helm release namespace
+    names where its chart was recorded, and a class installed from plain
+    manifests has none; both are only the fallback now."""
+    run, _, work = runtime
+    shutil.copyfile(INSTALLER / "defaults.json", work / "wizard.json")
+    ingress_class = {"metadata": {"name": "edge-class", **({"annotations": {"meta.helm.sh/release-namespace": annotation}}
+                                                           if annotation else {})},
+                     "spec": {"controller": controller}}
+    result = run('''WIZARD="$TEST_WORK/wizard.json"
+kubectl() {
+ case "$*" in
+  *'get nodes -o json') printf '%s' '{"items":[]}';;
+  *'get storageclasses -o json') printf '%s' '{"items":[{"metadata":{"name":"local-path"}}]}';;
+  *'get ingressclasses -o json') printf '%s' "$TEST_CLASSES";;
+  *'get deployments,daemonsets -A -o json') [[ -n $TEST_WORKLOADS ]] || { echo 'Error from server (Forbidden)' >&2; return 1; }; printf '%s' "$TEST_WORKLOADS";;
+  *) return 99;;
+ esac
+}
+wizard_discover synthetic-context
+''', TEST_CLASSES=json.dumps({"items": [ingress_class]}),
+                 TEST_WORKLOADS="" if workloads is None else json.dumps({"items": workloads}))
+    assert result.returncode == 0, result.stderr
+    site = json.loads((work / "wizard.json").read_text())
+    assert site["ingress"]["class"] == "edge-class"
+    assert site["ingress"]["namespace"] == expected
+    assert "Forbidden" not in result.stderr

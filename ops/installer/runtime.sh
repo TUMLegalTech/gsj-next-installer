@@ -602,16 +602,34 @@ wizard_credential() {
  esac
 }
 wizard_discover() {
- local context=$1 nodes classes ingress
+ local context=$1 nodes classes ingress workloads="$GSJ_WORK/wizard-workloads.json"
  nodes=$(kubectl --context "$context" get nodes -o json)
  classes=$(kubectl --context "$context" get storageclasses -o json)
  ingress=$(kubectl --context "$context" get ingressclasses -o json)
- jq --argjson nodes "$nodes" --argjson classes "$classes" --argjson ingress "$ingress" '
+ # ingress.namespace is the one namespace the application's NetworkPolicy
+ # admits, so it must be where the controller's Pods RUN. The class's Helm
+ # release namespace says where its chart was recorded, and a class applied
+ # from plain manifests carries none (the default then named a namespace with
+ # no controller in it). The controller is found by inspect's rule, narrowed
+ # to the image family the class's spec.controller names; the annotation and
+ # then the default stay the fallback. Read into a file: every Deployment and
+ # DaemonSet of a cluster can exceed what one argument may carry.
+ printf '{"items":[]}' > "$workloads"
+ if jq -e '.items|length==1' <<< "$ingress" >/dev/null; then kubectl --context "$context" get deployments,daemonsets -A -o json > "$workloads" 2>/dev/null || printf '{"items":[]}' > "$workloads"; fi
+ jq --argjson nodes "$nodes" --argjson classes "$classes" --argjson ingress "$ingress" --slurpfile workloads "$workloads" '
    if ($nodes.items|length)==1 then .storage.node=$nodes.items[0].metadata.name else . end |
    if ($classes.items|length)==0 then .storage.profile="managed-local-path"|.storage.class="gsj-local"
    else .storage.class=($classes.items|sort_by(.metadata.annotations["storageclass.kubernetes.io/is-default-class"]!="true",.metadata.name)|.[0].metadata.name) end |
    if ($ingress.items|length)==0 then .ingress.profile="managed-traefik"
-   elif ($ingress.items|length)==1 then .ingress.class=$ingress.items[0].metadata.name | .ingress.namespace=($ingress.items[0].metadata.annotations["meta.helm.sh/release-namespace"] // .ingress.namespace)
+   elif ($ingress.items|length)==1 then .ingress.class=$ingress.items[0].metadata.name |
+     ($ingress.items[0].spec.controller // "") as $controller |
+     ([["ingress-nginx","traefik","haproxy","contour"][] as $family|select($controller|contains($family))|$family]|first) as $family |
+     ([($workloads[0].items // [])[]|
+       select((.metadata.name|test("ingress|traefik|nginx|haproxy|contour|istio"))
+           or any((.spec.template.spec.containers // [])[]; (.image // "")|test("ingress-nginx|traefik|haproxy|contour")))|
+       select($family != null and any((.spec.template.spec.containers // [])[]; (.image // "")|contains($family)))|
+       .metadata.namespace]|unique) as $homes |
+     .ingress.namespace=(if ($homes|length)==1 then $homes[0] else ($ingress.items[0].metadata.annotations["meta.helm.sh/release-namespace"] // .ingress.namespace) end)
    else . end
  ' "$WIZARD" | atomic "$WIZARD"
 }
