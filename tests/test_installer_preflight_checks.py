@@ -13,6 +13,7 @@ no write reached the cluster, and the recovery verbs are exempt.
 """
 import base64
 import json
+import os
 import subprocess
 
 import pytest
@@ -383,6 +384,8 @@ def test_an_unreadable_certificate_file_is_refused_before_the_lease(runtime, tmp
 def test_a_certificate_or_key_file_this_account_cannot_read_is_refused_by_name(runtime, tmp_path, field, name, existing):
     """Refused as unreadable, with the remedy, rather than as no certificate or
     as a Secret that differs; and jq's words about the file are not printed."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads every file")
     run, state, work = runtime
     _baseline(tmp_path, state, work)
     crt, key = _self_signed(tmp_path, "files")
@@ -748,6 +751,8 @@ def test_an_operator_password_with_a_control_character_is_refused(runtime, tmp_p
 
 
 def test_an_operator_password_file_this_account_cannot_read_is_refused_by_name(runtime, tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root reads every file")
     run, state, work = runtime
     _baseline(tmp_path, state, work, _operator_secret(PASSWORD))
     (work / "operator-password").chmod(0)
