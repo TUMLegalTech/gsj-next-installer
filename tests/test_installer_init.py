@@ -1361,10 +1361,11 @@ def test_help_lists_init_and_the_verifier_and_inspect_are_pinned(runtime):
     assert pinned == hashlib.sha256((INSTALLER / "verify-release.sh").read_bytes()).hexdigest(), \
         "verify-release.sh changed: update INIT_VERIFIER_SHA256 in runtime.sh (init executes only the published verifier)"
     # inspect_cluster is byte-identical to the text init was built on
-    # (re-pinned deliberately when a review citation in one of its comments was
-    # reworded; the code is the same as the text init was built on)
+    # (re-pinned deliberately when one comment about its proxy field was
+    # reworded; only that comment changed, every other line is the text init
+    # was built on)
     body = source[source.index("\ninspect_cluster() {"):source.index("\nquantity_bytes() {")]
-    assert hashlib.sha256(body.encode()).hexdigest() == "2703b6018a43277e1ab50400f49c5b7ae5da9e711a74a4caf2409f2581775bce", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
+    assert hashlib.sha256(body.encode()).hexdigest() == "5296031fb5e8736420135a9cfbbec8f2bc952e6c5ec7004ae2dc2244afe7596d", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
 
 
 def test_the_guides_check_table_names_exactly_the_checks_init_writes():

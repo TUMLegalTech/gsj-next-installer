@@ -66,8 +66,8 @@ pull_failure_condition() {
  # limit, a certificate or a disk the node's side can put right while the
  # kubelet retries, and words this installer does not classify, which a
  # retry may clear. The message itself is untrusted text -- a registry or
- # a proxy composes it, a bearer can ride in it -- and is never repeated
- # It is kept in the state directory for the operator.
+ # a proxy composes it, a bearer can ride in it -- and is never repeated;
+ # it is kept in the state directory for the operator.
  local m; m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
  case $m in
    *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'definitive\tthe registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
@@ -772,13 +772,13 @@ inspect_cluster() {
  done
  # A proxy is reported by PRESENCE and origin only: a proxy URL may carry
  # user:password@, which must never reach this document (proxy_file_check
- # refuses one at the site input for the same reason). Through
- # url_origin_only, the one function -- the hand-made cut before it dropped
- # the userinfo, the scheme and the path and KEPT the query and the fragment
- # (an init report carried `proxy.example?REVIEW_PROXY_QUERY_SECRET`)
- #. A proxy variable may omit its scheme: one is lent for
- # the parse and taken back, so the field keeps its host[:port] shape; an
- # authority that is not a host is named by the function's fixed words.
+ # refuses one at the site input for the same reason). It goes through
+ # url_origin_only, the one function: the hand-made cut before it dropped
+ # the userinfo, the scheme and the path and KEPT the query and the fragment,
+ # so an init report carried a proxy's query string. A proxy variable may
+ # omit its scheme: one is lent for the parse and taken back, so the field
+ # keeps its host[:port] shape; an authority that is not a host is named by
+ # the function's fixed words.
  local proxy_set proxy_origin=''
  proxy_set=$( [[ -n ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}} ]] && printf true || printf false)
  if [[ $proxy_set == true ]]; then
@@ -4814,8 +4814,7 @@ installation_summary() {
  # backup.offbox_url, tls.acme_server; llm.allowed_origins are origins by
  # schema) -- goes through url_origin_only, the one function: the origin,
  # never a path, query or userinfo (a path segment is schema-valid and can
- # carry a credential). The full values stay in site.json beside it
- #.
+ # carry a credential). The full values stay in site.json beside it.
  jq -n --slurpfile site "$SITE" --slurpfile release "$GSJ_PAYLOAD/release.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg chart "$(sha_file "$GSJ_PAYLOAD/chart.tgz")" --arg operation "$OPERATION" --arg record "$STATE_DIR/installed.json" --arg report "$STATE_DIR/verification.json" \
    --arg public_url "$(url_origin_only "$(j '.public_url // ""')")" --arg llm_url "$(url_origin_only "$(j '.llm.base_url // ""')")" --arg ocr_url "$(url_origin_only "$(j '.ocr.url // ""')")" --arg vectors_url "$(url_origin_only "$(j '.corpus.vectors_url // ""')")" --arg offbox_url "$(url_origin_only "$(j '.backup.offbox_url // ""')")" --arg acme_server "$(url_origin_only "$(j '.tls.acme_server // ""')")" '
    $site[0] as $s | $release[0] as $r | $verification[0] as $v |
