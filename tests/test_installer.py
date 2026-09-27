@@ -1471,6 +1471,9 @@ k() {
    esac;;
  esac
 }
+# the site's other references are read by preflight_site_checks, pinned in
+# test_installer_preflight_checks.py; this body answers every Secret with the pull Secret
+preflight_site_checks() { :; }
 preflight
 '''
 

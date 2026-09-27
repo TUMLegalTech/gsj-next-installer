@@ -1278,15 +1278,16 @@ endpoint_preflight() {
 }
 preflight() {
  k cluster-info >/dev/null
- local platform nodes pull server
+ local platform nodes pull server versions
  # The server floor, asserted HERE so a too-old cluster is refused before the
  # first write rather than by Helm after the Lease, the Secrets and the add-ons.
  # `|| true` inside the substitution: under `set -Eeuo pipefail` a kubectl that
  # cannot answer `version` would otherwise make this ASSIGNMENT abort preflight
  # outright rather than leave $server empty. An unreadable server version must
  # skip the floor check, not kill the run -- the same trap that cost 43 test
- # regressions in client_version.
- server=$( { k version -o json 2>/dev/null || true; } | jq -r '.serverVersion.gitVersion // ""' 2>/dev/null || true)
+ # regressions in client_version. The answer is kept for the client's skew.
+ versions=$( { k version -o json 2>/dev/null || true; } )
+ server=$(jq -r '.serverVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
  [[ -z $server ]] || version_at_least "${server#v}" "$GSJ_SERVER_FLOOR" \
    || fail "requires Kubernetes >= $GSJ_SERVER_FLOOR, found $server. This release selects the provisioning Job by batch.kubernetes.io/job-name, a label the Job controller stamps only from 1.27; on an older server that Job is silently denied its dependencies by a NetworkPolicy that matches nothing."
  nodes=$(k get nodes -o json)
@@ -1310,6 +1311,132 @@ preflight() {
  if [[ $(j .storage.profile) == reuse ]]; then
    jq -e '.provisioner | IN("rancher.io/local-path","rancher.io/gsj-local-path","kubernetes.io/no-provisioner")' "$STATE_DIR/storage-class.json" >/dev/null || fail 'storage driver needs SQLite/fsync/locking qualification; only qualified local-path/static-local profiles are admitted'
    [[ $(j .storage.node) != '' ]] || fail 'SQLite local storage requires an explicit placement node'
+ fi
+ # The site's own references and kubectl's distance from the server, read
+ # before the Lease. Only an install or an upgrade writes what they would
+ # stop; every recovery verb runs against what is already there.
+ if [[ $COMMAND == install || $COMMAND == upgrade ]]; then preflight_site_checks "$versions"; fi
+}
+preflight_site_checks() {
+ # What an install or an upgrade used to meet only after the Lease -- the TLS
+ # Secret and certificate files (managed_dependencies), the operator Secret
+ # (secret_file: an upgrade met a changed password file after its backup had
+ # quiesced the application), leftover add-on CRDs (managed_helm_addon) -- or
+ # hours in, at the acceptance check: an expired or foreign certificate, a
+ # controller namespace with no controller, a host another Ingress serves.
+ # Every call here is a get. A refusal is a fixed sentence and the names
+ # involved; what kubectl said on a failed read is kept in the state
+ # directory and never repeated. A read this credential may not make is
+ # logged and passed, as the capacity check does: a namespace-scoped operator
+ # is a supported shape, and the later checks still stand.
+ local versions=$1 host secret existing crt key ca ns found pods counts total running controllers client server cv='' sv='' cm sm crds owner names orphans='' homes='' home teardown='' gets where
+ host=$(j '.public_url // ""' | sed -E 's#https://([^/:]+).*#\1#')
+ # kubectl is supported within one minor of the server (init's kubectl-skew
+ # row). A kubectl this run downloaded is the release's pin, not the
+ # operator's choice, so a skew there is refused with the way to keep this
+ # machine's own; a skew in this machine's own kubectl is said, and the run
+ # goes on. Only the numbers are repeated: a gitVersion is what the server says.
+ client=$(jq -r '.clientVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
+ server=$(jq -r '.serverVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
+ if [[ $client =~ ^v?([0-9]+\.([0-9]+)(\.[0-9]+)?) ]]; then cv=${BASH_REMATCH[1]}; cm=${BASH_REMATCH[2]}; fi
+ if [[ $server =~ ^v?([0-9]+\.([0-9]+)(\.[0-9]+)?) ]]; then sv=${BASH_REMATCH[1]}; sm=${BASH_REMATCH[2]}; fi
+ if [[ -n $cv && -n $sv ]] && (( 10#$cm - 10#$sm > 1 || 10#$sm - 10#$cm > 1 )); then
+   [[ " ${FETCH_SET:-} " != *" kubectl "* ]] || fail "kubectl version skew: the kubectl --fetch-tools downloaded for this run is $cv and the server is $sv, more than one minor apart, and kubectl is supported within one minor of the server. Run without --fetch-tools to use this machine's kubectl, or with --fetch-tools=helm, which fetches only Helm and keeps this machine's kubectl"
+   log "kubectl $cv is more than one minor from the server ($sv), and kubectl is supported within one minor of the server. The run goes on with it; if a step fails on it, install a kubectl within one minor of $sv"
+ fi
+ # The operator Secret, when it exists, must hold this password file's
+ # password under secret_file's normalization (trailing newlines dropped, a
+ # control character refused), refused in secret_file's words. Compared
+ # inside jq: the password reaches no argument and no file.
+ secret=$(j '.operator.secret // ""')
+ if [[ -n $secret ]]; then
+   jq -e -Rs 'sub("\\n+$";"")|length>0 and (any(explode[]; .<32 or .==127)|not)' "$OP_PASSWORD" >/dev/null || fail "operator.password_file holds a control character (a tab, a carriage return or another byte below 32) or nothing but newlines: write the password as one line of printable characters, then run the same command again"
+   existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-operator-secret.err") || fail "the operator Secret $secret in namespace $NAMESPACE could not be read: $(kubectl_failure_condition "$STATE_DIR/preflight-operator-secret.err"). kubectl's output is kept in $STATE_DIR/preflight-operator-secret.err; correct the access and run the same command again"
+   [[ -z $existing ]] || jq -e --rawfile password "$OP_PASSWORD" '.data.password == ($password|sub("\\n+$";"")|@base64)' <<< "$existing" >/dev/null || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite"
+ fi
+ case $(j '.tls.profile // ""') in
+ existing)
+   # managed_dependencies still asks for a complete Secret under the Lease.
+   secret=$(j .tls.secret); crt="$GSJ_WORK/preflight-tls.crt"
+   existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-tls-secret.err") || fail "TLS Secret is unavailable: $secret in namespace $NAMESPACE could not be read ($(kubectl_failure_condition "$STATE_DIR/preflight-tls-secret.err")). kubectl's output is kept in $STATE_DIR/preflight-tls-secret.err; correct the access and run the same command again"
+   [[ -n $existing ]] || fail "TLS Secret is unavailable: tls.profile existing serves the Secret $secret, and namespace $NAMESPACE holds none of that name. Create it there before installing: the namespace first if it does not exist yet (kubectl create namespace $NAMESPACE), then the kubernetes.io/tls Secret (kubectl -n $NAMESPACE create secret tls $secret --cert=FILE --key=FILE). A certificate that already lives in another namespace is copied without its key touching disk: kubectl -n OTHER get secret $secret -o json | jq '{apiVersion,kind,type,data,metadata:{name:.metadata.name}}' | kubectl -n $NAMESPACE create -f -"
+   jq -e '.type=="kubernetes.io/tls" and (.data["tls.crt"]|type=="string" and length>0) and (.data["tls.key"]|type=="string" and length>0)' <<< "$existing" >/dev/null || fail "TLS Secret is incomplete: $secret in namespace $NAMESPACE must be of type kubernetes.io/tls and hold a non-empty tls.crt and tls.key. Replace it with one that does (kubectl -n $NAMESPACE delete secret $secret, then kubectl -n $NAMESPACE create secret tls $secret --cert=FILE --key=FILE)"
+   { jq -r '.data["tls.crt"]' <<< "$existing" | base64 --decode > "$crt"; } 2>/dev/null && openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "TLS Secret is incomplete: the tls.crt of $secret in namespace $NAMESPACE is not a readable PEM certificate. Replace it with the certificate for $host"
+   certificate_names_host "$crt" "$host" || fail "TLS certificate host mismatch: the certificate in Secret $secret (namespace $NAMESPACE) does not name public_url's host $host. Put a certificate for $host in that Secret, or correct public_url"
+   openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1 || fail "TLS certificate expired: the certificate in Secret $secret (namespace $NAMESPACE) is past its expiry date. Put a current certificate for $host in that Secret, then run the same command again"
+   # The acceptance check verifies public_url from inside the application Pod
+   # with Python's X.509-strict default context against verification.ca_file,
+   # and a chain only a lax verifier accepts stops there as origin-tls-failed.
+   # Said, not refused: the chain the controller serves and the Pod's route (a
+   # proxy that carries the origin) decide that, not this Secret alone.
+   ca=$(j .verification.ca_file)
+   if [[ -n $ca ]] && ! openssl verify -x509_strict -CAfile "$(resolve_file "$ca")" -untrusted "$crt" "$crt" >/dev/null 2>&1; then
+     log "The certificate in Secret $secret does not pass strict verification (openssl verify -x509_strict) against verification.ca_file ($ca). The acceptance check inside the application Pod verifies strictly and would stop at origin-tls-failed; supply the CA that issued it, or a certificate whose chain passes strict verification. The run goes on"
+   fi;;
+ files)
+   # Compared, never written here: creating the Secret stays under the Lease.
+   secret=$(j .tls.secret); crt=$(resolve_file "$(j .tls.certificate_file)"); key=$(resolve_file "$(j .tls.private_key_file)"); private_file "$key"
+   openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "tls.certificate_file is not a readable PEM certificate ($(j .tls.certificate_file)); the host was not checked. Point it at the PEM certificate for $host"
+   certificate_names_host "$crt" "$host" || fail "TLS certificate host mismatch: tls.certificate_file ($(j .tls.certificate_file)) does not name public_url's host $host. Supply a certificate for $host, or correct public_url"
+   existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-tls-secret.err") || fail "TLS Secret $secret in namespace $NAMESPACE could not be read ($(kubectl_failure_condition "$STATE_DIR/preflight-tls-secret.err")). kubectl's output is kept in $STATE_DIR/preflight-tls-secret.err; correct the access and run the same command again"
+   [[ -z $existing ]] || jq -e --rawfile crt "$crt" --rawfile key "$key" '.data["tls.crt"]==($crt|@base64) and .data["tls.key"]==($key|@base64)' <<< "$existing" >/dev/null || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite";;
+ esac
+ # ingress.profile reuse: the application's NetworkPolicy admits
+ # ingress.namespace, and that namespace alone, to its web port, so a
+ # namespace without a controller is a site that never answers -- met at
+ # acceptance. A controller is recognized by inspect's rule; the refusal
+ # names counts, never what the API said.
+ if [[ $(j '.ingress.profile // ""') == reuse ]]; then
+   ns=$(j .ingress.namespace)
+   if ! found=$(kubectl --context "$CONTEXT" get namespace "$ns" -o name --ignore-not-found 2> "$STATE_DIR/preflight-ingress-namespace.err"); then
+     log "ingress.namespace $ns was not checked: this credential could not read that namespace (kubectl's output is kept in $STATE_DIR/preflight-ingress-namespace.err). The application's NetworkPolicy admits that namespace alone to its web port, so if no ingress controller runs there the site will not answer"
+   elif [[ -z $found ]]; then
+     fail "ingress.namespace $ns does not exist. Under ingress.profile reuse it must name the namespace the ingress controller's Pods run in, because the application's NetworkPolicy admits that namespace alone to its web port; kubectl get pods -A names it in its first column. Set ingress.namespace to it and run the same command again"
+   elif ! pods=$(kubectl --context "$CONTEXT" --namespace "$ns" get pods -o json 2> "$STATE_DIR/preflight-ingress-namespace.err"); then
+     log "ingress.namespace $ns was not checked: this credential could not list its Pods (kubectl's output is kept in $STATE_DIR/preflight-ingress-namespace.err). The application's NetworkPolicy admits that namespace alone to its web port, so if no ingress controller runs there the site will not answer"
+   else
+     counts=$(jq -r '[.items[]|select(.status.phase=="Running")] as $running | [$running[]|select((.metadata.name|test("ingress|traefik|nginx|haproxy|contour|istio")) or any((.spec.containers // [])[]; (.image // "")|test("ingress-nginx|traefik|haproxy|contour")))] as $controllers | "\(.items|length) \($running|length) \($controllers|length)"' <<< "$pods")
+     read -r total running controllers <<< "$counts"
+     (( controllers > 0 )) || fail "ingress.namespace $ns runs no ingress controller: it holds $total Pod(s), $running of them Running, and none of the Running ones is an ingress controller by its name or its image (ingress, traefik, nginx, haproxy, contour, istio). Under ingress.profile reuse it must name the namespace the controller's Pods run in, because the application's NetworkPolicy admits that namespace alone to its web port; kubectl get pods -A names it in its first column. Set ingress.namespace to it and run the same command again"
+   fi
+ fi
+ # Two deployments cannot share one host: the controller routes it to one of
+ # them, and the other's acceptance check fails hours in on a trust error.
+ # This installation's own Ingress (an upgrade's) is not a collision.
+ if [[ -n $host ]]; then
+   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))|"\(.metadata.namespace)/\(.metadata.name)"]|unique|join(", ")' 2>/dev/null); then
+     log "public_url's host $host was not checked against other Ingresses: this credential could not list Ingresses cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-ingresses.err). If another deployment serves $host, the acceptance check fails on it hours in rather than here"
+   elif [[ -n $found ]]; then
+     fail "public_url's host $host is already served by Ingress $found: two deployments cannot share one host. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"
+   fi
+ fi
+ # Leftover managed add-on CRDs: cluster-scoped, so they outlive the add-on's
+ # namespace and its owner record (the ConfigMap gsj-addon-owner there, with
+ # the same gsj.io/addon-owner label). managed_helm_addon still refuses them
+ # under the Lease; named here first, each, with the teardown -- which this
+ # installer never performs: deleting a CRD deletes every object of its kind.
+ if [[ $(j '.ingress.profile // ""') == managed-traefik || $(j '.tls.profile // ""') == managed-acme ]]; then
+   if ! crds=$(kubectl --context "$CONTEXT" get customresourcedefinitions -l gsj.io/addon-owner -o json 2> "$STATE_DIR/preflight-addon-crds.err"); then
+     log "Leftover managed add-on CustomResourceDefinitions were not checked: this credential could not list them (kubectl's output is kept in $STATE_DIR/preflight-addon-crds.err). One without its owner record is still refused after the Lease"
+   else
+     for owner in $(jq -r '[.items[].metadata.labels["gsj.io/addon-owner"]]|unique|.[]' <<< "$crds"); do
+       if ! found=$(kubectl --context "$CONTEXT" get configmaps -A -l "gsj.io/addon-owner=$owner" -o json 2> "$STATE_DIR/preflight-addon-crds.err"); then
+         log "Leftover managed add-on CustomResourceDefinitions were not checked against their owner records: this credential could not list ConfigMaps cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-addon-crds.err). One without its owner record is still refused after the Lease"
+         break
+       fi
+       if jq -e 'any(.items[]; .metadata.name=="gsj-addon-owner")' <<< "$found" >/dev/null; then continue; fi
+       names=$(jq -r --arg owner "$owner" '[.items[]|select(.metadata.labels["gsj.io/addon-owner"]==$owner)|.metadata.name]|join(" ")' <<< "$crds")
+       orphans+="${orphans:+ }$names"
+       names=$( { kubectl --context "$CONTEXT" get namespaces -l "gsj.io/addon-owner=$owner" -o json 2>/dev/null || true; } | jq -r '[.items[]?.metadata.name]|join(" ")' 2>/dev/null || true)
+       [[ -z $names ]] || homes+="${homes:+ }$names"
+     done
+     if [[ -n $orphans ]]; then
+       for home in $homes; do teardown+="helm -n $home list names the release; helm -n $home uninstall RELEASE; kubectl delete namespace $home; "; done
+       where="no add-on namespace is left"; [[ -z $homes ]] || where="add-on namespace: $homes"
+       gets=$(printf 'kubectl get %s -A, ' $orphans)
+       fail "managed add-on CustomResourceDefinitions are left without their owner record: $orphans ($where). The managed add-on this site selects would be refused on them after the Lease, as a resource that already exists without its owner record. Tear the leftover add-on down first; this installer deletes nothing: ${teardown:+uninstall its Helm release and delete its namespace (${teardown%; }), then }once each of ${gets%, } lists no object any more, delete the definitions by name (kubectl delete customresourcedefinition $orphans). Then run the same command again"
+     fi
+   fi
  fi
 }
 lease_still_live() {
