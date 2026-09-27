@@ -68,14 +68,17 @@ main "$TEST_COMMAND" --to "$SELECTED" --config "$SITE" --non-interactive
 ])
 def test_the_verified_child_fetches_the_clients_this_run_fetched(runtime, command, flags, handed):
     """Every --to hands off to the target's own installer before preflight, so
-    the child alone runs the checks a fetched client answers to -- among them
-    the refusal of a fetched kubectl more than one minor from the server. The
+    the child alone runs the checks a fetched client answers to -- for an
+    upgrade child, among them the refusal of a fetched kubectl more than one
+    minor from the server; a repair child makes no such check, and takes the
+    set so that it runs on the clients this run fetched, as fetched. The
     child's argv carried no --fetch-tools: its fetched set was empty while the
-    parent's fetched kubectl sat first on the PATH it inherited, and that skew
-    was only warned about. The child now receives the set this run fetched
-    (the archives are cached by checksum, so nothing downloads twice, and it
-    verifies them itself); all three stay the bare flag, the one form a target
-    that predates the per-client form parses. Nothing fetched, no flag."""
+    parent's fetched kubectl sat first on the PATH it inherited, and an
+    upgrade child only warned about that skew. The child now receives the set
+    this run fetched (the archives are cached by checksum, so nothing
+    downloads twice, and it verifies them itself); all three stay the bare
+    flag, the one form a target that predates the per-client form parses.
+    Nothing fetched, no flag."""
     run, _, work = runtime
     payload = work / "payload"
     (payload / "helpers").mkdir(parents=True)
