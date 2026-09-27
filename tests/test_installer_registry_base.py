@@ -883,17 +883,57 @@ def test_the_pull_deadline_over_an_installed_source_names_repair_after_raising_i
 
 # --- the probe Pod's resources, and a LimitRange or ResourceQuota that refuses it ---
 
-def test_every_probe_container_requests_what_a_limit_range_admits_with_its_limit_equal_to_the_request(runtime, tmp_path):
-    """1m CPU and 1Mi memory under a 16Mi limit: a LimitRange minimum above
-    either, or a maxLimitRequestRatio below 16, refused the Pod. 10m and 16Mi,
-    limited to 16Mi (ratio 1): six are 60m and 96Mi beside a running deployment."""
+def test_every_probe_container_requests_what_the_storage_check_does_with_both_limits_equal_to_the_request(runtime, tmp_path):
+    """10m CPU and 16Mi memory under a memory limit alone: a LimitRange minimum
+    between those and the 100m and 128Mi the storage check asks for admitted
+    the previous release's deployment and refused the probe, and the CPU limit
+    a LimitRange injects where none is set made a limit-to-request ratio of 100.
+    100m and 128Mi, with both limits equal to them (ratio 1): six are 600m and
+    768Mi beside a running deployment."""
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 6))
     _, result = _probe(run, work, tmp_path)
     assert result.returncode == 0, result.stderr
     pod = json.loads((work / "probe-pod.json").read_text())
     assert [c["resources"] for c in pod["spec"]["containers"]] == [
-        {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "16Mi"}}] * 6
+        {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}}] * 6
+
+
+# A namespace LimitRange that admits every Pod the previous release created: a
+# 32Mi minimum per container, a CPU limit of 1 injected where none is set, and a
+# limit at most 10 times the request. The fake applies it to what the manifest
+# asks and answers as the API server does.
+LIMIT_RANGE_CREATE = r"""create) doc=$(cat)
+           refused=$(jq -r 'def mi: if endswith("Gi") then (.[:-2]|tonumber)*1024 else .[:-2]|tonumber end;
+             def milli: if endswith("m") then .[:-1]|tonumber else (tonumber*1000) end;
+             [.spec.containers[].resources |
+               (if (.requests.memory|mi) < 32 then "minimum memory usage per Container is 32Mi, but request is \(.requests.memory)" else empty end),
+               ((((.limits.cpu // "1")|milli) / (.requests.cpu|milli)) as $ratio | if $ratio > 10 then "cpu max limit to request ratio per Container is 10, but provided ratio is \($ratio)" else empty end)]
+             | unique | join(", ")' <<< "$doc")
+           if [ -n "$refused" ]; then echo "Error from server (Forbidden): error when creating \"STDIN\": pods \"gsj-pull-aaaaaaaaaaaa\" is forbidden: [$refused]" >&2; return 1; fi
+           printf '%s' "$doc" > "$TEST_WORK/probe-pod.json";;"""
+
+
+def test_a_limit_range_that_admits_the_previous_release_s_pods_admits_the_probe(runtime, tmp_path):
+    """The probe's 16Mi fell below that 32Mi minimum and its 10m under the
+    injected CPU limit of 1 made a ratio of 100: the namespace admitted a whole
+    deployment and refused the Pod meant to prove its pulls. What the manifest
+    asks now passes both rules; the old request does not, so the fake bites."""
+    run, _, work = runtime
+    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    release = _public_release(); payload = _payload(tmp_path, release); site = _site()
+    site["registry"].update(base=BASE, pull_secret="corp-pull")
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    prelude = PROBE_PRELUDE.format(payload=payload).replace('create) cat > "$TEST_WORK/probe-pod.json";;', LIMIT_RANGE_CREATE)
+    result = run(prelude + "relocated_images_probe")
+    assert result.returncode == 0, result.stderr
+    assert "All 6 images pulled" in result.stderr and "could not be created" not in result.stderr
+    old = json.dumps({"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "16Mi"}}}]}})
+    refused = run(prelude + "k create -f - <<< " + json.dumps(old))
+    assert refused.returncode != 0
+    assert "minimum memory usage per Container is 32Mi, but request is 16Mi" in refused.stderr
+    assert "ratio per Container is 10, but provided ratio is 100" in refused.stderr
 
 
 @pytest.mark.parametrize("words", [
@@ -914,4 +954,4 @@ def test_a_limit_range_or_quota_that_refuses_the_probe_is_not_blamed_on_permissi
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "an admission policy (LimitRange or ResourceQuota) refused the Pod" in line, line
     assert "permissions" not in line and "32Mi" not in line and "exceeded" not in line
-    assert "cpu 10m and memory 16Mi" in line and "LimitRange" in line and "ResourceQuota" in line
+    assert "cpu 100m and memory 128Mi, with limits equal to those requests" in line and "LimitRange" in line and "ResourceQuota" in line

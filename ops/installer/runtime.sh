@@ -3236,22 +3236,25 @@ relocated_images_probe() {
  # removes a predecessor, and sweep removes one a killed installer left behind.
  PROBE_POD=$pod
  # What each container asks for. They never run, so the numbers only have to
- # pass admission: 1m CPU and 1Mi memory under a 16Mi limit fell below a
- # LimitRange minimum, or above its maxLimitRequestRatio, and the Pod was
- # refused. The limit equals the request (ratio 1); six of them are 60m and
- # 96Mi, which still schedule beside a running deployment.
- local cpu=10m memory=16Mi
+ # pass admission -- and a namespace that admits the deployment must admit its
+ # probe. 10m CPU and 16Mi under a memory limit alone did not: a LimitRange
+ # minimum between those and the 100m and 128Mi the storage check asks for
+ # refused the probe alone, and the CPU limit a LimitRange injects where none
+ # is set made a limit-to-request ratio of 100. So the storage check's
+ # request, with both limits equal to it (ratio 1, nothing injected); six are
+ # 600m and 768Mi, which still schedule beside a running deployment.
+ local cpu=100m memory=128Mi
  if ! jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$(j .storage.node)" --arg base "$base" --argjson deadline "$bound" --arg cpu "$cpu" --arg memory "$memory" --argjson pulls "$(jq '(.image.pullSecrets // [])|map({name:.})' "$GSJ_WORK/values.pending.json")" --slurpfile r "$GSJ_PAYLOAD/release.json" "$JQ_IMAGE"'
    {apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"gsj.io/pull-probe":$release}},
     spec:{restartPolicy:"Never",automountServiceAccountToken:false,enableServiceLinks:false,imagePullSecrets:$pulls,
           activeDeadlineSeconds:($deadline+300),
           nodeSelector:(if $node=="" then {} else {"kubernetes.io/hostname":$node} end),
-          containers:[$r[0].images|to_entries[]|{name:("pull-"+(.key|ascii_downcase)),image:(.value|image_ref($base)),imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:$cpu,memory:$memory},limits:{memory:$memory}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
+          containers:[$r[0].images|to_entries[]|{name:("pull-"+(.key|ascii_downcase)),image:(.value|image_ref($base)),imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:$cpu,memory:$memory},limits:{cpu:$cpu,memory:$memory}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
    PROBE_POD=''
    atomic "$STATE_DIR/pull-probe-create.err" < "$GSJ_WORK/pull-probe-create.err"
    local why next="If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
    why=$(kubectl_failure_condition "$GSJ_WORK/pull-probe-create.err")
-   [[ $why != *LimitRange* ]] || next="Each of its $want containers requests cpu $cpu and memory $memory with a memory limit of $memory: the namespace's LimitRange must admit that (its minimum, maximum and maxLimitRequestRatio) and its ResourceQuota must leave room for it"
+   [[ $why != *LimitRange* ]] || next="Each of its $want containers requests cpu $cpu and memory $memory, with limits equal to those requests: the namespace's LimitRange must admit that (its minimum, maximum and maxLimitRequestRatio) and its ResourceQuota must leave room for it"
    fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $why; kubectl's own words are kept in $STATE_DIR/pull-probe-create.err. $next"
  fi
  while :; do
