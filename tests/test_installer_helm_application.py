@@ -37,7 +37,7 @@ def application(tmp_path, chart):
     site = _site(); site['target'].update(namespace='synthetic-namespace', release='synthetic-release')
     (tmp_path / 'site.json').write_text(json.dumps(site))
     shutil.copyfile(tmp_path / 'site.json', state / 'site.pending.json')
-    result = subprocess.run(['jq', '--slurpfile', 'release', str(payload / 'release.json'), '-f', str(INSTALLER / 'compile.jq'), str(tmp_path / 'site.json')], check=True, capture_output=True)
+    result = subprocess.run(['jq', '--slurpfile', 'release', str(payload / 'release.json'), '--argjson', 'egress_endpoints', '[]', '-f', str(INSTALLER / 'compile.jq'), str(tmp_path / 'site.json')], check=True, capture_output=True)
     (work / 'values.pending.json').write_bytes(result.stdout)
     (state / 'operation.json').write_text(json.dumps({'operation': 'a' * 24, 'kind': 'install', 'target': 'synthetic-release', 'status': 'owned'}))
     api = tmp_path / 'api.json'

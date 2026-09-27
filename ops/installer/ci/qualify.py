@@ -119,6 +119,11 @@ def check_application(installed, manifest, expected=None):
     require(report.get("expected_corpus_fingerprint") == manifest["corpus"]["fingerprint"], "application corpus binding differs")
     require(verdict["public"].get("status") == "passed" and verdict["public"].get("tls_verified") is True
             and verdict["network"].get("status") == "passed", "public TLS or real NetworkPolicy gate failed")
+    # the closed outbound list was held, not merely rendered: the record's
+    # egress object carries the pod's probe and Chroma's report
+    egress = verdict["network"].get("egress")
+    require(isinstance(egress, dict) and isinstance(egress.get("gsj"), dict) and isinstance(egress.get("chroma"), dict),
+            "the NetworkPolicy gate did not hold the closed outbound list")
 
 
 def bundle(directory):

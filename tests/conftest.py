@@ -27,3 +27,60 @@ NEEDS_PRODUCT_PACKAGE = [
 collect_ignore = []
 if importlib.util.find_spec("gsj_deploy") is None:
     collect_ignore += NEEDS_PRODUCT_PACKAGE
+
+
+# The runtime resolves every host a site names (its LLM, OCR, allowed origins
+# and proxies) with `getent ahosts` on the machine it runs on, so every test
+# that compiles a site would otherwise ask the real resolver about
+# llm.example and its kin. This session-wide fixture puts a synthetic
+# resolver first on PATH, like the synthetic cluster the fake kubectl is: an
+# IP literal answers with itself, any other name with one address derived
+# from its spelling (203.0.113.0/24, the documentation range), and nothing
+# for a name under .invalid or, when a test's kubectl state names them, in
+# its "unresolvable" list; every name asked is recorded in that state.
+import os
+import pytest
+import tempfile
+
+_SYNTHETIC_GETENT = """#!/usr/bin/env python3
+import ipaddress, json, os, pathlib, sys
+a = sys.argv[1:]
+# the runtime ends the options with "--" so a name starting with "-" is a name; glibc's getent reads it the same way
+if len(a) >= 2 and a[1] == "--": del a[1]
+if a[:1] not in (["ahosts"], ["ahostsv6"]) or len(a) != 2: sys.exit(1)
+# a machine without IPv6 answers nothing for any IPv6 query, a literal included, when a test's state says so
+if a[0] == "ahostsv6":
+    _state = os.environ.get("TEST_KUBECTL_STATE")
+    if _state and os.path.exists(_state) and json.loads(pathlib.Path(_state).read_text()).get("no_ipv6"): sys.exit(2)
+name = a[1]
+state = os.environ.get("TEST_KUBECTL_STATE")
+s = json.loads(pathlib.Path(state).read_text()) if state and os.path.exists(state) else {}
+if state and os.path.exists(state):
+    s.setdefault("resolved", []).append(name); pathlib.Path(state).write_text(json.dumps(s))
+try:
+    ip = ipaddress.ip_address(name)
+    # an IPv4-mapped address is printed as glibc prints it, in dotted form, whatever this Python prints
+    mapped = getattr(ip, "ipv4_mapped", None)
+    print(f"{('::ffff:' + str(mapped)) if mapped else ip} STREAM {name}"); sys.exit(0)
+except ValueError: pass
+# a colon is no part of a name: the resolver answers nothing for it (a bracketed string that is no address)
+if ":" in name: sys.exit(2)
+# a name the test's state lists as loopback answers as /etc/hosts would on a machine that maps it locally
+if name in s.get("loopback", []): print(f"127.0.0.1 STREAM {name}"); sys.exit(0)
+# an in-cluster Service name resolves nowhere outside its cluster
+if name.endswith(".invalid") or name.endswith(".svc") or name.endswith(".svc.cluster.local") or name in s.get("unresolvable", []): sys.exit(2)
+n = sum(name.encode()) % 200 + 10
+print(f"203.0.113.{n} STREAM {name}"); print(f"203.0.113.{n} DGRAM {name}")
+"""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def synthetic_resolver():
+    directory = tempfile.mkdtemp(prefix="gsj-synthetic-resolver-")
+    getent = Path(directory) / "getent"
+    getent.write_text(_SYNTHETIC_GETENT)
+    getent.chmod(0o755)
+    previous = os.environ.get("PATH", "")
+    os.environ["PATH"] = directory + os.pathsep + previous
+    yield
+    os.environ["PATH"] = previous

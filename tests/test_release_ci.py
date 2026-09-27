@@ -161,7 +161,9 @@ def installed_state(module):
               "expected_corpus_fingerprint": "a" * 64,
               "checks": [{"name": name, "status": "passed"} for name in module.expected_checks()]}
     state = {"status": "complete", "manifest": manifest,
-             "verification": {"application": report, "public": {"status": "passed", "tls_verified": True}, "network": {"status": "passed"}}}
+             "verification": {"application": report, "public": {"status": "passed", "tls_verified": True},
+                              # the network gate's record carries the closed outbound list it held: the pod's probe and Chroma's report
+                              "network": {"status": "passed", "egress": {"gsj": {"answer": {}, "refuse": {}}, "chroma": {"control": "connected"}}}}}
     return state, copy.deepcopy(manifest)
 
 
@@ -201,7 +203,7 @@ def test_fixture_preservation_fails_on_reachable_history_or_contract_drift(modul
 
 
 @needs_web
-@pytest.mark.parametrize("failure", ["missing", "skipped", "cleanup", "corpus", "tls", "images"])
+@pytest.mark.parametrize("failure", ["missing", "skipped", "cleanup", "corpus", "tls", "images", "egress"])
 def test_ordinary_gate_requires_every_real_contract(modules, failure):
     module = modules[1]
     state, manifest = installed_state(module)
@@ -212,6 +214,7 @@ def test_ordinary_gate_requires_every_real_contract(modules, failure):
     elif failure == "corpus": state["verification"]["application"]["expected_corpus_fingerprint"] = "b" * 64
     elif failure == "tls": state["verification"]["public"]["tls_verified"] = False
     elif failure == "images": state["manifest"]["images"]["web"] = "different"
+    elif failure == "egress": state["verification"]["network"]["egress"] = "not rendered by the applied chart"   # the list was never held
     with pytest.raises(ValueError):
         module.check_application(state, manifest)
 

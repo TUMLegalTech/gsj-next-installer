@@ -53,6 +53,9 @@ def validated(site):
     return json.loads(out.stdout)
 
 
+STAND_IN_ENDPOINTS = [{"cidr": "198.51.100.20/32", "port": 443}]
+
+
 def compiled(tmp_path, site, *extra):
     release = tmp_path / "release.json"
     release.write_text(json.dumps(_release()))
@@ -71,7 +74,7 @@ def rendered(tmp_path, values=None, *args, release="gsj"):
         command += ["--values", str(path)]
     else:  # the installer always sets fullnameOverride to the release name (§3 of the contract)
         command += ["--set", "fullnameOverride=" + release, "--set", "operator.password=x",
-                    "--set", "llm.model=openai@http://llm.test:8000/v1#test-model"]
+                    "--set", "llm.model=openai@http://198.51.100.10:8000/v1#test-model"]   # an IPv4 literal: the chart admits it without a resolved list
     out = subprocess.run(command + list(args), capture_output=True, text=True,
                          env=dict(os.environ, KUBECONFIG=os.devnull))
     assert out.returncode == 0, out.stderr
@@ -100,7 +103,10 @@ def web_deployment(docs, release="gsj"):
 @pytest.mark.parametrize("example", EXAMPLES, ids=[p.name for p in EXAMPLES])
 def test_every_example_site_validates_compiles_and_renders_with_the_pinned_chart(tmp_path, example):
     site = validated(merged(example))
-    values = compiled(tmp_path, site)
+    # the runtime always passes the resolved outbound list; here a stand-in
+    # address stands for the examples' hostnames (the chart refuses a
+    # hostname only while the key is unset)
+    values = compiled(tmp_path, site, "--argjson", "egress_endpoints", json.dumps(STAND_IN_ENDPOINTS))
     release = site["target"]["release"]
     docs = rendered(tmp_path, values, release=release)
     kinds = {(d["kind"], d["metadata"]["name"]) for d in docs}
@@ -138,11 +144,23 @@ def test_every_compiled_leaf_is_a_value_the_pinned_chart_declares(tmp_path, exam
     emitted = set(leaves(values))
     # maps the chart hands on whole (`toYaml .Values.resources.web`, the
     # placement selector) or declares empty: compare at the map
-    maps = {"placement.nodeSelector", "ingress.annotations", "trust", "corpus.resources",
+    maps = {"placement.nodeSelector", "ingress.annotations", "trust", "corpus.resources", "networkPolicy.ingressControllerPodSelector",
             "resources.web", "resources.mcp", "resources.runner", "resources.forgejo", "resources.chroma"}
+    # the pod-selector map is exempt as a map the chart hands on whole — a pinned chart that declares the outbound list must declare it too
+    if "networkPolicy.egress.endpoints" in declared:
+        assert "networkPolicy.ingressControllerPodSelector" in declared
     unknown = sorted(leaf for leaf in emitted
                      if leaf not in declared and not any(leaf.startswith(m + ".") or leaf == m for m in maps))
     assert unknown == [], f"compile.jq emits values the pinned chart does not declare: {unknown}"
+    # the runtime's compile adds the outbound list and the controller pod
+    # selector; once the pinned chart declares them, that compile is held to
+    # the same rule (a pinned chart that predates them is not asked)
+    if "networkPolicy.egress.endpoints" in declared:
+        values = compiled(tmp_path, validated(merged(example)), "--argjson", "egress_endpoints", json.dumps(STAND_IN_ENDPOINTS))
+        emitted = set(leaves(values))
+        unknown = sorted(leaf for leaf in emitted
+                         if leaf not in declared and not any(leaf.startswith(m + ".") or leaf == m for m in maps))
+        assert unknown == [], f"the runtime's compile emits values the pinned chart does not declare: {unknown}"
 
 
 def test_the_synthetic_site_compiles_to_the_documented_keys(tmp_path):
@@ -169,11 +187,11 @@ def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
                 ("Job", "gsj-provision"), ("ConfigMap", "gsj-scripts"),
                 ("Secret", "gsj-operator"),
                 ("PersistentVolumeClaim", "gsj-data"), ("PersistentVolumeClaim", "gsj-forgejo"), ("PersistentVolumeClaim", "gsj-chroma"),
-                ("ServiceAccount", "gsj-provisioner"), ("ServiceAccount", "gsj-pod"),
-                ("Role", "gsj-provisioner"), ("Role", "gsj-marker-reader"),
-                ("RoleBinding", "gsj-provisioner"), ("RoleBinding", "gsj-marker-reader"),
+                ("ServiceAccount", "gsj-provisioner"), ("Role", "gsj-provisioner"), ("RoleBinding", "gsj-provisioner"),
                 ("NetworkPolicy", "gsj-default-deny-ingress"), ("NetworkPolicy", "gsj-gsj-web-ingress"),
                 ("NetworkPolicy", "gsj-forgejo-ingress"), ("NetworkPolicy", "gsj-forgejo-egress"), ("NetworkPolicy", "gsj-chroma-ingress"),
+                # the gsj pod's and Chroma's outbound lists: red while the pin names a chart that predates them, like the contract document's identity test
+                ("NetworkPolicy", "gsj-gsj-egress"), ("NetworkPolicy", "gsj-chroma-egress"),
                 ("Ingress", "gsj-web")}
     missing = expected - names
     assert not missing, f"the pinned chart no longer renders {sorted(missing)}"
@@ -277,7 +295,7 @@ def test_progress_deadline_outlasts_the_dependency_wait_and_the_import(tmp_path)
         assert startup["progressDeadlineSeconds"] > floor + threshold * 5
     assert web_deployment(rendered(tmp_path, None, *CORPUS))["spec"]["progressDeadlineSeconds"] == startup["progressDeadlineSeconds"]
     out = subprocess.run(["helm", "template", "gsj", str(pinned_web.chart()), "--set", "fullnameOverride=gsj",
-                          "--set", "operator.password=x", "--set", "llm.model=openai@http://llm.test:8000/v1#test-model",
+                          "--set", "operator.password=x", "--set", "llm.model=openai@http://198.51.100.10:8000/v1#test-model",
                           *CORPUS, "--set", f"startup.progressDeadlineSeconds={floor}"],
                          capture_output=True, text=True)
     assert out.returncode != 0, "a progress window equal to the two deadlines must not render"
@@ -298,7 +316,8 @@ def test_compiled_values_name_the_controller_and_carry_no_inert_key(tmp_path):
              (site("reuse"), ("--arg", "ingress_controller", "k8s.io/ingress-nginx"), "k8s.io/ingress-nginx"),
              (site("reuse"), (), "k8s.io/ingress-nginx")]
     for s, extra, controller in cases:
-        values = compiled(tmp_path, s, *extra)
+        # rendered as the runtime compiles: with the outbound list it always passes
+        values = compiled(tmp_path, s, *extra, "--argjson", "egress_endpoints", "[]")
         assert values["ingress"]["controller"] == controller
         assert "annotations" not in values["ingress"]
         assert "provisioning" not in values

@@ -533,7 +533,7 @@ load_site() {
  OP_PASSWORD=$(resolve_file "$(j .operator.password_file)"); if [[ $COMMAND != restore || -f $OP_PASSWORD ]]; then private_file "$OP_PASSWORD"; [[ -s $OP_PASSWORD ]] || fail 'operator password is empty'; fi
  BACKUP_DIR=$(resolve_file "$(j .backup.directory)"); BACKUP_PASSWORD=$(resolve_file "$(j .backup.passphrase_file)"); private_file "$BACKUP_PASSWORD"; [[ -s $BACKUP_PASSWORD ]] || fail 'backup encryption passphrase is empty'
  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$SITE" > "$GSJ_WORK/values.pending.json"
+ compile_values "$SITE" > "$GSJ_WORK/values.pending.json"
  local delivery_ca delivery_auth
  delivery_ca=$(j .delivery.ca_file); delivery_auth=$(j .delivery.auth_header_file)
  if [[ -n $delivery_ca ]]; then
@@ -1196,6 +1196,186 @@ initializer_memory_check() {
 # 58203 (the guide's step-0 block, verbatim in its logic). A credential file
 # rides as a header read from a private file, never on a command line.
 GSJ_OCR_PROBE_PNG=iVBORw0KGgoAAAANSUhEUgAAATcAAABDAQAAAADRnX/8AAACLklEQVR42u2VMW7cMBBFHykhUpVVuu2sI+wBnJhHyRFSuooHCBDkGDkKj6Aj0F1KGXDBNbicFJS00tqFU6XZ6QR8/uH8+V80yntKLe+rK+6K+1fcsUVrHnfGmM/GGDgZw1OHWnh0HNsNX+g2BMMzL+r4PfDnBaiBmAD8tpE/EQkqDUEBVHWsNFfKF+AWUE2g8BDYJSoVHjRbgAwobhMIIBAhI/hyv7FgZQElyJX3Hgrzeo5kjIr6RqcA1j3cJxrFhFBwQYG4VvJGaTvkJ3Ev2G7m88BYv9LWAJDrc1+B0PIm0P2QGecB/ErmyHyaHu5nnOkB6V/RfZ+koJ/7etjI98nZOM6SMEx8AuhKPhgGUpgPqnMFZ7uzzEdjAZ7Nyck0KghYUAiXV8uI2Yx9VnfllxFwFlILkLXwUbcjF5yKP0HsFgpb3HJRN6ggkyrVvF8ADuMK14tU3hOKpvsRLCSIi3yNZtg7l+tDwLvLHMGveKZrBFpQKVrVy7wJQ9rcMNGSq/O+7bR1+9pWY6rfyvlq7Kdph8Vq3RmXwa4enGFq19EFTnHCjSvzrnfTjT3ghdQWvruSnbNhejzEeUMplpz7OyVXKncqmhpV1bAjNeONUMWGbMKu5NytqI7GCN0TpKEv32jfLfMKuLURjD05BGows+99WdoqHy12CYJlyZtMCV5wNbURBLDUuPn/UqqLK/FbnFHASEs/+Vk2PQGM/8bhIwBfD+w/AOb67l9x/xH3F0Tp4vsISHl9AAAAAElFTkSuQmCC
+# ---- the gsj pod's closed outbound list: the site's addresses, resolved ----
+# The chart closes the gsj pod's outbound traffic to a list, and a
+# NetworkPolicy names ADDRESSES, never hosts. compile_values therefore hands
+# compile.jq the addresses of every host the application dials outside the
+# cluster — the LLM, the OCR, each allowed model origin, each proxy — as
+# networkPolicy.egress.endpoints ([{cidr, port}]). An IP literal is itself. A
+# hostname is resolved with getent on THIS machine when an operation starts
+# (install, upgrade, restore); a continued, resumed or repaired operation, and
+# every verb that applies nothing, reuse the addresses the operation recorded,
+# so the compiled configuration stays byte-identical across the runs of one
+# operation and no backup, sweep or abandon depends on this machine's
+# resolver. A name this machine cannot resolve is never a refusal — a site
+# that worked before this list existed keeps installing — but it is said in
+# the log, because the pod gets no rule for it: the endpoint preflight says
+# what the endpoint answered from here, and acceptance skips what it cannot
+# reach. A name of an in-cluster Service is said as that: this release's list
+# admits addresses outside the cluster only. What is refused is a URL no
+# policy could be written for (a port outside 1-65535).
+egress_endpoint_urls() { # merged site file -> "site key<TAB>url" lines, every address the gsj pod dials outside the cluster
+ local site=$1 file
+ jq -r '[["llm.base_url", .llm.base_url], ["ocr.url", .ocr.url]] + (.llm.allowed_origins | map(["llm.allowed_origins", .]))
+        | map(select(.[1] != "")) | .[] | @tsv' "$site"
+ file=$(jq -r '.trust.proxy_file // ""' "$site")
+ if [[ -n $file ]]; then
+   file=$(resolve_file "$file")
+   if [[ -f $file && ! -L $file && -r $file ]]; then
+     # the trust step's own shape check first, its stderr kept (a malformed
+     # file must not echo a piece of itself), then the credential refusal
+     jq -e 'type=="object" and (keys|sort)==["HTTPS_PROXY","HTTP_PROXY","NO_PROXY"] and all(.[];type=="string")' "$file" >/dev/null 2>&1 || fail 'proxy_file must contain exactly HTTP_PROXY, HTTPS_PROXY and NO_PROXY strings'
+     proxy_file_check "$file"
+     jq -r '[.HTTP_PROXY, .HTTPS_PROXY] | map(select(. != "")) | map(["trust.proxy_file", .]) | .[] | @tsv' "$file"
+   elif [[ -r ${GSJ_WORK:-}/restored-proxy-normalized.json ]]; then
+     # a restore to a machine that does not carry the proxy file yet: the
+     # archive's proxy (recovered and checked against the release's Secret by
+     # restore_archive, which then recompiles the values) serves the list
+     jq -r '[.HTTP_PROXY, .HTTPS_PROXY] | map(select(. != "")) | map(["trust.proxy_file", .]) | .[] | @tsv' "$GSJ_WORK/restored-proxy-normalized.json"
+   else
+     # an install or upgrade refuses at its trust step without the file; a
+     # restore takes the proxy from its archive once it is open
+     log "trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this compile (an install or upgrade refuses at its trust step without the file; a restore takes the proxy from its archive)"
+   fi
+ fi
+}
+ipv6_literal_ok() { # an IPv6 literal, an IPv4 octet regex -> 0 when the literal's grammar holds: at most one "::", at most eight groups of up to four hex digits (an embedded IPv4 tail counts as two), nothing else
+ local body=$1 ipv4=$2 tail g n=0 double=0
+ if [[ $body == *.* ]]; then tail=${body##*:}; [[ $tail =~ $ipv4 ]] || return 1; body="${body%"$tail"}0:0"; fi
+ [[ $body != *:::* ]] || return 1
+ case $body in *::*::*) return 1;; *::*) double=1;; esac
+ [[ $body != :* || $body == ::* ]] || return 1
+ [[ $body != *: || $body == *:: ]] || return 1
+ local IFS=':'
+ for g in $body; do [[ -z $g ]] && continue; [[ $g =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1; n=$((n+1)); done
+ if (( double )); then (( n <= 7 )); else (( n == 8 )); fi
+}
+resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what cannot be resolved here is said, not refused
+ local key=$1 url=$2 scheme='' rest authority host port address shown ports p cidr cidrs=() literal=0
+ # the character tests below read bytes in the C locale (in a subshell, so
+ # the resolver keeps the operator's locale and its IDN encoding): a name is
+ # refused only for what no host can carry
+ local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:.]+$' local_answer='^(127\.|169\.254\.|::1$|::$|[fF][eE][89aAbB]|0\.0\.0\.0$)' forbidden='[][[:space:][:cntrl:]/@?#\\]'
+ ipv4="^$octet\.$octet\.$octet\.$octet$"
+ # what a refusal or a log line names: the site key and, for the LLM, the OCR
+ # and an origin, the URL's origin; never a proxy URL (its file may carry what
+ # proxy_file_check refuses)
+ case $key in trust.proxy_file) shown='a proxy URL in trust.proxy_file';; *) shown="$key ($(url_origin_only "$url"))";; esac
+ if [[ $url == *://* ]]; then scheme=${url%%://*}; rest=${url#*://}; else rest=$url; fi
+ scheme=$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')
+ authority=${rest%%[/?#]*}; authority=${authority##*@}
+ if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; port=${authority##*]}; port=${port#:}; literal=1
+ elif [[ $authority == *:* ]]; then host=${authority%%:*}; port=${authority##*:}
+ else host=$authority; port=''; fi
+ if [[ -n $port ]]; then ports=$port
+ else
+   # the scheme's port; a proxy URL without a port is dialled on the scheme's
+   # port by the pod's Python and node clients and on 1080 by curl, so a
+   # port-less proxy gets both
+   case $scheme in https) ports=443;; socks5|socks5h|socks4|socks4a) ports=1080;; *) ports=80;; esac
+   [[ $key != trust.proxy_file || $ports == 1080 ]] || { ports="$ports 1080"; log "$shown names no port; the gsj pod gets a rule on the scheme's port and on 1080 (curl's proxy default); name the port in the proxy file to admit one"; }
+ fi
+ # an IPv4-mapped IPv6 literal is its IPv4 address; a bracketed literal is
+ # hex, colons and dots (an embedded IPv4 as in 64:ff9b::10.0.0.5 included),
+ # a zone-scoped literal (fe80::1%eth0) is no address a policy can name; a
+ # name may carry any byte a host can, and the resolver says what it is
+ if (( literal )); then
+   ( LC_ALL=C; [[ $host =~ $ipv4 || ( $host =~ $ipv6 && $host == *:* ) ]] ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+   if [[ $host == *:* ]]; then
+     # the literal's grammar is checked here, not by the resolver: a machine
+     # without IPv6 answers nothing for any IPv6 query, literal or not; what
+     # the resolver does answer is the canonical form, and is taken
+     ( LC_ALL=C; ipv6_literal_ok "$host" "$ipv4" ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+     if command -v getent >/dev/null 2>&1; then
+       local parsed; parsed=$(getent ahostsv6 -- "$host" 2>/dev/null | awk 'NR==1{print $1}')
+       [[ $parsed =~ $ipv6 || $parsed =~ $ipv4 ]] || parsed=''
+       [[ -z $parsed ]] || host=$parsed
+     fi
+   fi
+ fi
+ if [[ $host =~ ^::[fF]{4}:(.*)$ ]]; then local mapped=${BASH_REMATCH[1]}; [[ $mapped =~ $ipv4 ]] && host=$mapped; fi
+ if (( literal )); then :
+ else ( LC_ALL=C; [[ -n $host && ! $host =~ $forbidden ]] ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"; fi
+ for p in $ports; do
+   { [[ $p =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )); } || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+ done
+ if [[ $host =~ $ipv4 ]]; then cidrs=("$host/32")
+ elif [[ $host == *:* ]]; then cidrs=("$host/128")
+ elif ! command -v getent >/dev/null 2>&1; then log "getent is not available on this machine; $shown gets no outbound rule"; return 0
+ else
+   # a dotted quad that is no address (999.1.1.1, 010.0.0.7) is a name here,
+   # and the resolver says what it is; a name this machine cannot resolve is
+   # said as an in-cluster Service when it is shaped like one (…svc…), which
+   # this release's list cannot admit, and as unresolvable otherwise
+   while read -r address; do
+     [[ -n $address ]] || continue
+     if [[ $address =~ $local_answer ]]; then
+       log "$shown resolves to $address on this machine, an address the pod could never reach; the gsj pod gets no outbound rule for that answer"; continue
+     fi
+     if [[ $address == *:* ]]; then cidrs+=("$address/128"); else cidrs+=("$address/32"); fi
+   done < <(getent ahosts -- "$host" 2>/dev/null | awk '{print $1}' | sort -u | grep -E '^([0-9.]+|[0-9A-Fa-f:.]+)$' || true)
+   if (( ! ${#cidrs[@]} )); then
+     if [[ $host == *.svc || $host == *.svc.* ]]; then
+       log "$shown names an in-cluster Service; this release's outbound list admits addresses outside the cluster only, so the gsj pod gets no rule for it"
+     else
+       log "$shown names a host this machine cannot resolve to an address the pod could reach; the gsj pod gets no outbound rule for it (fix this machine's DNS for that name, or name the address in the site file, and run again)"
+     fi
+     return 0
+   fi
+ fi
+ for cidr in "${cidrs[@]}"; do for p in $ports; do jq -n --arg cidr "$cidr" --argjson port "$((10#$p))" '{cidr:$cidr,port:$port}'; done; done
+}
+egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --argjson egress_endpoints
+ local site=$1 fresh=0 replacement=0 recorded urls key url
+ case ${COMMAND:-} in install|upgrade|restore) fresh=1;; repair) replacement=1;; esac
+ # a repair may carry a changed site (a corrected endpoint is what a repair
+ # is for), so it resolves the site it is given — once, kept under its
+ # operation below — instead of the list the operation recorded
+ if (( ! fresh && ! replacement )); then
+   # the operation being continued recorded its list in its intent; before
+   # that, or for a verb that continues nothing, the retained values
+   for recorded in "${STATE_DIR:-}/operation-intents/${RESUME_ID:-}/values.json" "${STATE_DIR:-}/values.pending.json"; do
+     if [[ -n ${RESUME_ID:-} || $recorded != */operation-intents/* ]] && [[ -f $recorded && ! -L $recorded ]] && jq -e '.networkPolicy.egress.endpoints|type=="array"' "$recorded" >/dev/null 2>&1; then
+       jq -c '.networkPolicy.egress.endpoints' "$recorded"; return 0
+     fi
+   done
+ fi
+ # with nothing recorded, an operation being continued resolves once and
+ # keeps the list in its state under its own name: a repair that re-enters
+ # compares its transition file byte for byte, and a resolver answer that
+ # changed between two runs must not be what differs; a verb that continues
+ # nothing keeps nothing
+ local kept=''
+ [[ -z ${RESUME_ID:-} || -z ${STATE_DIR:-} ]] || kept="$STATE_DIR/egress-endpoints-$RESUME_ID.json"
+ if (( ! fresh )) && [[ -n $kept && -f $kept && ! -L $kept ]] && jq -e 'type=="array"' "$kept" >/dev/null 2>&1; then cat "$kept"; return 0; fi
+ # a refusal inside a command substitution must still stop the compile:
+ # errexit does not reach a $(...) subshell, so the status is checked here
+ urls=$(egress_endpoint_urls "$site") || return 1
+ local list
+ list=$({
+   while IFS=$'\t' read -r key url; do
+     [[ -n $url ]] || continue
+     resolve_endpoint "$key" "$url" || exit 1
+   done <<< "$urls"
+ } | jq -s 'unique') || return 1
+ if (( ! fresh )) && [[ -n $kept && -d ${STATE_DIR:-} ]]; then printf '%s\n' "$list" | atomic "$kept"; fi
+ printf '%s\n' "$list"
+}
+compile_values() { # merged site file -> the chart's values on stdout: compile.jq plus the outbound list
+ # the gsj pod's start-up check reads its ready marker from a mounted
+ # ConfigMap, which the kubelet refreshes within about 80 s of the
+ # provisioning Job's write: a dependency deadline near the schema's floor
+ # would expire first, and is said so here
+ local deadline; deadline=$(jq -r '.deadlines.dependencies_seconds // 0' "$1" 2>/dev/null || echo 0)
+ [[ ! $deadline =~ ^[0-9]+$ ]] || (( deadline == 0 || deadline >= 120 )) || log "deadlines.dependencies_seconds is $deadline: the gsj pod's ready marker reaches it through a mounted ConfigMap on the kubelet's next pod sync (60-90 s with the default sync period, longer where it is raised), and the deadline counts from the pod's start, so it must also cover the provisioning Job's run; an expiry only restarts wait-deps, which then finds the marker — a deadline under 120 s is likely to expire once"
+ local endpoints; endpoints=$(egress_endpoints "$1") || exit 1
+ jq --slurpfile release "$GSJ_PAYLOAD/release.json" --argjson egress_endpoints "$endpoints" -f "$GSJ_PAYLOAD/compile.jq" "$1"
+}
+compile_values_recorded() { # merged site file, a recorded values file -> the values with THAT file's outbound list (none recorded, or no file: none passed)
+ local recorded=null
+ [[ -f $2 && ! -L $2 ]] && recorded=$(jq -c '.networkPolicy.egress.endpoints // null' "$2")
+ jq --slurpfile release "$GSJ_PAYLOAD/release.json" --argjson egress_endpoints "$recorded" -f "$GSJ_PAYLOAD/compile.jq" "$1"
+}
 endpoint_probe_header() {
  # Authorization: Bearer <the credential file's contents>, in a 0600 file
  # curl reads with --header @FILE; empty when the endpoint has no credential.
@@ -4020,8 +4200,48 @@ public_verify() {
  done < "$GSJ_WORK/spa-assets"
  jq -n --arg url "$url" --argjson assets "$(wc -l < "$GSJ_WORK/spa-assets")" '{name:"public-https",status:"passed",url:$url,tls_verified:true,spa:true,security_headers:true,assets_verified:$assets}' > "$STATE_DIR/public-check.json"
 }
+# The egress probe the door's container runs (it has httpx): every address
+# that must answer, every address that must not connect within 10 s, and a
+# name cluster DNS must resolve. It reports; the assertions are in
+# network_verify. A refused target is "no connection" whatever the CNI's way
+# of refusing — an immediate reset (kube-router), a hang to the timeout
+# (Calico, kindnet) or a name that did not resolve — and only the arbitrary
+# public ADDRESS, which needs no name, counts as blocked on any outcome but a
+# completed connection, like every other canary; the Kubernetes API's
+# ClusterIP is among them, the canary any unpoliced pod reaches.
+GSJ_EGRESS_PROBE_PY='import json, socket, ssl, sys, time
+import httpx
+spec = json.load(sys.stdin)
+out = {"answer": {}, "refuse": {}, "resolve": {}}
+for name, url in spec["answer"].items():
+    try:
+        out["answer"][name] = {"http": httpx.get(url, timeout=10.0, follow_redirects=False).status_code}
+    except Exception as exc:
+        # a TLS-level failure is an answer: the endpoint was reached, and what
+        # it presents is the acceptance checks matter, not the policy
+        cause, tls = exc, False
+        while cause is not None and not tls:
+            tls = isinstance(cause, ssl.SSLError) or "SSL" in type(cause).__name__ or "certificate" in str(cause).lower()
+            cause = cause.__cause__ or cause.__context__
+        out["answer"][name] = {"tls": type(exc).__name__} if tls else {"error": type(exc).__name__}
+for name, target in spec["refuse"].items():
+    started = time.monotonic()
+    try:
+        socket.create_connection((target["host"], target["port"]), timeout=10).close()
+        out["refuse"][name] = {"connected": True, "seconds": round(time.monotonic() - started, 1)}
+    except socket.gaierror:
+        out["refuse"][name] = {"connected": False, "outcome": "unresolved", "seconds": round(time.monotonic() - started, 1)}
+    except OSError as exc:
+        out["refuse"][name] = {"connected": False, "outcome": type(exc).__name__, "seconds": round(time.monotonic() - started, 1)}
+for name, host in spec["resolve"].items():
+    try:
+        socket.getaddrinfo(host, None); out["resolve"][name] = True
+    except OSError:
+        out["resolve"][name] = False
+print(json.dumps(out))
+'
 network_verify() {
- local forge pod start elapsed status=0 body='' rc=0 tries=0
+ local forge pod chroma start elapsed status=0 body='' rc=0 tries=0
  forge=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=forgejo" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
  # The allowed pair asserts the strict /readyz, which stays dependency-bearing:
  # guarded and briefly retried, so a heartbeat blip right after the
@@ -4046,7 +4266,193 @@ network_verify() {
  (( status != 0 )) || fail 'NetworkPolicy deny was not enforced: Forgejo reached Chroma, which the policy must block'
  pod=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gsj" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
  k exec "$pod" -c gsj-web -- python -c "import httpx; r=httpx.get('http://$RELEASE-chroma:8000/api/v2/heartbeat'); r.raise_for_status(); assert isinstance(r.json()['nanosecond heartbeat'],int)" >/dev/null
- jq -n --arg source "$forge" --argjson seconds "$elapsed" '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds}' > "$STATE_DIR/network-check.json"
+ # The gsj pod's closed outbound list, from inside the pod: the site's own
+ # endpoints, Forgejo, Chroma and cluster DNS answer; the hubs and indexes
+ # the runtime must never download from, the agent runtime's own hosts, the
+ # telemetry collector, an arbitrary public address on 443 and the node's
+ # own port 22 get no connection within 10 s. The LLM's and the OCR's answer
+ # is asserted only when the endpoint answers this machine now: an endpoint
+ # that is merely down keeps its acceptance skip and the install completes,
+ # as the preflight said; one that answers here and not from the pod names a
+ # wrong list. What the probe found is kept in the operation's state. All of
+ # it applies to a chart that renders the outbound policy — read from the
+ # applied release's own manifest, never from what the cluster happens to
+ # hold: a corrected program applying an earlier release's chart has no
+ # list to hold, and the record says so; a manifest that carries the policy
+ # and a cluster that does not hold it is a failure, not a skip.
+ local manifest held
+ manifest=$(h get manifest "$RELEASE") || fail "the applied release's manifest could not be read (helm get manifest $RELEASE)"
+ if ! grep -qE "^  name: ${RELEASE}-gsj-egress\$" <<< "$manifest"; then
+   log "the applied chart renders no outbound policy for the gsj pod ($RELEASE-gsj-egress is not in the release's manifest): the three pairs are proven, the closed list is not held"
+   jq -n --arg source "$forge" --argjson seconds "$elapsed" '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,egress:"not rendered by the applied chart"}' > "$STATE_DIR/network-check.json"
+   return 0
+ fi
+ local policy
+ for policy in "$RELEASE-gsj-egress" "$RELEASE-chroma-egress"; do
+   held=$(k get networkpolicy "$policy" --ignore-not-found -o name) || fail "the outbound policy $policy could not be read from the cluster"
+   [[ -n $held ]] || fail "the applied chart renders $policy but the cluster does not hold it"
+ done
+ local node llm ocr probe llm_state='' ocr_state='' unreached reached
+ node=$(k get pod "$pod" -o json | jq -r '.status.hostIP // ""')
+ [[ -n $node ]] || fail "the application pod $pod reports no host address; the outbound check cannot name the node"
+ llm=$(j '.llm.base_url // ""'); ocr=$(j '.ocr.url // ""')
+ # what answers THIS machine now (any HTTP status within 10 s) is held to an
+ # answer from the pod; an endpoint that answers nowhere keeps its
+ # acceptance skip, as the preflight said
+ # ... and only for an endpoint the applied values admit: a name curl
+ # resolves here but the resolver could not is on no list, so the pod's
+ # silence is the list's honesty, said in the log, not a policy failure
+ [[ -z $llm ]] || { llm_state=silent; if endpoint_answers_here "${llm%/}/models"; then if endpoint_admitted llm.base_url "$llm"; then llm_state=working; else log "llm.base_url ($(url_origin_only "$llm")) answers this machine, but the applied outbound list carries no rule for its address nor for a proxy that routes it; the pod's answer is not held"; fi; fi; }
+ [[ -z $ocr ]] || { ocr_state=silent; if endpoint_answers_here "$ocr"; then if endpoint_admitted ocr.url "$ocr"; then ocr_state=working; else log "ocr.url ($(url_origin_only "$ocr")) answers this machine, but the applied outbound list carries no rule for its address nor for a proxy that routes it; the pod's answer is not held"; fi; fi; }
+ jq -n --arg release "$RELEASE" --arg node "$node" --arg llm "$llm" --arg ocr "$ocr" '
+   {answer:({forgejo:"http://\($release)-forgejo:3000/api/healthz", chroma:"http://\($release)-chroma:8000/api/v2/heartbeat"}
+            + (if $llm != "" then {llm:(($llm|sub("/+$";""))+"/models")} else {} end)
+            + (if $ocr != "" then {ocr:$ocr} else {} end)),
+    refuse:({"huggingface.co":{host:"huggingface.co",port:443}, "pypi.org":{host:"pypi.org",port:443}, "github.com":{host:"github.com",port:443},
+             "api.github.com":{host:"api.github.com",port:443}, "pi.dev":{host:"pi.dev",port:443},
+             "mobile.events.data.microsoft.com":{host:"mobile.events.data.microsoft.com",port:443},
+             "public-address":{host:"1.1.1.1",port:443}, "node-ssh":{host:$node,port:22},
+             "kubernetes-api":{host:"kubernetes.default.svc",port:443}}),
+    resolve:{cluster:"\($release)-forgejo"}}' > "$GSJ_WORK/egress-spec.json"
+ probe=$(k exec -i "$pod" -c gsj-web -- python -c "$GSJ_EGRESS_PROBE_PY" egress-probe < "$GSJ_WORK/egress-spec.json") || fail "the outbound probe did not run in the application pod (exit $?)"
+ jq -e 'type=="object" and (.answer|type=="object") and (.refuse|type=="object") and (.resolve|type=="object")' <<< "$probe" >/dev/null 2>&1 || fail 'the outbound probe in the application pod reported nothing readable'
+ printf '%s' "$probe" | atomic "$STATE_DIR/egress-probe.json"
+ unreached=$(jq -r --arg llm_ok "$llm_state" --arg ocr_ok "$ocr_state" '[.answer|to_entries[]|select(.value.http==null and .value.tls==null)|select(.key!="llm" or $llm_ok=="working")|select(.key!="ocr" or $ocr_ok=="working")|.key]|join(", ")' "$STATE_DIR/egress-probe.json")
+ [[ -z $unreached ]] || fail "NetworkPolicy: the gsj pod did not reach $unreached, which its outbound policy must admit (the probe's outcome is in $STATE_DIR/egress-probe.json)"
+ reached=$(jq -r '[.refuse|to_entries[]|select(.value.connected==true)|.key]|join(", ")' "$STATE_DIR/egress-probe.json")
+ [[ -z $reached ]] || fail "NetworkPolicy outbound deny was not enforced: the gsj pod connected to $reached, which its outbound policy must refuse (the probe's outcome is in $STATE_DIR/egress-probe.json)"
+ jq -e '.resolve.cluster==true' "$STATE_DIR/egress-probe.json" >/dev/null || fail 'cluster DNS did not answer from the gsj pod, which its outbound policy must admit'
+ # From Chroma nothing but DNS: its image has bash and getent, nothing else
+ # that opens a connection, so bash's own /dev/tcp is the probe — proven
+ # able to connect first, against the cluster DNS the policy admits (the
+ # resolver /etc/resolv.conf names), so a probe that cannot open anything
+ # never passes as "everything blocked". The Kubernetes API's ClusterIP is
+ # among the targets that must be blocked: any unpoliced pod reaches it, so
+ # a policy that is missing shows even on a cluster without internet, where
+ # the public canaries are refused anyway.
+ chroma=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=chroma" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
+ local chroma_report connected
+ chroma_report=$(k exec "$chroma" -- bash -c ': chroma-egress; r=""; dns=$(awk "/^nameserver/{print \$2; exit}" /etc/resolv.conf); if [ -n "$dns" ] && timeout 10 bash -c "exec 3<>/dev/tcp/$dns/53" 2>/dev/null; then r="control=connected "; else r="control=blocked "; fi; for t in "forgejo '"$RELEASE"'-forgejo 3000" "web '"$RELEASE"'-web 8780" "public-address 1.1.1.1 443" "github.com github.com 443" "api ${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc} ${KUBERNETES_SERVICE_PORT:-443}"; do set -- $t; if timeout 10 bash -c "exec 3<>/dev/tcp/$2/$3" 2>/dev/null; then r="$r$1=connected "; else r="$r$1=blocked "; fi; done; if getent hosts '"$RELEASE"'-forgejo >/dev/null 2>&1; then r="${r}dns=ok"; else r="${r}dns=failed"; fi; printf "%s" "$r"') || fail "the outbound probe did not run in the Chroma pod (exit $?)"
+ [[ $chroma_report == "control=connected "* ]] || fail "the Chroma pod's probe could not open a connection even to cluster DNS, which its outbound policy admits; the probe proves nothing (it reported: $chroma_report)"
+ connected=$(tr ' ' '\n' <<< "$chroma_report" | awk -F= '$2=="connected" && $1!="control" {print $1}' | paste -sd ',' - | sed 's/,/, /g')
+ [[ -z $connected ]] || fail "NetworkPolicy outbound deny was not enforced on Chroma: it connected to $connected, and Chroma may reach nothing but DNS"
+ [[ $chroma_report == *"dns=ok"* ]] || fail "cluster DNS did not answer from the Chroma pod, which its outbound policy must admit (the probe reported: $chroma_report)"
+ # the panel's canaries are https, so only HTTPS_PROXY takes them through a
+ # proxy; a file naming HTTP_PROXY alone, or none, leaves them dialling
+ # directly, and the panel is held
+ local proxied=false pfile; pfile=$(j '.trust.proxy_file // ""')
+ if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && jq -e '(.HTTPS_PROXY // "") != ""' "$pfile" >/dev/null 2>&1 && proxied=true; fi
+ isolation_verify "$proxied"
+ jq -n --arg source "$forge" --argjson seconds "$elapsed" --slurpfile probe "$STATE_DIR/egress-probe.json" --arg chroma "$chroma_report" --arg llm_ok "$llm_state" --arg ocr_ok "$ocr_state" --argjson proxied "$proxied" --slurpfile isolation "$STATE_DIR/isolation.json" \
+   '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,
+     egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
+             isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
+}
+no_proxy_covers() ( # host, the proxy file's NO_PROXY -> 0 when the pod dials the host directly (the pod's list carries the cluster names too); a subshell, so no glob expands and no option leaks
+ set -f
+ local host=$1 entry
+ local IFS=','
+ for entry in $2 localhost .localhost 127.0.0.1 .svc .cluster.local "$RELEASE-forgejo" "$RELEASE-chroma"; do
+   entry=${entry// /}; [[ -n $entry ]] || continue
+   [[ $entry == '*' ]] && return 0
+   entry=${entry#.}
+   [[ $host == "$entry" || $host == *".$entry" ]] && return 0
+ done
+ return 1
+)
+endpoint_admitted() { # site key, URL -> 0 when the applied values admit the pod's dial: an IPv4 literal the chart derives, an address the name resolves to now (any one, since answer sets rotate), or the proxy the site routes the scheme through
+ local rest authority host want proxy='' pfile
+ rest=${2#*://}; authority=${rest%%[/?#]*}; authority=${authority##*@}
+ if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; else host=${authority%%:*}; fi
+ [[ ! $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+ pfile=$(j '.trust.proxy_file // ""')
+ if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && proxy=$(jq -r --arg url "$2" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$pfile" 2>/dev/null); fi
+ # a host the file's NO_PROXY covers is dialled directly, whatever proxy the scheme has
+ # the pod dials the proxy, not the endpoint: the proxy's rule decides alone
+ if [[ -n $proxy ]] && ! no_proxy_covers "$host" "$(jq -r '.NO_PROXY // ""' "$pfile" 2>/dev/null)"; then
+   want=$(resolve_endpoint trust.proxy_file "$proxy" 2>/dev/null | jq -s '.') || return 1
+   [[ $want != '[]' ]] || return 1
+   jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1
+   return
+ fi
+ want=$(resolve_endpoint "$1" "$2" 2>/dev/null | jq -s '.') || return 1
+ [[ $want != '[]' ]] || return 1
+ jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1
+}
+endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s, dialled as the pod dials it
+ # the pod dials it with the site's CA bundle, through the site's proxy and
+ # past it for NO_PROXY names, so this machine dials it the same way; what
+ # counts is an HTTP status from the endpoint — the pod's probe counts the
+ # same thing — so a TLS failure keeps the endpoint's skip, and a status the
+ # proxy itself answers with (407, 502, 503, 504) is not the endpoint's
+ # load_site exports CURL_CA_BUNDLE with the delivery CA for the downloads;
+ # the pod never trusts that CA, so this probe builds its own bundle from
+ # the system's and trust.ca_file and runs curl without the export
+ local code rc=0 file proxy='' args=(--silent --show-error --max-time 10 -o /dev/null -w '%{http_code}')
+ # looked up in a subshell: a machine without a bundle keeps the endpoint's
+ # skip instead of ending the operation
+ local bundle; bundle=$(CURL_CA_BUNDLE='' system_ca_bundle 2>/dev/null) || return 1
+ printf '%s\n' "$bundle" > "$GSJ_WORK/answers-here-ca.path"
+ # written afresh each time: a copy of the system bundle would keep its
+ # read-only mode and refuse the next write
+ rm -f "$GSJ_WORK/answers-here-ca.pem"
+ cat "$bundle" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null || return 1
+ chmod 600 "$GSJ_WORK/answers-here-ca.pem"
+ file=$(j '.trust.ca_file // ""'); [[ -z $file ]] || { file=$(resolve_file "$file"); [[ -r $file ]] && cat "$file" >> "$GSJ_WORK/answers-here-ca.pem"; }
+ args+=(--cacert "$GSJ_WORK/answers-here-ca.pem")
+ file=$(j '.trust.proxy_file // ""')
+ if [[ -n $file ]]; then
+   file=$(resolve_file "$file")
+   if [[ -r $file ]]; then
+     proxy=$(jq -r --arg url "$1" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$file" 2>/dev/null)
+     [[ -z $proxy ]] || args+=(--proxy "$proxy")
+     # the pod's NO_PROXY: the file's entries plus the cluster names the trust step adds
+     local bypass; bypass="$(jq -r '.NO_PROXY // ""' "$file" 2>/dev/null),localhost,.localhost,127.0.0.1,.svc,.cluster.local,$RELEASE-forgejo,$RELEASE-chroma"
+     args+=(--noproxy "${bypass#,}")
+   fi
+ fi
+ # the shell's own proxy variables never route this probe: only the site's
+ # proxy file does, as in the pod
+ # (-q first: the operator's .curlrc must not route or trust for it either)
+ code=$(env -u CURL_CA_BUNDLE -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY curl -q "${args[@]}" "$1" 2>/dev/null) || rc=$?
+ (( rc == 0 )) || return 1
+ [[ $code =~ ^[1-5][0-9][0-9]$ ]] || return 1
+ case $code in 407|502|503|504) [[ -z $proxy ]];; *) return 0;; esac
+}
+isolation_verify() { # $1: true when the site routes through a proxy
+ # The door's own isolation panel, read through the public route as the
+ # operator: both vantages (the door's process and the runner's) must call
+ # every canary "blockiert" — unless the site names a proxy: the panel's
+ # probes honour HTTP(S)_PROXY, so on a proxied site they measure the proxy's
+ # policy, which is the operator's, and the answer is recorded, not held
+ # (the raw-socket probe above, which no proxy variable reaches, still proves
+ # the pod itself connects to nothing). The operator's password rides in a
+ # request body read from a private file, never on a command line; the
+ # session ends with a logout. The panel's answer is kept in the state.
+ local proxied=${1:-false} url host port ca connect jar code
+ url=$(j .public_url); url=${url%/}; host=$(printf '%s' "$url" | sed -E 's#https://([^/:]+).*#\1#'); port=$(printf '%s' "$url" | sed -nE 's#https://[^/:]+:([0-9]+).*#\1#p'); port=${port:-443}
+ # the panel probes every canary from both vantages in turn, each with its
+ # own connect timeout, and a CNI that drops rather than rejects spends that
+ # timeout on every address: the read's budget is minutes, not seconds
+ local args=(--silent --show-error --max-time 300)
+ ca=$(j .verification.ca_file); [[ -z $ca ]] || args+=(--cacert "$(resolve_file "$ca")")
+ connect=$(j .verification.connect_host); [[ -z $connect ]] || args+=(--connect-to "$host:$port:$connect:$(j .verification.connect_port)")
+ jar="$GSJ_WORK/isolation-cookies"; : > "$jar"; chmod 600 "$jar"
+ jq -n --arg user "$(j .operator.login)" --rawfile password "$OP_PASSWORD" '{user:$user,password:($password|sub("[\\r\\n]+$";""))}' | atomic "$GSJ_WORK/isolation-login.json"
+ code=$(curl "${args[@]}" -c "$jar" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary "@$GSJ_WORK/isolation-login.json" "$url/api/login") || fail "the isolation panel could not be reached through the public route (curl exit $?)"
+ rm -f "$GSJ_WORK/isolation-login.json"
+ [[ $code == 200 ]] || fail "the isolation panel's operator login answered HTTP $code"
+ code=$(curl "${args[@]}" -b "$jar" -o "$GSJ_WORK/isolation.json" -w '%{http_code}' -X POST "$url/api/admin/isolation") || fail "the isolation panel did not answer (curl exit $?)"
+ curl "${args[@]}" -b "$jar" -o /dev/null -X POST "$url/api/logout" >/dev/null 2>&1 || true
+ rm -f "$jar"
+ [[ $code == 200 ]] || fail "the isolation panel answered HTTP $code"
+ jq -e '(.targets|type=="array" and length>0) and (.server|type=="array" and length>0) and (.runner|type=="array" and length>0)' "$GSJ_WORK/isolation.json" >/dev/null 2>&1 || fail 'the isolation panel answered without its targets and both vantages'
+ cat "$GSJ_WORK/isolation.json" | atomic "$STATE_DIR/isolation.json"
+ if [[ $proxied == true ]]; then
+   log "the isolation panel's verdicts are recorded, not held: the site names a proxy, and the panel measures what the proxy permits ($STATE_DIR/isolation.json)"
+   return 0
+ fi
+ jq -e 'all(.server[],.runner[]; .verdict=="blockiert")' "$STATE_DIR/isolation.json" >/dev/null || fail "the isolation panel reports $(jq -r '[.server[],.runner[]|select(.verdict!="blockiert")]|length' "$STATE_DIR/isolation.json") canary verdicts that are not blocked, from the door or from the runner (its answer is in $STATE_DIR/isolation.json)"
 }
 verification_new_run() {
  local attempts
@@ -4496,7 +4902,7 @@ prepare_repair_transition() {
  local source=$1 intent uid
  jq -e '.corpus.repair_generation<2147483647' "$SITE" >/dev/null || fail 'corpus repair generation is exhausted'
  jq '.corpus.repair_generation += 1' "$SITE" > "$GSJ_WORK/repair-site.json"
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$GSJ_WORK/repair-site.json" > "$GSJ_WORK/repair-values.json"
+ compile_values "$GSJ_WORK/repair-site.json" > "$GSJ_WORK/repair-values.json"
  uid=$(k get namespace "$NAMESPACE" -o json | jq -er .metadata.uid)
  intent="repair-transition-$OPERATION-$(sha_file "$GSJ_WORK/repair-site.json")-$(sha_file "$GSJ_PAYLOAD/release.json").json"
  jq -n --arg operation "$OPERATION" --arg source "$source" --arg target "$RELEASE_ID" --arg uid "$uid" --arg release "$(sha_file "$GSJ_PAYLOAD/release.json")" --slurpfile before "$SITE" --slurpfile after "$GSJ_WORK/repair-site.json" --slurpfile values "$GSJ_WORK/repair-values.json" --slurpfile saved "$STATE_DIR/site.pending.json" --slurpfile prior_values "$STATE_DIR/values.pending.json" '{format:"gsj.repair-transition/1",operation:$operation,source:$source,target:$target,namespace_uid:$uid,release_sha256:$release,site_before:$before[0],site_after:$after[0],values_after:$values[0],saved_site:$saved[0],saved_values:$prior_values[0]}' > "$GSJ_WORK/repair-transition.json"
@@ -4866,7 +5272,7 @@ restore_program_select() {
  jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$SITE" > "$GSJ_WORK/restore-program/validated-site.json"
  jq -e --slurpfile site "$SITE" '.==$site[0]' "$GSJ_WORK/restore-program/validated-site.json" >/dev/null || fail 'restore configuration does not satisfy the exact source schema'
  retained_site_matches "$SITE" "$STATE_DIR/site.pending.json" || fail 'restore program configuration differs from the retained operation'
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$SITE" > "$GSJ_WORK/values.pending.json"
+ compile_values "$SITE" > "$GSJ_WORK/values.pending.json"
  RESTORE_PROGRAM_ACTIVE=true
 }
 restore_program_resources() {
@@ -5247,7 +5653,10 @@ restore_archive() {
    def acme: {tls:(.tls|{issuer,email,acme_server,secret}),ingress_class:.ingress.class};
    .tls.profile!="managed-acme" or (acme==($target[0]|acme))
  ' "$GSJ_WORK/restore-source-site.json" >/dev/null || fail 'restore cannot change the ACME account, issuer or solver identity'
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$GSJ_WORK/restore-source-site.json" > "$GSJ_WORK/restore-source-values.json"
+ # the source values feed the identity comparison and the reference list,
+ # which never read the outbound list: compiled without it, so the source
+ # site's endpoints are not resolved and its proxy file is not looked for
+ compile_values_recorded "$GSJ_WORK/restore-source-site.json" /dev/null > "$GSJ_WORK/restore-source-values.json"
  # Context, node and StorageClass may relocate. Account, endpoint/model/auth,
  # trust, public host, and typed resource references must retain their identity.
  jq -e --slurpfile target "$GSJ_WORK/values.pending.json" '
@@ -5355,6 +5764,13 @@ restore_archive() {
    fi
    jq -n --arg name "$value_name" --arg file "$file" --arg staged "$recovered" --argjson mode "$mode" '{name:$name,file:$file,staged:$staged,mode:$mode}' >> "$GSJ_WORK/restore-inputs.jsonl"
  done
+ # The outbound list was compiled before the archive was open: a proxy the
+ # archive supplies (the site's file is not on this machine yet) enters the
+ # values now, before the intent records them.
+ if [[ -r $GSJ_WORK/restored-proxy-normalized.json ]]; then
+   compile_values "$SITE" > "$GSJ_WORK/values.pending.recompiled"
+   mv -f "$GSJ_WORK/values.pending.recompiled" "$GSJ_WORK/values.pending.json"
+ fi
  # Two logical inputs may share a path only when their recovered bytes agree.
  while IFS= read -r file; do
    recovered=''

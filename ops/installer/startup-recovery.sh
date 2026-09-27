@@ -1,4 +1,18 @@
 # Explicit recovery of a signed first startup. This file never declares readiness.
+startup_barrier_exact() { # a rendered web Deployment, this pod's generation, the marker name -> 0 when its first init is the exact provisioning barrier
+ # Either shape the barrier has had: the marker read through the API
+ # (WAIT_MARKER names it, a projected token), or the marker MOUNTED (the
+ # WAIT_MARKER_DIR env, the marker mount, the optional ConfigMap volume naming
+ # it, no token) — a continuation renders the target's own chart, which may
+ # be either release.
+ jq -e --arg generation "$2" --arg marker "$3" '
+   .spec.replicas==1 and .spec.template.spec.initContainers[0].name=="wait-deps" and .spec.template.spec.initContainers[0].command==["python","/scripts/wait-deps.py"]
+   and any(.spec.template.spec.initContainers[0].env[];.name=="GSJ_DEPLOYMENT_GENERATION" and .value==$generation)
+   and (any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER" and .value==$marker)
+        or (any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER_DIR" and .value=="/marker")
+            and any(.spec.template.spec.initContainers[0].volumeMounts[]?;.name=="marker" and .mountPath=="/marker")
+            and any(.spec.template.spec.volumes[]?;.name=="marker" and .configMap.name==$marker and .configMap.optional==true)))' "$1" >/dev/null
+}
 authenticate_predecessor() {
  local installer=$1 expected=$2 directory=$3 parent descriptor signature version marker count file
  parent=$(cd "$(dirname "$installer")" && pwd); installer="$parent/$(basename "$installer")"
@@ -198,7 +212,9 @@ startup_source_select() {
    cp "$saved/site.json" "$directory/site.json"; cp "$saved/values.json" "$directory/values.json"
  else
    jq -s '.[0]*.[1]' "$PREDECESSOR_PAYLOAD/defaults.json" "$STATE_DIR/site.pending.json" | jq --slurpfile schema "$PREDECESSOR_PAYLOAD/site.schema.json" -f "$PREDECESSOR_PAYLOAD/validate.jq" > "$directory/site.json"
-   jq --slurpfile release "$PREDECESSOR_PAYLOAD/release.json" -f "$PREDECESSOR_PAYLOAD/compile.jq" "$directory/site.json" > "$directory/values.json"
+   # the outbound list the operation recorded rides along (a policy names
+   # addresses; they were resolved when the operation started, never here)
+   GSJ_PAYLOAD=$PREDECESSOR_PAYLOAD compile_values_recorded "$directory/site.json" "$STATE_DIR/values.pending.json" > "$directory/values.json"
    jq -e --slurpfile saved "$STATE_DIR/values.pending.json" '.==$saved[0]' "$directory/values.json" >/dev/null || fail 'saved first-startup configuration does not compile to its signed predecessor values'
  fi
  storage_identity > "$GSJ_WORK/storage.json"
@@ -272,7 +288,7 @@ startup_source_credentials() {
 
 startup_prepare_data_pod() {
  local saved=$1 pod="gsj-startup-data-$OPERATION"
- jq --arg name "$pod" --slurpfile source "$GSJ_WORK/installed.json" 'def image_ref($base): (if ($base // "") == "" then . else .repository = ($base + "/" + (.repository | split("/") | last)) end) | .repository + "@" + .digest; .[]|select(.kind=="Deployment" and (.metadata.name|endswith("-web")))|.spec.template as $t|{apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:$t.metadata.labels},spec:{restartPolicy:"Never",automountServiceAccountToken:false,nodeSelector:$t.spec.nodeSelector,imagePullSecrets:($t.spec.imagePullSecrets//[]),securityContext:($t.spec.securityContext//{}),containers:[{name:"source-proof",image:($source[0].manifest.images.web|image_ref($source[0].site.registry.base)),command:["sh","-c","while :; do sleep 3600; done"],resources:{requests:{cpu:"100m",memory:"512Mi"},limits:{cpu:"1000m",memory:"1536Mi"}},readinessProbe:{exec:{command:["false"]}},volumeMounts:[{name:"data",mountPath:"/volumes/gsj",readOnly:true},{name:"transfer",mountPath:"/transfer"}]}],volumes:[{name:"data",persistentVolumeClaim:{claimName:($source[0].site.storage.data.existing_claim|if .=="" then $source[0].site.target.release+"-data" else . end),readOnly:true}},{name:"transfer",emptyDir:{}}]}}' "$saved/actual.json" > "$GSJ_WORK/startup-data-pod.json"
+ jq --arg name "$pod" --slurpfile source "$GSJ_WORK/installed.json" 'def image_ref($base): (if ($base // "") == "" then . else .repository = ($base + "/" + (.repository | split("/") | last)) end) | .repository + "@" + .digest; .[]|select(.kind=="Deployment" and (.metadata.name|endswith("-web")))|.spec.template as $t|{apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:$t.metadata.labels},spec:{restartPolicy:"Never",automountServiceAccountToken:false,nodeSelector:$t.spec.nodeSelector,imagePullSecrets:($t.spec.imagePullSecrets//[]),securityContext:($t.spec.securityContext//{}),containers:[{name:"source-proof",image:($source[0].manifest.images.web|image_ref($source[0].site.registry.base)),command:["sh","-c","while :; do sleep 3600; done"],env:[{name:"ORT_DISABLE_TELEMETRY",value:"1"}],resources:{requests:{cpu:"100m",memory:"512Mi"},limits:{cpu:"1000m",memory:"1536Mi"}},readinessProbe:{exec:{command:["false"]}},volumeMounts:[{name:"data",mountPath:"/volumes/gsj",readOnly:true},{name:"transfer",mountPath:"/transfer"}]}],volumes:[{name:"data",persistentVolumeClaim:{claimName:($source[0].site.storage.data.existing_claim|if .=="" then $source[0].site.target.release+"-data" else . end),readOnly:true}},{name:"transfer",emptyDir:{}}]}}' "$saved/actual.json" > "$GSJ_WORK/startup-data-pod.json"
  startup_owned_pod "$pod" "$GSJ_WORK/startup-data-pod.json"
  jq -n --arg operation "$OPERATION" --arg control "$(sha_file "$saved/control.json")" --slurpfile source "$GSJ_WORK/installed.json" --slurpfile initializer "$saved/initializer.json" --slurpfile proof "$saved/control.json" '$source[0] as $s|{format:"gsj.startup-source-settings/1",operation:$operation,release_identity:$s.manifest.identity,namespace_uid:$s.namespace_uid,generation:$proof[0].generation,control_sha256:$control,corpus_manifest_sha256:$s.manifest.corpus.manifest_sha256,corpus_fingerprint:$s.manifest.corpus.fingerprint,core_commit:$s.manifest.core.commit,model:$s.manifest.model,rows:$s.manifest.corpus.rows,vectors:$s.manifest.corpus.chunks,initializer:$initializer[0],paths:{db:"/volumes/gsj/db/gsj.db",source:("/volumes/gsj/bootstrap/corpora/"+$s.manifest.corpus.manifest_sha256),state:"/volumes/gsj/bootstrap/state",model_path:"/app/models/snowflake-arctic-embed-m-v2.0"},deadline_seconds:$s.site.deadlines.initialization_seconds}' > "$GSJ_WORK/startup-data-settings.json"
  k exec -i "$pod" -- sh -c 'umask 077; cat > /transfer/startup-source-settings.json' < "$GSJ_WORK/startup-data-settings.json"
@@ -627,7 +643,7 @@ startup_helm_stage() {
  jq --arg web "$RELEASE-web" '.[]|select(.kind=="Deployment" and .metadata.name==$web)' "$GSJ_WORK/startup-next-resources.json" > "$GSJ_WORK/startup-next-web.json"
  # First init must be the exact script/marker barrier for the new, not-yet
  # provisioned Helm revision. No corpus or application process may precede it.
- jq -e --arg generation "$RELEASE_ID:$revision" --arg marker "$RELEASE-provisioned" '.spec.replicas==1 and .spec.template.spec.initContainers[0].name=="wait-deps" and .spec.template.spec.initContainers[0].command==["python","/scripts/wait-deps.py"] and any(.spec.template.spec.initContainers[0].env[];.name=="GSJ_DEPLOYMENT_GENERATION" and .value==$generation) and any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER" and .value==$marker)' "$GSJ_WORK/startup-next-web.json" >/dev/null || fail 'successor application lacks its exact first-init provisioning barrier'
+ startup_barrier_exact "$GSJ_WORK/startup-next-web.json" "$RELEASE_ID:$revision" "$RELEASE-provisioned" || fail 'successor application lacks its exact first-init provisioning barrier'
  marker=$(k get configmap "$RELEASE-provisioned" -o json)
  jq -e --arg generation "$RELEASE_ID:$revision" '.data.generation!=$generation' <<< "$marker" >/dev/null || fail 'successor provisioning already ran outside this continuation'
  current=$(jq --arg web "$RELEASE-web" '.[]|select(.kind=="Deployment" and .metadata.name==$web)' "$GSJ_WORK/startup-continuation/live.json"); uid=$(jq -r .metadata.uid <<< "$current")
@@ -745,7 +761,7 @@ startup_helm_continue() {
  jq --slurpfile schema "$payload/site.schema.json" -f "$payload/validate.jq" "$SITE" > "$working/site.json"
  cmp -s "$working/site.json" "$SITE" || jq -e --slurpfile site "$SITE" '.==$site[0]' "$working/site.json" >/dev/null || fail 'current configuration does not satisfy the signed target schema'
  cmp -s "$SITE" "$STATE_DIR/site.pending.json" || fail 'continuation requires the exact saved target configuration'
- jq --slurpfile release "$payload/release.json" -f "$payload/compile.jq" "$SITE" > "$GSJ_WORK/values.pending.json"
+ compile_values_recorded "$SITE" "$STATE_DIR/values.pending.json" > "$GSJ_WORK/values.pending.json"
  if [[ -f $directory/intent.json && ! -L $directory/intent.json ]]; then
    jq -e --arg program "$program" --argjson replacement "$STARTUP_PROGRAM_REPLACE" --arg target "$target" --arg operation "$OPERATION" --arg script "$(sha_file "$CONTINUE_HELM_INSTALLER")" --arg site "$(sha_file "$SITE")" '.format=="gsj.startup-helm-continuation/1" and (.program==$program or $replacement) and .target==$target and .operation==$operation and .installer_sha256==$script and .site_sha256==$site' "$directory/intent.json" >/dev/null || fail 'saved continuation program, installer or configuration differs'
    local evidence

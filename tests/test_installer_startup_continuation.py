@@ -35,9 +35,11 @@ def partial(shell):
             pod['spec']['initContainers'] = [
                 {'name': 'wait-deps', 'image': 'web@sha256:' + '1' * 64,
                  'command': ['python', '/scripts/wait-deps.py'],
-                 'env': [{'name': 'GSJ_DEPLOYMENT_GENERATION', 'value': 'source:1'}, {'name': 'WAIT_MARKER', 'value': 'gsj-provisioned'}]},
+                 'env': [{'name': 'GSJ_DEPLOYMENT_GENERATION', 'value': 'source:1'}, {'name': 'WAIT_MARKER_DIR', 'value': '/marker'}],
+                 'volumeMounts': [{'name': 'marker', 'mountPath': '/marker', 'readOnly': True}]},
                 {'name': 'corpus-initialize', 'image': 'web@sha256:' + '1' * 64, 'command': ['python', '-m', 'gsj_deploy.initialize']},
             ]
+            pod['spec']['volumes'] = [{'name': 'marker', 'configMap': {'name': 'gsj-provisioned', 'optional': True}}]
         source.append({'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': metadata('gsj-' + role),
                        'spec': {'replicas': 1, 'selector': {'matchLabels': {'role': role}}, 'template': pod}})
     source.append({'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': metadata('gsj-provision'),
@@ -696,3 +698,23 @@ def test_completed_successor_cannot_skip_historical_receipt_binding(wrapper):
     assert second.returncode != 0 and 'source evidence changed' in second.stderr
     assert not (m['state'] / 'replaced-lease.json').exists()
     assert 'installed-target' not in (m['state'] / 'actions').read_text().splitlines()
+
+
+@pytest.mark.parametrize('shape,ok', [('api', True), ('mounted', True), ('mounted-without-volume', False), ('neither', False)])
+def test_the_first_init_barrier_is_accepted_in_either_shape(shell, shape, ok):
+    """A continuation renders the target's own chart: the barrier reads the
+    marker through the API (WAIT_MARKER, an earlier release) or from a
+    mounted ConfigMap volume (WAIT_MARKER_DIR, the mount, the optional
+    volume naming the marker). Either is exact; a mounted shape without its
+    volume, or no marker at all, is not."""
+    m = shell
+    env = [{'name': 'GSJ_DEPLOYMENT_GENERATION', 'value': 'target:3'}]
+    spec = {'initContainers': [{'name': 'wait-deps', 'command': ['python', '/scripts/wait-deps.py'], 'env': env}], 'volumes': []}
+    if shape == 'api': env.append({'name': 'WAIT_MARKER', 'value': 'gsj-provisioned'})
+    if shape.startswith('mounted'):
+        env.append({'name': 'WAIT_MARKER_DIR', 'value': '/marker'})
+        spec['initContainers'][0]['volumeMounts'] = [{'name': 'marker', 'mountPath': '/marker', 'readOnly': True}]
+        if shape == 'mounted': spec['volumes'] = [{'name': 'marker', 'configMap': {'name': 'gsj-provisioned', 'optional': True}}]
+    put(m['work'] / 'web.json', {'kind': 'Deployment', 'spec': {'replicas': 1, 'template': {'spec': spec}}})
+    result = m['run']('startup_barrier_exact "$GSJ_WORK/web.json" target:3 gsj-provisioned\n')
+    assert (result.returncode == 0) is ok, result.stderr
