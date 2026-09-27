@@ -1330,7 +1330,7 @@ preflight_site_checks() {
  # logged and passed, as the capacity check does: a namespace-scoped operator
  # is a supported shape, and the later checks still stand.
  local versions=$1 host secret existing crt key ca ns found pods counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
- host=$(j '.public_url // ""' | sed -E 's#https://([^/:]+).*#\1#')
+ host=$(j '.public_url // ""' | sed -nE 's#^https://([^/:]+).*#\1#p')
  # kubectl is supported within one minor of the server (init's kubectl-skew
  # row). A kubectl this run downloaded is the release's pin, not the
  # operator's choice, so a skew there is refused with the way to keep this
@@ -2598,7 +2598,7 @@ managed_dependencies() {
    if [[ $COMMAND == addon-repair ]]; then managed_helm_addon traefik "$ns" "$class" "$chart" "$GSJ_WORK/traefik-values.json" "$REVISION"; return;
    else managed_helm_addon traefik "$ns" "$class" "$chart" "$GSJ_WORK/traefik-values.json"; fi
  fi
- tlsprofile=$(j .tls.profile); secret=$(j .tls.secret); host=$(j .public_url | sed -E 's#https://([^/:]+).*#\1#')
+ tlsprofile=$(j .tls.profile); secret=$(j .tls.secret); host=$(j .public_url | sed -nE 's#^https://([^/:]+).*#\1#p')
  case "$tlsprofile" in
  existing)
    k get secret "$secret" -o json | jq -e '.type=="kubernetes.io/tls" and .data["tls.crt"] and .data["tls.key"]' >/dev/null || fail 'TLS Secret is unavailable or incomplete';;
@@ -4253,7 +4253,7 @@ wait_application() {
 }
 public_verify() {
  local url host port ca connect asset
- url=$(j .public_url); url=${url%/}; host=$(printf '%s' "$url" | sed -E 's#https://([^/:]+).*#\1#'); port=$(printf '%s' "$url" | sed -nE 's#https://[^/:]+:([0-9]+).*#\1#p'); port=${port:-443}
+ url=$(j .public_url); url=${url%/}; host=$(printf '%s' "$url" | sed -nE 's#^https://([^/:]+).*#\1#p'); port=$(printf '%s' "$url" | sed -nE 's#https://[^/:]+:([0-9]+).*#\1#p'); port=${port:-443}
  local args=(--silent --show-error --max-time 30) end code
  ca=$(j .verification.ca_file); [[ -z $ca ]] || args+=(--cacert "$(resolve_file "$ca")")
  connect=$(j .verification.connect_host); [[ -z $connect ]] || args+=(--connect-to "$host:$port:$connect:$(j .verification.connect_port)")
@@ -5844,7 +5844,7 @@ tls_repair() {
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
  start_renewal
  before=$(sha_file "$directory/ca.crt")
- secret=$(j .tls.secret); host=$(j .public_url | sed -E 's#https://([^/:]+).*#\1#')
+ secret=$(j .tls.secret); host=$(j .public_url | sed -nE 's#^https://([^/:]+).*#\1#p')
  k get secret "$secret" -o json > "$GSJ_WORK/tls-secret.json"
  jq -r '.data["tls.crt"]' "$GSJ_WORK/tls-secret.json" | base64 --decode > "$GSJ_WORK/tls-leaf.crt"
  reissue_local_ca "$directory" "$GSJ_WORK/reissued-ca.crt"
