@@ -660,7 +660,7 @@ def test_several_missing_tools_are_all_named_in_one_run(tmp_path, keypair):
     for tool in ("helm", "kubectl", "jq"):
         row = _check(report, tool)
         assert row["status"] == "FAIL" and f"requires {tool} >= {FLOORS[tool]}" in row["detail"] and "none on PATH" in row["detail"], row
-        assert "any other command accepts --fetch-tools" in row["fix"] and f"pins a {tool} for linux/amd64" in row["fix"], row
+        assert f"any other command accepts --fetch-tools={tool} (this release pins a {tool} for linux/amd64" in row["fix"], row
         assert f"FAIL    {tool}" in result.stdout
     assert _check(report, "openssl")["status"] == "PASS" and "--fetch-tools does not supply OpenSSL" in _check(report, "openssl")["detail"]
     assert _check(report, "cluster")["status"] == "UNKNOWN"
@@ -680,7 +680,19 @@ def test_the_fetch_tools_advice_says_what_this_release_pins_for_this_platform(tm
     box.serve(box.assets)
     report = _report(box.run())
     assert "--fetch-tools cannot help here: this release pins no helm for linux/amd64" in _check(report, "helm")["fix"]
-    assert "any other command accepts --fetch-tools (this release pins a jq for linux/amd64" in _check(report, "jq")["fix"]
+    assert "any other command accepts --fetch-tools=jq (this release pins a jq for linux/amd64" in _check(report, "jq")["fix"]
+
+
+@pytest.mark.parametrize("tool", ["helm", "kubectl", "jq"])
+def test_the_fetch_tools_advice_names_the_single_client_form_for_its_row(tmp_path, keypair, tool):
+    """Each row names the fetch of its own client alone; the Helm row says the
+    other two stay this box's, the kubectl row points at the version note."""
+    box = Box(tmp_path, keypair, **{tool: None})
+    fix = _check(_report(box.run()), tool)["fix"]
+    assert f"--fetch-tools={tool} (this release pins a {tool} for linux/amd64 for that run only" in fix, fix
+    assert ("fetches Helm alone and keeps this box's kubectl and jq" in fix) == (tool == "helm"), fix
+    assert ("read the guide's note on kubectl and your server's version first" in fix) == (tool == "kubectl"), fix
+    assert "--fetch-tools " not in fix and "--fetch-tools (" not in fix, fix
 
 
 def test_a_too_old_client_is_named_with_floor_and_finding(tmp_path, keypair):

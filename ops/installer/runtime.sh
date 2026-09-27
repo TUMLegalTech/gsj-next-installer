@@ -6349,7 +6349,16 @@ init_box() {
  local tool floor pinned kubectl_version='' kubectl_ok=false
  for tool in helm kubectl jq; do
    case $tool in helm) floor=$GSJ_HELM_FLOOR;; kubectl) floor=$GSJ_KUBECTL_FLOOR;; jq) floor=$GSJ_JQ_FLOOR;; esac
-   if gsj_client_info "$tool" "$GSJ_PLATFORM" >/dev/null 2>&1; then pinned="any other command accepts --fetch-tools (this release pins a $tool for $GSJ_PLATFORM for that run only; read the guide's note on kubectl and your server's version first)"; else pinned="--fetch-tools cannot help here: this release pins no $tool for $GSJ_PLATFORM"; fi
+   # The single-client form fetches this row's client alone and keeps the
+   # other two from this box.
+   if gsj_client_info "$tool" "$GSJ_PLATFORM" >/dev/null 2>&1; then
+     pinned="any other command accepts --fetch-tools=$tool (this release pins a $tool for $GSJ_PLATFORM for that run only"
+     case $tool in
+       helm) pinned+="; --fetch-tools=helm fetches Helm alone and keeps this box's kubectl and jq)";;
+       kubectl) pinned+="; read the guide's note on kubectl and your server's version first)";;
+       *) pinned+=")";;
+     esac
+   else pinned="--fetch-tools cannot help here: this release pins no $tool for $GSJ_PLATFORM"; fi
    where=$(command -v "$tool" 2>/dev/null) || where=''
    if [[ -z $where ]]; then init_row "$tool" FAIL 'none on PATH' "requires $tool >= $floor, found none on PATH" "install $tool >= $floor with your distribution; $pinned"; continue; fi
    found=$(client_version "$tool")
