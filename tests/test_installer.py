@@ -1490,7 +1490,14 @@ preflight
     ({"type": "kubernetes.io/dockerconfigjson", "data": {}}, "", "install", False),
     ({"type": "kubernetes.io/dockerconfigjson", "data": {".dockerconfigjson": "e30="}}, "", "install", True),
     (None, "registry.json", "install", True),
+    # a restore recreates the pull Secret; sweep and abandon clear what a dead
+    # run left, even after the namespace (and an operator-made pull Secret in
+    # it) is gone; lease-repair restores a Lease's holder. None pulls an image.
     (None, "", "restore", True),
+    (None, "", "restore-repair", True),
+    (None, "", "sweep", True),
+    (None, "", "abandon", True),
+    (None, "", "lease-repair", True),
 ])
 def test_referenced_pull_secret_is_checked_read_only_before_mutation(runtime, secret, config_file, command, accepted):
     run, _, work = runtime
@@ -1507,7 +1514,7 @@ def test_referenced_pull_secret_is_checked_read_only_before_mutation(runtime, se
         assert "registry.pull_secret must name an existing image pull Secret" in result.stderr
     assert "c3ludGhldGlj" not in result.stdout + result.stderr
     reads = (work / "secret-reads").read_text().split() if (work / "secret-reads").exists() else []
-    assert reads == ([] if config_file or command == "restore" else ["registry-auth"])
+    assert reads == ([] if config_file or command != "install" else ["registry-auth"])
 
 
 def test_trust_bundle_uses_the_system_probe_and_never_the_download_override(runtime, tmp_path):

@@ -1295,13 +1295,17 @@ preflight() {
  initializer_memory_check "$nodes"
  [[ -n $platform ]] || fail 'selected storage node is unavailable'
  while IFS= read -r nodes; do jq -e --arg p "$nodes" '.platforms | index($p)' "$GSJ_PAYLOAD/release.json" >/dev/null || fail "release has no qualified native images for $nodes"; done <<< "$platform"
- for permission in 'get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps' 'create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io'; do
+ # get replicasets.apps: the initializer wait proves its Pod is this release's
+ # own through the ReplicaSet that owns it, and is named here with the rest.
+ for permission in 'get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps' 'get replicasets.apps' 'create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io'; do
    read -r verb resource <<< "$permission"; [[ $(k auth can-i "$verb" "$resource") == yes ]] || fail "missing deployment permission: $permission"
  done
  # A referenced pull Secret is never created here. Refuse before the first
- # write instead of after image pulls back off; restore recreates it.
+ # write instead of after image pulls back off; restore recreates it. sweep,
+ # abandon and lease-repair pull no image, and sweep must clear a dead run's
+ # residue even once the namespace, and any pull Secret in it, is gone.
  pull=$(j .registry.pull_secret)
- if [[ -n $pull && -z $(j .registry.config_file) && $COMMAND != restore && $COMMAND != restore-repair ]]; then
+ if [[ -n $pull && -z $(j .registry.config_file) && ! $COMMAND =~ ^(restore|restore-repair|sweep|abandon|lease-repair)$ ]]; then
    k get secret "$pull" -o json 2>/dev/null | jq -e '(.type=="kubernetes.io/dockerconfigjson" and (.data[".dockerconfigjson"]|type=="string" and length>0)) or (.type=="kubernetes.io/dockercfg" and (.data[".dockercfg"]|type=="string" and length>0))' >/dev/null || fail "registry.pull_secret must name an existing image pull Secret in namespace $NAMESPACE; create it or set registry.config_file"
  fi
  registry_base_preflight
@@ -1329,7 +1333,7 @@ preflight_site_checks() {
  # directory and never repeated. A read this credential may not make is
  # logged and passed, as the capacity check does: a namespace-scoped operator
  # is a supported shape, and the later checks still stand.
- local versions=$1 host secret existing crt key ca ns found pods counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
+ local versions=$1 host secret existing crt key ca ns found pods controller counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
  host=$(j '.public_url // ""' | sed -nE 's#^https://([^/:]+).*#\1#p')
  # kubectl is supported within one minor of the server (init's kubectl-skew
  # row). A kubectl this run downloaded is the release's pin, not the
@@ -1362,15 +1366,25 @@ preflight_site_checks() {
    [[ -n $existing ]] || fail "TLS Secret is unavailable: tls.profile existing serves the Secret $secret, and namespace $NAMESPACE holds none of that name. Create it there before installing: the namespace first if it does not exist yet (kubectl create namespace $NAMESPACE), then the kubernetes.io/tls Secret (kubectl -n $NAMESPACE create secret tls $secret --cert=FILE --key=FILE). A certificate that already lives in another namespace is copied without its key touching disk: kubectl -n OTHER get secret $secret -o json | jq '{apiVersion,kind,type,data,metadata:{name:.metadata.name}}' | kubectl -n $NAMESPACE create -f -"
    jq -e '.type=="kubernetes.io/tls" and (.data["tls.crt"]|type=="string" and length>0) and (.data["tls.key"]|type=="string" and length>0)' <<< "$existing" >/dev/null || fail "TLS Secret is incomplete: $secret in namespace $NAMESPACE must be of type kubernetes.io/tls and hold a non-empty tls.crt and tls.key. Replace it with one that does (kubectl -n $NAMESPACE delete secret $secret, then kubectl -n $NAMESPACE create secret tls $secret --cert=FILE --key=FILE)"
    { jq -r '.data["tls.crt"]' <<< "$existing" | base64 --decode > "$crt"; } 2>/dev/null && openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "TLS Secret is incomplete: the tls.crt of $secret in namespace $NAMESPACE is not a readable PEM certificate. Replace it with the certificate for $host"
-   certificate_names_host "$crt" "$host" || fail "TLS certificate host mismatch: the certificate in Secret $secret (namespace $NAMESPACE) does not name public_url's host $host. Put a certificate for $host in that Secret, or correct public_url"
-   openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1 || fail "TLS certificate expired: the certificate in Secret $secret (namespace $NAMESPACE) is past its expiry date. Put a current certificate for $host in that Secret, then run the same command again"
+   # What is refused is the Secret: missing, unreadable, of another type,
+   # without both keys, or without a certificate. Its host and its expiry are
+   # said, not refused: where a proxy in front of the cluster terminates TLS
+   # with its own certificate, this Secret may hold a placeholder no client
+   # there sees, and a refusal would stop a site that works.
+   certificate_names_host "$crt" "$host" || log "The certificate in Secret $secret (namespace $NAMESPACE) does not name public_url's host $host. Where the ingress controller terminates TLS for $host, browsers refuse it and the acceptance check inside the application Pod stops at origin-tls-failed; where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a certificate for $host in that Secret, or correct public_url, unless such a proxy serves $host. The run goes on"
    # The acceptance check verifies public_url from inside the application Pod
-   # with Python's X.509-strict default context against verification.ca_file,
-   # and a chain only a lax verifier accepts stops there as origin-tls-failed.
-   # Said, not refused: the chain the controller serves and the Pod's route (a
-   # proxy that carries the origin) decide that, not this Secret alone.
+   # with Python's default context against verification.ca_file: X.509-strict,
+   # and from 3.13 partial-chain too, so a CA file holding the intermediate
+   # that issued the certificate is trusted there as it is by -partial_chain
+   # here. A chain only a lax verifier accepts stops there as
+   # origin-tls-failed. Said, not refused: the chain the controller serves and
+   # the Pod's route (a proxy that carries the origin) decide that, not this
+   # Secret alone. An expired certificate needs a current one, not another
+   # CA, so it is said once, as that.
    ca=$(j .verification.ca_file)
-   if [[ -n $ca ]] && ! openssl verify -x509_strict -CAfile "$(resolve_file "$ca")" -untrusted "$crt" "$crt" >/dev/null 2>&1; then
+   if ! openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
+     log "The certificate in Secret $secret (namespace $NAMESPACE) is past its expiry date. Where the ingress controller terminates TLS for $host, browsers refuse it and the acceptance check inside the application Pod stops at origin-tls-failed; where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a current certificate for $host in that Secret, unless such a proxy serves $host. The run goes on"
+   elif [[ -n $ca ]] && ! openssl verify -x509_strict -partial_chain -CAfile "$(resolve_file "$ca")" -untrusted "$crt" "$crt" >/dev/null 2>&1; then
      log "The certificate in Secret $secret does not pass strict verification (openssl verify -x509_strict) against verification.ca_file ($ca). The acceptance check inside the application Pod verifies strictly and would stop at origin-tls-failed; supply the CA that issued it, or a certificate whose chain passes strict verification. The run goes on"
    fi;;
  files)
@@ -1387,8 +1401,14 @@ preflight_site_checks() {
  # ingress.profile reuse: the application's NetworkPolicy admits
  # ingress.namespace, and that namespace alone, to its web port, so a
  # namespace without a controller is a site that never answers -- met at
- # acceptance. A controller is recognized by inspect's rule; the refusal
- # names counts, never what the API said.
+ # acceptance. Refused when it does not exist or holds no Running Pod. A
+ # Running Pod no rule here recognizes may still be the controller -- Kong,
+ # Ambassador, Gloo and OpenShift's router run under names and images of
+ # their own, and a refusal would leave a working site no way on -- and the
+ # NetworkPolicy admits it all the same: that is said, and the run goes on.
+ # A controller is recognized by inspect's rule, or by the controller the
+ # IngressClass preflight saved names (OpenShift's router-* Pods, Kong's
+ # images). Counts only, never what the API said.
  if [[ $(j '.ingress.profile // ""') == reuse ]]; then
    ns=$(j .ingress.namespace)
    if ! found=$(kubectl --context "$CONTEXT" get namespace "$ns" -o name --ignore-not-found 2> "$STATE_DIR/preflight-ingress-namespace.err"); then
@@ -1398,16 +1418,24 @@ preflight_site_checks() {
    elif ! pods=$(kubectl --context "$CONTEXT" --namespace "$ns" get pods -o json 2> "$STATE_DIR/preflight-ingress-namespace.err"); then
      log "ingress.namespace $ns was not checked: this credential could not list its Pods (kubectl's output is kept in $STATE_DIR/preflight-ingress-namespace.err). The application's NetworkPolicy admits that namespace alone to its web port, so if no ingress controller runs there the site will not answer"
    else
-     counts=$(jq -r '[.items[]|select(.status.phase=="Running")] as $running | [$running[]|select((.metadata.name|test("ingress|traefik|nginx|haproxy|contour|istio")) or any((.spec.containers // [])[]; (.image // "")|test("ingress-nginx|traefik|haproxy|contour")))] as $controllers | "\(.items|length) \($running|length) \($controllers|length)"' <<< "$pods")
+     controller=$(jq -r '.spec.controller // ""' "$STATE_DIR/ingress-class.json" 2>/dev/null || true)
+     counts=$(jq -r --arg controller "$controller" '[.items[]|select(.status.phase=="Running")] as $running | [$running[]|select((.metadata.name|test("ingress|traefik|nginx|haproxy|contour|istio")) or any((.spec.containers // [])[]; (.image // "")|test("ingress-nginx|traefik|haproxy|contour"))
+       or ($controller=="openshift.io/ingress-to-route" and (.metadata.name|startswith("router-")))
+       or ($controller=="konghq.com/ingress-controller" and any((.spec.containers // [])[]; (.image // "")|test("(^|/)kong[/:@-]"))))] as $controllers | "\(.items|length) \($running|length) \($controllers|length)"' <<< "$pods")
      read -r total running controllers <<< "$counts"
-     (( controllers > 0 )) || fail "ingress.namespace $ns runs no ingress controller: it holds $total Pod(s), $running of them Running, and none of the Running ones is an ingress controller by its name or its image (ingress, traefik, nginx, haproxy, contour, istio). Under ingress.profile reuse it must name the namespace the controller's Pods run in, because the application's NetworkPolicy admits that namespace alone to its web port; kubectl get pods -A names it in its first column. Set ingress.namespace to it and run the same command again"
+     (( running > 0 )) || fail "ingress.namespace $ns runs no ingress controller: it holds no Running Pod ($total Pod(s) in all). Under ingress.profile reuse it must name the namespace the controller's Pods run in, because the application's NetworkPolicy admits that namespace alone to its web port; kubectl get pods -A names it in its first column. Set ingress.namespace to it and run the same command again"
+     (( controllers > 0 )) || log "ingress.namespace $ns holds $running Running Pod(s), and none of them is an ingress controller this check recognizes by its name, its image or the controller IngressClass $(j .ingress.class) names. The application's NetworkPolicy admits every Pod in that namespace to its web port, so a controller running there under another name is served all the same; if no controller runs there, the install stops at its public HTTPS route check once the application is up. The run goes on"
    fi
  fi
  # Two deployments cannot share one host: the controller routes it to one of
  # them, and the other's acceptance check fails hours in on a trust error.
- # This installation's own Ingress (an upgrade's) is not a collision.
+ # Not a collision: this installation's own Ingress (an upgrade's); one
+ # already being deleted; cert-manager's HTTP-01 solver Ingress (labelled
+ # acme.cert-manager.io/http01-solver), which serves public_url's host from
+ # this namespace while a renewal is pending, and removing it would only
+ # fight cert-manager; one without rules, which serves no host.
  if [[ -n $host ]]; then
-   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))|"\(.metadata.namespace)/\(.metadata.name)"]|unique|join(", ")' 2>/dev/null); then
+   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(.metadata.deletionTimestamp==null and .metadata.labels["acme.cert-manager.io/http01-solver"]!="true")|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))|"\(.metadata.namespace)/\(.metadata.name)"]|unique|join(", ")' 2>/dev/null); then
      log "public_url's host $host was not checked against other Ingresses: this credential could not list Ingresses cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-ingresses.err). If another deployment serves $host, the acceptance check fails on it hours in rather than here"
    elif [[ -n $found ]]; then
      fail "public_url's host $host is already served by Ingress $found: two deployments cannot share one host. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"

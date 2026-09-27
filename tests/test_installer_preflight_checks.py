@@ -17,13 +17,43 @@ import subprocess
 
 import pytest
 
-from tests.test_installer import runtime  # noqa: F401  (fixture)
+from tests.test_installer import _runtime
 
 WRITES = ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
 HOST = "legal.example"                        # _site()'s public_url host
 VERSIONS = {"clientVersion": {"gitVersion": "v1.33.1"}, "serverVersion": {"gitVersion": "v1.33.6+k3s1"}}
 PASSWORD = "synthetic-operator-password"
 OWNER = "a" * 40
+
+# The shared fake answers `get pods`, and `get ingresses` without -A, with
+# every object in the cluster whatever namespace kubectl was given, so a check
+# that read the wrong namespace would pass on it. This front keeps that
+# namespace and lists only the objects that live there; -A lists them all.
+NAMESPACED = '''#!/usr/bin/env python3
+import json, subprocess, sys
+args, namespace = sys.argv[1:], "default"
+while args and args[0] in ("--context", "--namespace", "-n"):
+    namespace = namespace if args[0] == "--context" else args[1]
+    args = args[2:]
+answer = subprocess.run([@SHARED@, *sys.argv[1:]], stdout=subprocess.PIPE)
+listed = answer.stdout
+if answer.returncode == 0 and args[:2] in (["get", "pods"], ["get", "ingresses"]) and not {"-A", "--all-namespaces"} & set(args):
+    document = json.loads(listed)
+    document["items"] = [o for o in document["items"] if o["metadata"].get("namespace", "default") == namespace]
+    listed = json.dumps(document).encode()
+sys.stdout.buffer.write(listed)
+sys.exit(answer.returncode)
+'''
+
+
+@pytest.fixture
+def runtime(tmp_path):
+    run, state, work = _runtime(tmp_path)
+    fake = tmp_path / "bin" / "kubectl"
+    shared = fake.rename(tmp_path / "bin" / "kubectl-shared")
+    fake.write_text(NAMESPACED.replace("@SHARED@", repr(str(shared))))
+    fake.chmod(0o755)
+    return run, state, work
 
 
 def _b64(data):
@@ -79,6 +109,18 @@ def _issued(tmp_path, ca_crt, ca_key):
     return crt, key
 
 
+def _intermediate(tmp_path, ca_crt, ca_key):
+    """An authority issued by ca_crt, with the extensions strict verification
+    requires of a CA that is not self-signed."""
+    key, csr, crt, ext = (tmp_path / f"intermediate.{s}" for s in ("key", "csr", "crt", "ext"))
+    _openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=intermediate-ca", "-keyout", key, "-out", csr)
+    ext.write_text("basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n"
+                   "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+    _openssl("x509", "-req", "-in", csr, "-CA", ca_crt, "-CAkey", ca_key, "-CAcreateserial", "-days", "1",
+             "-sha256", "-extfile", ext, "-out", crt)
+    return crt, key
+
+
 def _tls_secret(crt, key, kind="kubernetes.io/tls", name="gsj-tls"):
     return {"apiVersion": "v1", "kind": "Secret", "type": kind, "metadata": {"name": name},
             "data": {"tls.crt": _b64(crt.read_bytes()), "tls.key": _b64(key.read_bytes())}}
@@ -110,8 +152,10 @@ def _site(work, change=None):
 
 
 def _cluster(state, *objects, **flags):
-    state.write_text(json.dumps({"lease": None, "calls": [], **flags,
-                                 "resources": {o["kind"] + "/" + o["metadata"]["name"]: o for o in objects}}))
+    """Keyed by namespace too where an object has one, so two Ingresses of one
+    name in two namespaces are two objects."""
+    state.write_text(json.dumps({"lease": None, "calls": [], **flags, "resources": {
+        "/".join(filter(None, (o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]))): o for o in objects}}))
 
 
 def _baseline(tmp_path, state, work, *objects, password=PASSWORD + "\n", **flags):
@@ -136,6 +180,16 @@ def _no_write(state):
 def _admitted(result, state):
     assert result.returncode == 0 and "ADMITTED" in result.stdout, result.stderr
     _no_write(state)
+
+
+def _logged(result, anchor, *words):
+    """The one log line that carries anchor, holding every word."""
+    lines = [l for l in result.stderr.splitlines() if anchor in l and not l.startswith("GSJ:")]
+    assert len(lines) == 1, result.stderr
+    for word in words:
+        assert word in lines[0], (word, lines[0])
+    assert "https://" not in lines[0], lines[0]
+    return lines[0]
 
 
 def _refusal(result, state, *words):
@@ -183,24 +237,36 @@ def test_an_incomplete_tls_secret_is_refused(runtime, tmp_path, change):
     _refusal(_checks(run), state, "TLS Secret is incomplete", "gsj-tls", "synthetic-namespace")
 
 
-def test_a_tls_secret_for_another_host_is_refused_without_repeating_the_certificate(runtime, tmp_path):
+# Under tls.profile existing the ruled check is that the Secret exists, of its
+# type and with both keys. A site whose TLS terminates at a proxy in front of
+# the cluster may keep a placeholder certificate in it, for another host or
+# long expired, and must keep installing and upgrading: those two are said,
+# and the run goes on.
+
+def test_a_tls_secret_for_another_host_is_warned_about_without_repeating_the_certificate(runtime, tmp_path):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
     crt, key = _self_signed(tmp_path, "other", host="other.example")
     _cluster(state, _tls_secret(crt, key), CONTROLLER)
     result = _checks(run)
-    _refusal(result, state, "TLS certificate host mismatch", "gsj-tls", HOST)
+    _admitted(result, state)
+    _logged(result, "does not name public_url's host", "Secret gsj-tls", "synthetic-namespace", HOST,
+            "origin-tls-failed", "a proxy in front of the cluster", "The run goes on")
     assert "other.example" not in result.stderr
 
 
-def test_an_expired_tls_secret_is_refused(runtime, tmp_path):
+def test_an_expired_tls_secret_is_warned_about_and_not_also_as_a_chain(runtime, tmp_path):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
     crt, key = _expired(tmp_path)
     _cluster(state, _tls_secret(crt, key), CONTROLLER)
+    _site(work, lambda s: s["verification"].update(ca_file=str(crt)))
     result = _checks(run)
-    _refusal(result, state, "TLS certificate expired", "gsj-tls", "synthetic-namespace")
+    _admitted(result, state)
+    _logged(result, "is past its expiry date", "Secret gsj-tls", "synthetic-namespace", HOST,
+            "origin-tls-failed", "a proxy in front of the cluster", "The run goes on")
     assert "2020" not in result.stderr, "the certificate's own dates are not repeated"
+    assert "strict verification" not in result.stderr, "an expired certificate needs a current one, not another CA"
 
 
 @pytest.mark.parametrize("trusted", [True, False])
@@ -228,6 +294,25 @@ def _chain(tmp_path):
     chain = tmp_path / "chain.crt"
     chain.write_bytes(crt.read_bytes() + ca_crt.read_bytes())
     return chain, key, ca_crt
+
+
+def test_a_ca_file_holding_the_issuing_intermediate_passes_strict_verification(runtime, tmp_path):
+    """The acceptance check's Python (3.13 on) sets VERIFY_X509_PARTIAL_CHAIN
+    in its default context, so a CA file holding only the intermediate that
+    issued the certificate is trusted there; openssl verify reaches the same
+    verdict only with -partial_chain."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    root_crt, root_key = _authority(tmp_path, "root-ca")
+    middle_crt, middle_key = _intermediate(tmp_path, root_crt, root_key)
+    crt, key = _issued(tmp_path, middle_crt, middle_key)
+    served = tmp_path / "served-chain.crt"
+    served.write_bytes(crt.read_bytes() + middle_crt.read_bytes())
+    _cluster(state, _tls_secret(served, key), CONTROLLER)
+    _site(work, lambda s: s["verification"].update(ca_file=str(middle_crt)))
+    result = _checks(run)
+    _admitted(result, state)
+    assert "strict verification" not in result.stderr, result.stderr
 
 
 @pytest.mark.parametrize("profile", ["existing", "files"])
@@ -310,19 +395,86 @@ def test_an_ingress_namespace_that_does_not_exist_is_refused(runtime, tmp_path):
     _refusal(_checks(run), state, "ingress.namespace gsj-ingress does not exist", "kubectl get pods -A")
 
 
-def test_an_ingress_namespace_without_a_running_controller_is_refused_by_counts(runtime, tmp_path):
+def test_an_ingress_namespace_without_a_running_pod_is_refused_by_counts(runtime, tmp_path):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
     crt, key = _self_signed(tmp_path, "served2")
-    _cluster(state, _tls_secret(crt, key), _pod("postgres-0", "docker.io/library/postgres:16"),
+    _cluster(state, _tls_secret(crt, key), _pod("migrate-7xk2q", "docker.io/library/postgres:16", phase="Succeeded"),
              _pod("ingress-nginx-controller-5d8f7c", "registry.k8s.io/ingress-nginx/controller:v1.12.1", phase="Pending"))
-    _refusal(_checks(run), state, "ingress.namespace gsj-ingress runs no ingress controller", "2 Pod(s)", "1 of them Running",
-             "NetworkPolicy")
+    _refusal(_checks(run), state, "ingress.namespace gsj-ingress runs no ingress controller", "no Running Pod",
+             "2 Pod(s) in all", "NetworkPolicy", "kubectl get pods -A")
+
+
+def test_an_empty_ingress_namespace_is_refused(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "served2")
+    _cluster(state, _tls_secret(crt, key))
+    _refusal(_checks(run), state, "ingress.namespace gsj-ingress runs no ingress controller", "no Running Pod", "0 Pod(s) in all")
+
+
+def test_a_controller_that_runs_outside_ingress_namespace_is_not_counted_for_it(runtime, tmp_path):
+    """The Pods are read in ingress.namespace alone: a controller in another
+    namespace is not what the application's NetworkPolicy admits."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "served2")
+    _cluster(state, _tls_secret(crt, key), _pod("ingress-nginx-controller-5d8f7c",
+                                                "registry.k8s.io/ingress-nginx/controller:v1.12.1", namespace="ingress-nginx"))
+    _refusal(_checks(run), state, "ingress.namespace gsj-ingress runs no ingress controller", "no Running Pod", "0 Pod(s) in all")
+
+
+# Controllers whose Pods carry none of the names and images the rule knows:
+# Kong's controller image, and OpenShift's router, whose image is a release
+# payload digest. Each is recognized by the IngressClass that names it.
+KONG = _pod("kong-controller-6c4f9d", "kong/kubernetes-ingress-controller:3.4")
+ROUTER = _pod("router-default-5b7c9d", "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:" + "c" * 64,
+              namespace="openshift-ingress")
+CONTROLLERS = {"kong": ("konghq.com/ingress-controller", KONG), "router": ("openshift.io/ingress-to-route", ROUTER)}
+
+
+def _reused(tmp_path, state, work, controller, ingress_class):
+    """ingress.namespace holding only `controller`'s Pod, and the IngressClass
+    preflight saved naming `ingress_class`'s controller (None: no class)."""
+    pod = CONTROLLERS[controller][1]
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "served2")
+    _cluster(state, _tls_secret(crt, key), pod)
+    _site(work, lambda s: s["ingress"].update(namespace=pod["metadata"]["namespace"]))
+    if ingress_class:
+        (work / "ingress-class.json").write_text(json.dumps({
+            "apiVersion": "networking.k8s.io/v1", "kind": "IngressClass", "metadata": {"name": "gsj-ingress"},
+            "spec": {"controller": CONTROLLERS[ingress_class][0]}}))
+    return pod["metadata"]["namespace"]
+
+
+@pytest.mark.parametrize("controller, ingress_class", [("kong", None), ("kong", "router"), ("router", None), ("router", "kong")])
+def test_running_pods_no_rule_recognizes_are_warned_about_and_passed(runtime, tmp_path, controller, ingress_class):
+    """A site behind a controller the rule does not know works, and must keep
+    installing and upgrading. The application's NetworkPolicy admits the
+    whole namespace, so it is said, and the run goes on."""
+    run, state, work = runtime
+    namespace = _reused(tmp_path, state, work, controller, ingress_class)
+    result = _checks(run)
+    _admitted(result, state)
+    line = _logged(result, f"ingress.namespace {namespace} holds 1 Running Pod(s)", "none of them is an ingress controller",
+                   "admits every Pod in that namespace", "public HTTPS route check", "The run goes on")
+    assert CONTROLLERS[controller][1]["metadata"]["name"] not in line and "konghq" not in line and "openshift.io" not in line, line
+
+
+@pytest.mark.parametrize("controller", sorted(CONTROLLERS))
+def test_a_controller_its_ingress_class_names_is_recognized_without_a_warning(runtime, tmp_path, controller):
+    run, state, work = runtime
+    _reused(tmp_path, state, work, controller, controller)
+    result = _checks(run)
+    _admitted(result, state)
+    assert "Running Pod" not in result.stderr, result.stderr
 
 
 def test_a_reused_controller_in_the_target_namespace_itself_is_checked_there(runtime, tmp_path):
     run, state, work = runtime
-    _baseline(tmp_path, state, work)
+    _baseline(tmp_path, state, work, _pod("ingress-nginx-controller-5d8f7c", "registry.k8s.io/ingress-nginx/controller:v1.12.1",
+                                          namespace="synthetic-namespace"))
     _site(work, lambda s: s["ingress"].update(namespace="synthetic-namespace"))
     _admitted(_checks(run), state)
     calls = json.loads(state.read_text())["calls"]
@@ -360,6 +512,43 @@ def test_an_ingress_of_another_deployment_on_the_same_host_is_refused_by_name(ru
     line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/other-web",
                     "two deployments cannot share one host", "public_url")
     assert "synthetic-release-web" not in line and "third-web" not in line
+
+
+def test_the_deployment_s_own_ingress_name_in_another_namespace_is_a_collision(runtime, tmp_path):
+    """Only this deployment's own namespace and name is exempt."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("synthetic-namespace", "synthetic-release-web", HOST),
+              _ingress("other-namespace", "synthetic-release-web", HOST))
+    line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/synthetic-release-web")
+    assert "synthetic-namespace/" not in line, line
+
+
+def _solver(namespace, name, labelled=True):
+    ingress = _ingress(namespace, name, HOST)
+    if labelled:
+        ingress["metadata"]["labels"] = {"acme.cert-manager.io/http01-solver": "true"}
+    return ingress
+
+
+@pytest.mark.parametrize("passing", ["solver", "deleting"])
+def test_an_acme_solver_or_a_deleting_ingress_on_the_host_is_not_a_collision(runtime, tmp_path, passing):
+    """cert-manager's HTTP-01 solver serves public_url's host from the
+    deployment's own namespace while a renewal is pending, and removing it
+    would fight cert-manager; an Ingress being deleted is on its way out."""
+    run, state, work = runtime
+    if passing == "solver":
+        other = _solver("synthetic-namespace", "cm-acme-http-solver-x7k2p")
+    else:
+        other = _ingress("other-namespace", "other-web", HOST)
+        other["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+    _baseline(tmp_path, state, work, _ingress("synthetic-namespace", "synthetic-release-web", HOST), other)
+    _admitted(_checks(run), state)
+
+
+def test_an_ingress_named_like_a_solver_without_its_label_is_a_collision(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _solver("other-namespace", "cm-acme-http-solver-x7k2p", labelled=False))
+    _refusal(_checks(run), state, "is already served by Ingress other-namespace/cm-acme-http-solver-x7k2p")
 
 
 def test_an_ingress_list_this_credential_may_not_read_is_logged_and_passed(runtime, tmp_path):
@@ -559,6 +748,21 @@ def test_a_kubectl_version_with_a_build_suffix_is_compared_by_its_numbers(runtim
         assert "minor" not in result.stderr, result.stderr
 
 
+@pytest.mark.parametrize("client, fetched, verdict", [
+    ("v1.31.9", "kubectl", "refused"), ("v1.31.9", "", "warned"), ("v1.35.0", "kubectl", "refused"),
+    ("v1.32.4", "kubectl", "silent"), ("v1.32.4", "", "silent")])
+def test_the_skew_boundary_is_one_minor_either_side_of_the_server(runtime, tmp_path, client, fetched, verdict):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    versions = {"clientVersion": {"gitVersion": client}, "serverVersion": {"gitVersion": "v1.33.6+k3s1"}}
+    result = _checks(run, versions, before=f'FETCH_SET="{fetched}"\n' if fetched else "unset FETCH_SET\n")
+    if verdict == "refused":
+        _refusal(result, state, client[1:], "1.33.6", "more than one minor apart")
+    else:
+        _admitted(result, state)
+        assert ("within one minor" in result.stderr) is (verdict == "warned"), result.stderr
+
+
 def test_a_fetched_kubectl_within_one_minor_passes_silently(runtime, tmp_path):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
@@ -570,14 +774,16 @@ def test_a_fetched_kubectl_within_one_minor_passes_silently(runtime, tmp_path):
 
 # --- only install and upgrade are refused on these -------------------------------------
 
-def _preflight(run, work, command):
+def _preflight(run, work, command, denied=""):
+    """preflight over the fake, every `auth can-i` recorded in can-i and
+    answered yes but `denied`."""
     (work / "release.json").write_text(json.dumps({"platforms": ["linux/amd64"]}))
     nodes = json.dumps({"items": [{"metadata": {"name": "synthetic-node"}, "status": {"nodeInfo": {"architecture": "amd64"}}}]})
     return run(f'''GSJ_PAYLOAD="$TEST_WORK"; COMMAND={command}; OP_PASSWORD="$TEST_WORK/operator-password"
 k() {{ case "$*" in
   cluster-info) return 0;;
   "version -o json") printf '%s' "$TEST_VERSIONS";;
-  "auth can-i "*) printf 'yes\\n';;
+  "auth can-i "*) printf '%s\\n' "${{*:3}}" >> "$TEST_WORK/can-i"; if [[ "${{*:3}}" == "{denied}" ]]; then printf 'no\\n'; else printf 'yes\\n'; fi;;
   "get nodes -o json") printf '%s' '{nodes}';;
   "get storageclass "*) printf '%s' '{{"provisioner":"rancher.io/local-path"}}';;
   "get ingressclass "*) printf '{{}}';;
@@ -593,6 +799,27 @@ def test_preflight_refuses_install_and_upgrade_on_the_site_checks(runtime, tmp_p
     _baseline(tmp_path, state, work)
     _cluster(state, CONTROLLER)
     _refusal(_preflight(run, work, command), state, "TLS Secret is unavailable")
+
+
+# What preflight asks `kubectl auth can-i` in the target namespace, in order.
+# ReplicaSets are read to prove the initializer Pod's owner.
+PERMISSIONS = ["get pods", "create pods", "create secrets", "create configmaps", "create leases.coordination.k8s.io",
+               "patch deployments.apps", "get replicasets.apps", "create jobs.batch", "get persistentvolumeclaims",
+               "create persistentvolumeclaims", "create networkpolicies.networking.k8s.io"]
+
+
+def test_preflight_asks_for_every_namespace_permission_in_its_first_seconds(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _admitted(_preflight(run, work, "install"), state)
+    assert (work / "can-i").read_text().splitlines() == PERMISSIONS
+
+
+def test_a_credential_that_may_not_read_replicasets_is_refused_by_name(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _refusal(_preflight(run, work, "install", denied="get replicasets.apps"), state,
+             "missing deployment permission: get replicasets.apps")
 
 
 EXEMPT = ["restore", "restore-repair", "backup", "backup-repair", "resume", "repair", "sweep", "abandon",
