@@ -187,8 +187,9 @@ elif a[:2] == ["get", "ns"]: print("target-namespace-uid")
 elif a[:2] == ["get", "lease"]:
     if s["lease"] is not None: print(json.dumps(s["lease"]))
 elif a[:2] == ["get", "networkpolicy"]:
-    # the applied chart's outbound policy: present unless a test says the chart predates it
-    if s.get("no_egress_policy"): code = 1
+    # the outbound policy the cluster holds: absent (nothing printed, --ignore-not-found) or unreadable when a test says so
+    if s.get("fail_networkpolicy_get"): code = 1
+    elif s.get("no_egress_policy"): code = 0 if "--ignore-not-found" in a else 1
     else: print("networkpolicy.networking.k8s.io/" + a[2])
 elif a[:2] == ["get", "pods"]:
     # a label selector narrows the list, as it does on a cluster; without one every Pod is listed
@@ -287,6 +288,7 @@ if url and "/api/" not in url and "-w" in a and ("/models" in url or "/chat/comp
     s.setdefault("host_probes", []).append(a); p.write_text(json.dumps(s))
     if any(part in url for part in s.get("silent_endpoints", [])): sys.exit(7)
     if any(part in url for part in s.get("tls_endpoints", [])): sys.exit(60)
+    if any(part in url for part in s.get("proxy_status_endpoints", [])): sys.stdout.write("502"); sys.exit(0)
     sys.stdout.write("200"); sys.exit(0)
 if "/api/login" in url or "/api/admin/isolation" in url or "/api/logout" in url:
     # the door's isolation panel, through the public route: the state's
@@ -1747,6 +1749,8 @@ def _network_cluster(state, *, deny_code, deny_delay=0.0, egress_rules=None):
     state.write_text(json.dumps(s))
     work = state.parent / "work"
     (work / "op.pass").write_text("synthetic-operator-password\n"); (work / "op.pass").chmod(0o600)
+    (work / "manifest.yaml").write_text("---\n# Source: gsj/templates/networkpolicy.yaml\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
+                                        "metadata:\n  name: synthetic-release-gsj-egress\nspec:\n  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: gsj\n")
     (work / "endpoint-preflight.json").write_text(json.dumps({"format": "gsj.endpoint-preflight/1", "probed_from": "synthetic", "llm": "working", "ocr": "working"}))
 
 
@@ -1827,7 +1831,10 @@ def test_networkpolicy_check_records_the_closed_outbound_list_from_inside_both_p
     assert any("chroma-egress" in " ".join(c) and c[1] == "chroma-0" for c in calls)
 
 
-NETWORK_VERIFY = 'OP_PASSWORD="$TEST_WORK/op.pass"; network_verify\n'
+# the applied release's manifest is read from Helm: the synthetic one carries
+# the gsj pod's outbound policy unless a test writes another
+NETWORK_VERIFY = ('OP_PASSWORD="$TEST_WORK/op.pass"; '
+                  'h() { case "$1 $2" in "get manifest") cat "$TEST_WORK/manifest.yaml";; *) return 1;; esac; }; network_verify\n')
 
 
 @pytest.mark.parametrize("report,words", [
@@ -1874,6 +1881,19 @@ def test_the_site_endpoints_are_asserted_only_when_they_answer_this_machine_now(
         assert record["egress"]["asserted"] == {"llm": "llm.example" not in silent, "ocr": "ocr.example" not in silent, "isolation": True}
     else:
         assert "did not reach ocr" in result.stderr
+
+
+def test_a_proxy_file_that_names_no_proxy_leaves_the_panel_held(runtime):
+    """NO_PROXY alone is not a proxy: the panel's probes dial directly, so
+    every verdict must read blocked, as on a site without the file."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = str(work / "proxies.json")
+    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": "localhost"}))
+    (work / "site.json").write_text(json.dumps(site))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode == 0 and "recorded, not held" not in result.stderr, result.stderr
+    assert json.loads((work / "network-check.json").read_text())["egress"]["asserted"]["isolation"] is True
 
 
 def test_a_proxied_site_records_the_isolation_panel_instead_of_holding_it(runtime):
@@ -2133,12 +2153,13 @@ def test_a_port_with_a_leading_zero_is_read_in_decimal(runtime, tmp_path):
     assert {"cidr": llm, "port": 8080} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
 
 
-def test_a_restore_without_the_proxy_file_says_the_remedy_and_takes_nothing_from_the_archive(runtime, tmp_path):
-    """The list is compiled before a restore opens its archive, so a machine
-    that does not carry the proxy file yet gets no proxy rule from that
-    operation: the log says so and names the remedy. The archive's proxy
-    Secret is never read for it — it is written after the values are
-    compiled, so a rule taken from it could only ever be a promise."""
+def test_a_restore_without_the_proxy_file_takes_the_archives_proxy_once_the_archive_is_open(runtime, tmp_path):
+    """The list is compiled before a restore opens its archive, so the first
+    compile on a machine that does not carry the proxy file says so and
+    gives no proxy rule. Once restore_archive has recovered the proxy from
+    the archive (and checked it against the release's Secret) it recompiles
+    the values, before its intent records them: that compile carries the
+    proxy's address. The archive's raw Secret list is never read for it."""
     run, state, work = runtime
     payload = _payload_for_compile(tmp_path)
     site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = str(work / "absent-proxies.json")
@@ -2148,10 +2169,20 @@ def test_a_restore_without_the_proxy_file_says_the_remedy_and_takes_nothing_from
     (work / "restorable-secrets.json").write_text(json.dumps({"items": [secret]}))
     result = run('COMMAND=restore; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
     assert result.returncode == 0, result.stderr
-    assert ("trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this operation "
-            "(put the file in place before the operation, or run install afterwards)") in result.stderr
+    assert ("trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this compile "
+            "(an install or upgrade refuses at its trust step without the file; a restore takes the proxy from its archive)") in result.stderr
     assert 3128 not in {e["port"] for e in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]}
-    assert "proxy.example" not in json.loads(state.read_text()).get("resolved", []), "the archive's Secret was read for the list"
+    assert "proxy.example" not in json.loads(state.read_text()).get("resolved", []), "the archive's Secret list was read for the list"
+    # restore_archive recovered the proxy from the archive: the recompile carries it
+    (work / "restored-proxy-normalized.json").write_text(json.dumps({"HTTP_PROXY": "http://proxy.example:3128", "HTTPS_PROXY": "", "NO_PROXY": "localhost"}))
+    result = run('COMMAND=restore; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0 and "cannot be read here" not in result.stderr, result.stderr
+    proxy = "203.0.113.%d/32" % (sum(b"proxy.example") % 200 + 10)
+    assert {"cidr": proxy, "port": 3128} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+    # and restore_archive recompiles after its input loop, before the intent is recorded
+    body = (INSTALLER / "runtime.sh").read_text(); body = body[body.index("restore_archive() {"):]
+    recompile = body.index('compile_values "$SITE" > "$GSJ_WORK/values.pending.recompiled"')
+    assert body.index("restored-proxy-normalized.json") < recompile < body.index("else acquire; fi"), "the recompile sits between the recovered inputs and acquire"
 
 
 @pytest.mark.parametrize("proxies,rc,words", [
@@ -3431,11 +3462,11 @@ def test_a_continued_operation_with_nothing_recorded_resolves_once_and_keeps_its
     the resolver is not asked again."""
     run, state, work = runtime
     payload = _payload_for_compile(tmp_path)
-    program = 'COMMAND=repair; STATE_DIR="$TEST_WORK/state"; mkdir -p "$STATE_DIR"; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n'
+    program = 'COMMAND=repair; RESUME_ID=aaaaaaaaaaaaaaaaaaaaaaaa; STATE_DIR="$TEST_WORK/state"; mkdir -p "$STATE_DIR"; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n'
     first = run(program, TEST_PAYLOAD=str(payload))
     assert first.returncode == 0, first.stderr
     out = json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
-    kept = work / "state" / "egress-endpoints.json"
+    kept = work / "state" / "egress-endpoints-aaaaaaaaaaaaaaaaaaaaaaaa.json"
     assert out and json.loads(kept.read_text()) == out and (kept.stat().st_mode & 0o777) == 0o600
     asked = list(json.loads(state.read_text())["resolved"])
     s = json.loads(state.read_text()); s["unresolvable"] = ["llm.example", "ocr.example"]; state.write_text(json.dumps(s))
@@ -3443,38 +3474,54 @@ def test_a_continued_operation_with_nothing_recorded_resolves_once_and_keeps_its
     assert second.returncode == 0, second.stderr
     assert json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"] == out
     assert json.loads(state.read_text())["resolved"] == asked, "the resolver was asked again"
-    # a fresh operation keeps nothing there: its list is recorded in its intent
-    result = run('COMMAND=install; STATE_DIR="$TEST_WORK/fresh"; mkdir -p "$STATE_DIR"; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > /dev/null\n', TEST_PAYLOAD=str(payload))
-    assert result.returncode == 0 and not (work / "fresh" / "egress-endpoints.json").exists()
+    # a fresh operation keeps nothing there (its list is recorded in its intent), nor does a verb that continues nothing
+    for program in ('COMMAND=install; STATE_DIR="$TEST_WORK/fresh"; mkdir -p "$STATE_DIR"; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > /dev/null\n',
+                    'COMMAND=backup; STATE_DIR="$TEST_WORK/fresh"; mkdir -p "$STATE_DIR"; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > /dev/null\n'):
+        result = run(program, TEST_PAYLOAD=str(payload))
+        assert result.returncode == 0, result.stderr
+        assert not list((work / "fresh").glob("egress-endpoints*")), program
 
 
 def test_the_network_check_holds_the_three_pairs_alone_when_the_applied_chart_renders_no_outbound_policy(runtime):
-    """A corrected program applying an earlier release's chart has no
-    outbound policy to hold: the three pairs are proven, no probe runs, and
-    the record says the list was not rendered."""
+    """Whether the closed list is held is read from the applied release's
+    own manifest. A corrected program applying an earlier release's chart
+    has no outbound policy to hold: the three pairs are proven, no probe
+    runs, and the record says the list was not rendered. A manifest that
+    carries the policy and a cluster that does not hold it, or cannot say,
+    is red — never a skip."""
     run, state, work = runtime
     _network_cluster(state, deny_code=1)
-    s = json.loads(state.read_text()); s["no_egress_policy"] = True; state.write_text(json.dumps(s))
+    (work / "manifest.yaml").write_text("---\nkind: Deployment\nmetadata:\n  name: synthetic-release-web\n")
     result = run(NETWORK_VERIFY)
     assert result.returncode == 0, result.stderr
-    assert "the applied chart renders no outbound policy for the gsj pod (synthetic-release-gsj-egress is absent)" in result.stderr
+    assert "the applied chart renders no outbound policy for the gsj pod (synthetic-release-gsj-egress is not in the release's manifest)" in result.stderr
     record = json.loads((work / "network-check.json").read_text())
     assert record["status"] == "passed" and record["egress"] == "not rendered by the applied chart"
     s = json.loads(state.read_text())
     assert not (work / "egress-probe.json").exists() and "door_calls" not in s and "host_probes" not in s
     assert not any("egress-probe" in c or "chroma-egress" in " ".join(c) for c in s["calls"])
+    _network_cluster(state, deny_code=1)          # the manifest carries the policy again
+    s = json.loads(state.read_text()); s["no_egress_policy"] = True; state.write_text(json.dumps(s))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode != 0 and "renders synthetic-release-gsj-egress but the cluster does not hold it" in result.stderr, result.stderr
+    s = json.loads(state.read_text()); s["no_egress_policy"] = False; s["fail_networkpolicy_get"] = True; state.write_text(json.dumps(s))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode != 0 and "could not be read from the cluster" in result.stderr, result.stderr
+    assert not (work / "egress-probe.json").exists()
 
 
-def test_the_host_side_endpoint_probe_dials_with_the_sites_trust_inputs_and_counts_a_tls_answer(runtime):
+def test_the_host_side_endpoint_probe_dials_as_the_pod_dials_and_a_tls_failure_keeps_the_skip(runtime):
     """What answers this machine is asked the way the pod asks: with the
-    site's CA file beside the system bundle and through the site's proxy; a
-    TLS-level answer (a certificate this bundle does not trust) still proves
-    the host is there, so the pod-side assertion is kept. The panel's read
-    has minutes, not seconds: a CNI that drops spends a timeout per canary."""
+    site's CA file beside the system bundle, through the site's proxy and
+    past it for its NO_PROXY names. What counts is an HTTP status of the
+    endpoint's own — the pod's probe counts the same — so a TLS failure
+    keeps the endpoint's acceptance skip instead of turning into a
+    NetworkPolicy failure. The panel's read has minutes, not seconds: a CNI
+    that drops spends a timeout per canary."""
     run, state, work = runtime
     _network_cluster(state, deny_code=1)
     (work / "site-ca.pem").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
-    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": ""}))
+    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "ocr.example"}))
     site = json.loads((work / "site.json").read_text()); site["trust"].update(ca_file="site-ca.pem", proxy_file="proxies.json")
     (work / "site.json").write_text(json.dumps(site))
     s = json.loads(state.read_text()); s["tls_endpoints"] = ["llm.example"]; state.write_text(json.dumps(s))
@@ -3483,8 +3530,14 @@ def test_the_host_side_endpoint_probe_dials_with_the_sites_trust_inputs_and_coun
     probes = json.loads(state.read_text())["host_probes"]
     llm = next(p for p in probes if "https://llm.example/v1/models" in p)
     assert llm[llm.index("--cacert") + 1].endswith("/answers-here-ca.pem") and llm[llm.index("--proxy") + 1] == "http://proxy.example:3128"
+    assert llm[llm.index("--noproxy") + 1] == "ocr.example"
     bundle = (work / "answers-here-ca.pem").read_text()
     assert bundle.endswith("MIIB\n-----END CERTIFICATE-----\n") and len(bundle) > 60, "the site's CA rides beside the system bundle"
     record = json.loads((work / "network-check.json").read_text())
-    assert record["egress"]["asserted"] == {"llm": True, "ocr": True, "isolation": False}
+    assert record["egress"]["asserted"] == {"llm": False, "ocr": True, "isolation": False}, "a TLS failure here keeps the skip; the OCR answered"
     assert json.loads(state.read_text())["door_max_time"] == ["300"]
+    # a status the proxy itself answers with is not the endpoint's
+    s = json.loads(state.read_text()); s["tls_endpoints"] = []; s["proxy_status_endpoints"] = ["llm.example"]; state.write_text(json.dumps(s))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((work / "network-check.json").read_text())["egress"]["asserted"]["llm"] is False

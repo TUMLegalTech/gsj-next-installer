@@ -1227,11 +1227,15 @@ egress_endpoint_urls() { # merged site file -> "site key<TAB>url" lines, every a
      jq -e 'type=="object" and (keys|sort)==["HTTPS_PROXY","HTTP_PROXY","NO_PROXY"] and all(.[];type=="string")' "$file" >/dev/null 2>&1 || fail 'proxy_file must contain exactly HTTP_PROXY, HTTPS_PROXY and NO_PROXY strings'
      proxy_file_check "$file"
      jq -r '[.HTTP_PROXY, .HTTPS_PROXY] | map(select(. != "")) | map(["trust.proxy_file", .]) | .[] | @tsv' "$file"
+   elif [[ -r ${GSJ_WORK:-}/restored-proxy-normalized.json ]]; then
+     # a restore to a machine that does not carry the proxy file yet: the
+     # archive's proxy (recovered and checked against the release's Secret by
+     # restore_archive, which then recompiles the values) serves the list
+     jq -r '[.HTTP_PROXY, .HTTPS_PROXY] | map(select(. != "")) | map(["trust.proxy_file", .]) | .[] | @tsv' "$GSJ_WORK/restored-proxy-normalized.json"
    else
-     # the list is compiled before a restore opens its archive, so a machine
-     # that does not carry the proxy file yet gets no proxy rule from this
-     # operation: put the file in place first, or run install afterwards
-     log "trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this operation (put the file in place before the operation, or run install afterwards)"
+     # an install or upgrade refuses at its trust step without the file; a
+     # restore takes the proxy from its archive once it is open
+     log "trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this compile (an install or upgrade refuses at its trust step without the file; a restore takes the proxy from its archive)"
    fi
  fi
 }
@@ -1244,7 +1248,7 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  # proxy_file_check refuses)
  case $key in trust.proxy_file) shown='a proxy URL in trust.proxy_file';; *) shown="$key ($(url_origin_only "$url"))";; esac
  if [[ $url == *://* ]]; then scheme=${url%%://*}; rest=${url#*://}; else rest=$url; fi
- scheme=${scheme,,}
+ scheme=$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')
  authority=${rest%%[/?#]*}; authority=${authority##*@}
  if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; port=${authority##*]}; port=${port#:}
  elif [[ $authority == *:* ]]; then host=${authority%%:*}; port=${authority##*:}
@@ -1295,12 +1299,14 @@ egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --a
      fi
    done
  fi
- # with nothing recorded, a continued operation resolves once and keeps the
- # list in its state: a repair that re-enters compares its transition file
- # byte for byte, and a resolver answer that changed between two runs must
- # not be what differs
- local kept="${STATE_DIR:-}/egress-endpoints.json"
- if (( ! fresh )) && [[ -n ${STATE_DIR:-} && -f $kept && ! -L $kept ]] && jq -e 'type=="array"' "$kept" >/dev/null 2>&1; then cat "$kept"; return 0; fi
+ # with nothing recorded, an operation being continued resolves once and
+ # keeps the list in its state under its own name: a repair that re-enters
+ # compares its transition file byte for byte, and a resolver answer that
+ # changed between two runs must not be what differs; a verb that continues
+ # nothing keeps nothing
+ local kept=''
+ [[ -z ${RESUME_ID:-} || -z ${STATE_DIR:-} ]] || kept="$STATE_DIR/egress-endpoints-$RESUME_ID.json"
+ if (( ! fresh )) && [[ -n $kept && -f $kept && ! -L $kept ]] && jq -e 'type=="array"' "$kept" >/dev/null 2>&1; then cat "$kept"; return 0; fi
  # a refusal inside a command substitution must still stop the compile:
  # errexit does not reach a $(...) subshell, so the status is checked here
  urls=$(egress_endpoint_urls "$site") || return 1
@@ -1311,7 +1317,7 @@ egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --a
      resolve_endpoint "$key" "$url" || exit 1
    done <<< "$urls"
  } | jq -s 'unique') || return 1
- if (( ! fresh )) && [[ -n ${STATE_DIR:-} && -d ${STATE_DIR:-} ]]; then printf '%s\n' "$list" | atomic "$kept"; fi
+ if (( ! fresh )) && [[ -n $kept && -d ${STATE_DIR:-} ]]; then printf '%s\n' "$list" | atomic "$kept"; fi
  printf '%s\n' "$list"
 }
 compile_values() { # merged site file -> the chart's values on stdout: compile.jq plus the outbound list
@@ -4214,14 +4220,20 @@ network_verify() {
  # that is merely down keeps its acceptance skip and the install completes,
  # as the preflight said; one that answers here and not from the pod names a
  # wrong list. What the probe found is kept in the operation's state. All of
- # it applies to a chart that renders the outbound policy: a corrected
- # program applying an earlier release's chart has no list to hold, and the
- # record says so.
- if ! k get networkpolicy "$RELEASE-gsj-egress" -o name >/dev/null 2>&1; then
-   log "the applied chart renders no outbound policy for the gsj pod ($RELEASE-gsj-egress is absent): the three pairs are proven, the closed list is not held"
+ # it applies to a chart that renders the outbound policy — read from the
+ # applied release's own manifest, never from what the cluster happens to
+ # hold: a corrected program applying an earlier release's chart has no
+ # list to hold, and the record says so; a manifest that carries the policy
+ # and a cluster that does not hold it is a failure, not a skip.
+ local manifest held
+ manifest=$(h get manifest "$RELEASE") || fail "the applied release's manifest could not be read (helm get manifest $RELEASE)"
+ if ! grep -qE "^  name: ${RELEASE}-gsj-egress\$" <<< "$manifest"; then
+   log "the applied chart renders no outbound policy for the gsj pod ($RELEASE-gsj-egress is not in the release's manifest): the three pairs are proven, the closed list is not held"
    jq -n --arg source "$forge" --argjson seconds "$elapsed" '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,egress:"not rendered by the applied chart"}' > "$STATE_DIR/network-check.json"
    return 0
  fi
+ held=$(k get networkpolicy "$RELEASE-gsj-egress" --ignore-not-found -o name) || fail "the outbound policy $RELEASE-gsj-egress could not be read from the cluster"
+ [[ -n $held ]] || fail "the applied chart renders $RELEASE-gsj-egress but the cluster does not hold it"
  local node llm ocr probe llm_state='' ocr_state='' unreached reached
  node=$(k get pod "$pod" -o json | jq -r '.status.hostIP // ""')
  [[ -n $node ]] || fail "the application pod $pod reports no host address; the outbound check cannot name the node"
@@ -4260,30 +4272,38 @@ network_verify() {
  connected=$(tr ' ' '\n' <<< "$chroma_report" | awk -F= '$2=="connected" && $1!="control" {print $1}' | paste -sd ',' - | sed 's/,/, /g')
  [[ -z $connected ]] || fail "NetworkPolicy outbound deny was not enforced on Chroma: it connected to $connected, and Chroma may reach nothing but DNS"
  [[ $chroma_report == *"dns=ok"* ]] || fail "cluster DNS did not answer from the Chroma pod, which its outbound policy must admit (the probe reported: $chroma_report)"
- local proxied=false; [[ -z $(j '.trust.proxy_file // ""') ]] || proxied=true
+ # the panel's probes honour a proxy the site names; a proxy file that names
+ # none (NO_PROXY alone) leaves them dialling directly, and the panel is held
+ local proxied=false pfile; pfile=$(j '.trust.proxy_file // ""')
+ if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && jq -e '((.HTTP_PROXY // "") != "") or ((.HTTPS_PROXY // "") != "")' "$pfile" >/dev/null 2>&1 && proxied=true; fi
  isolation_verify "$proxied"
  jq -n --arg source "$forge" --argjson seconds "$elapsed" --slurpfile probe "$STATE_DIR/egress-probe.json" --arg chroma "$chroma_report" --arg llm_ok "$llm_state" --arg ocr_ok "$ocr_state" --argjson proxied "$proxied" --slurpfile isolation "$STATE_DIR/isolation.json" \
    '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,
      egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
              isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
 }
-endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s, with the site's own trust inputs
- # the pod dials it with the site's CA bundle and through the site's proxy,
- # so this machine dials it the same way; a TLS-level answer (a certificate
- # this bundle does not trust, a handshake that failed) is still an answer —
- # the host is there
- local code rc=0 file args=(--silent --show-error --max-time 10 -o /dev/null -w '%{http_code}')
+endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s, dialled as the pod dials it
+ # the pod dials it with the site's CA bundle, through the site's proxy and
+ # past it for NO_PROXY names, so this machine dials it the same way; what
+ # counts is an HTTP status from the endpoint — the pod's probe counts the
+ # same thing — so a TLS failure keeps the endpoint's skip, and a status the
+ # proxy itself answers with (407, 502, 503, 504) is not the endpoint's
+ local code rc=0 file proxy='' args=(--silent --show-error --max-time 10 -o /dev/null -w '%{http_code}')
  file=$(j '.trust.ca_file // ""'); [[ -z $file ]] || { file=$(resolve_file "$file"); [[ -r $file ]] && { cat "$(system_ca_bundle)" "$file" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null && args+=(--cacert "$GSJ_WORK/answers-here-ca.pem"); }; }
  file=$(j '.trust.proxy_file // ""')
  if [[ -n $file ]]; then
    file=$(resolve_file "$file")
    if [[ -r $file ]]; then
-     local proxy; proxy=$(jq -r --arg url "$1" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$file" 2>/dev/null)
+     proxy=$(jq -r --arg url "$1" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$file" 2>/dev/null)
      [[ -z $proxy ]] || args+=(--proxy "$proxy")
+     local bypass; bypass=$(jq -r '.NO_PROXY // ""' "$file" 2>/dev/null)
+     [[ -z $bypass ]] || args+=(--noproxy "$bypass")
    fi
  fi
  code=$(curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
- case $rc in 0) [[ $code =~ ^[1-5][0-9][0-9]$ ]];; 35|51|58|60) return 0;; *) return 1;; esac
+ (( rc == 0 )) || return 1
+ [[ $code =~ ^[1-5][0-9][0-9]$ ]] || return 1
+ case $code in 407|502|503|504) [[ -z $proxy ]];; *) return 0;; esac
 }
 isolation_verify() { # $1: true when the site routes through a proxy
  # The door's own isolation panel, read through the public route as the
@@ -5627,6 +5647,13 @@ restore_archive() {
    fi
    jq -n --arg name "$value_name" --arg file "$file" --arg staged "$recovered" --argjson mode "$mode" '{name:$name,file:$file,staged:$staged,mode:$mode}' >> "$GSJ_WORK/restore-inputs.jsonl"
  done
+ # The outbound list was compiled before the archive was open: a proxy the
+ # archive supplies (the site's file is not on this machine yet) enters the
+ # values now, before the intent records them.
+ if [[ -r $GSJ_WORK/restored-proxy-normalized.json ]]; then
+   compile_values "$SITE" > "$GSJ_WORK/values.pending.recompiled"
+   mv -f "$GSJ_WORK/values.pending.recompiled" "$GSJ_WORK/values.pending.json"
+ fi
  # Two logical inputs may share a path only when their recovered bytes agree.
  while IFS= read -r file; do
    recovered=''

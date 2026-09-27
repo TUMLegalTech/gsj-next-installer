@@ -2809,14 +2809,15 @@ reach exactly:
   without the site's DNS and an interrupted operation resumes whatever the
   resolver answers today. An operation that recorded nothing (one that began
   before this list existed) resolves once and keeps the answer in its state.
-  A restore to a machine that does not carry the proxy file yet gets no
-  proxy rule from that operation: put the file in place first, or run
-  `install` afterwards. A name your cluster's DNS
+  A restore to a machine that does not carry the proxy file yet takes the
+  proxy from the archive once it is open. A name your cluster's DNS
   answers with another address than this machine's DNS is yours to
   reconcile: the Pod would resolve the name, connect to the cluster's answer
   and be refused, and the Verbindungstest would say "Nicht verbunden". A
   model origin a lawyer enters in a case's settings works only if its
-  address is on this list. A proxy on the list is a door: what the proxy
+  address is on this list. Every address rule admits whatever else is served at that address and
+  port — another tenant of a shared load balancer or CDN in front of your
+  model endpoint is admitted with it. A proxy on the list is a door: what the proxy
   permits is reachable through it, so the list bounds the proxy's address,
   not what lies behind it — and the application's isolation panel, whose
   probes honour the proxy, then measures the proxy's policy.

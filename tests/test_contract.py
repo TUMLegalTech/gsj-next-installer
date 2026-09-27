@@ -292,7 +292,7 @@ def test_progress_deadline_outlasts_the_dependency_wait_and_the_import(tmp_path)
         assert startup["progressDeadlineSeconds"] > floor + threshold * 5
     assert web_deployment(rendered(tmp_path, None, *CORPUS))["spec"]["progressDeadlineSeconds"] == startup["progressDeadlineSeconds"]
     out = subprocess.run(["helm", "template", "gsj", str(pinned_web.chart()), "--set", "fullnameOverride=gsj",
-                          "--set", "operator.password=x", "--set", "llm.model=openai@http://llm.test:8000/v1#test-model",
+                          "--set", "operator.password=x", "--set", "llm.model=openai@http://198.51.100.10:8000/v1#test-model",
                           *CORPUS, "--set", f"startup.progressDeadlineSeconds={floor}"],
                          capture_output=True, text=True)
     assert out.returncode != 0, "a progress window equal to the two deadlines must not render"
@@ -313,7 +313,8 @@ def test_compiled_values_name_the_controller_and_carry_no_inert_key(tmp_path):
              (site("reuse"), ("--arg", "ingress_controller", "k8s.io/ingress-nginx"), "k8s.io/ingress-nginx"),
              (site("reuse"), (), "k8s.io/ingress-nginx")]
     for s, extra, controller in cases:
-        values = compiled(tmp_path, s, *extra)
+        # rendered as the runtime compiles: with the outbound list it always passes
+        values = compiled(tmp_path, s, *extra, "--argjson", "egress_endpoints", "[]")
         assert values["ingress"]["controller"] == controller
         assert "annotations" not in values["ingress"]
         assert "provisioning" not in values
