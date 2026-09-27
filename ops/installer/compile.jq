@@ -18,12 +18,13 @@ def image($key): $r.images[$key]
  # --arg ingress_controller, and without it the chart keeps ingress-nginx.
  ingress:{enabled:true,className:$s.ingress.class,controller:(if $s.ingress.profile=="managed-traefik" then "traefik.io/ingress-controller" else ($ARGS.named.ingress_controller // "k8s.io/ingress-nginx") end),host:($s.public_url | capture("^https://(?<host>[^:/]+)").host),tls:[{secretName:$s.tls.secret,hosts:[($s.public_url | capture("^https://(?<host>[^:/]+)").host)]}]},
  # The gsj pod's closed outbound list names addresses, never hosts: the
- # runtime resolves llm.base_url, ocr.url, llm.allowed_origins, the proxy URLs
- # and public_url on the machine it runs on when an operation starts and
- # passes them as --argjson egress_endpoints ([{cidr, port}]); the controller
- # the installer manages is narrowed to its own pods by label. Without the
- # argument (a compile outside the runtime) both keys are absent and the
- # values are what they were before the list existed.
+ # runtime resolves llm.base_url, ocr.url, llm.allowed_origins and the proxy
+ # URLs on the machine it runs on when an operation starts and passes what it
+ # could resolve as --argjson egress_endpoints ([{cidr, port}]); the public
+ # route is reached through the controller peers the chart renders, never as
+ # an address; the controller the installer manages is narrowed to its own
+ # pods by label. Without the argument (a compile outside the runtime) both
+ # keys are absent and the values are what they were before the list existed.
  networkPolicy:({enabled:true,ingressControllerNamespace:$s.ingress.namespace}
       + (if $ARGS.named.egress_endpoints != null then {egress:{endpoints:$ARGS.named.egress_endpoints},
            ingressControllerPodSelector:(if $s.ingress.profile=="managed-traefik" then {"app.kubernetes.io/name":"traefik"} else {} end)} else {} end)),

@@ -144,7 +144,7 @@ def test_every_compiled_leaf_is_a_value_the_pinned_chart_declares(tmp_path, exam
     emitted = set(leaves(values))
     # maps the chart hands on whole (`toYaml .Values.resources.web`, the
     # placement selector) or declares empty: compare at the map
-    maps = {"placement.nodeSelector", "ingress.annotations", "trust", "corpus.resources",
+    maps = {"placement.nodeSelector", "ingress.annotations", "trust", "corpus.resources", "networkPolicy.ingressControllerPodSelector",
             "resources.web", "resources.mcp", "resources.runner", "resources.forgejo", "resources.chroma"}
     unknown = sorted(leaf for leaf in emitted
                      if leaf not in declared and not any(leaf.startswith(m + ".") or leaf == m for m in maps))

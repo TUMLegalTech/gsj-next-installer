@@ -1227,44 +1227,61 @@ egress_endpoint_urls() { # merged site file -> "site key<TAB>url" lines, every a
      jq -e 'type=="object" and (keys|sort)==["HTTPS_PROXY","HTTP_PROXY","NO_PROXY"] and all(.[];type=="string")' "$file" >/dev/null 2>&1 || fail 'proxy_file must contain exactly HTTP_PROXY, HTTPS_PROXY and NO_PROXY strings'
      proxy_file_check "$file"
      jq -r '[.HTTP_PROXY, .HTTPS_PROXY] | map(select(. != "")) | map(["trust.proxy_file", .]) | .[] | @tsv' "$file"
-   elif [[ -f $GSJ_WORK/restorable-secrets.json ]] && jq -e --arg name "$RELEASE-proxy" 'any(.items[];.kind=="Secret" and .metadata.name==$name)' "$GSJ_WORK/restorable-secrets.json" >/dev/null 2>&1; then
-     # a restore to a machine that does not carry the proxy file yet: the
-     # archive's proxy Secret names the proxy the restored release will use
-     jq -r --arg name "$RELEASE-proxy" '.items[]|select(.kind=="Secret" and .metadata.name==$name)|.data|[.HTTP_PROXY, .HTTPS_PROXY]|map(select(.!=null)|@base64d)|map(select(. != ""))|map(["trust.proxy_file", .])|.[]|@tsv' "$GSJ_WORK/restorable-secrets.json"
    else
-     log "trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this compile (the trust step refuses if the file is still missing)"
+     # the list is compiled before a restore opens its archive, so a machine
+     # that does not carry the proxy file yet gets no proxy rule from this
+     # operation: put the file in place first, or run install afterwards
+     log "trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy from this operation (put the file in place before the operation, or run install afterwards)"
    fi
  fi
 }
 resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what cannot be resolved here is said, not refused
- local key=$1 url=$2 scheme='' rest authority host port address answered=0 shown
- local ipv4='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' ipv6='^[0-9A-Fa-f:]+$'
+ local key=$1 url=$2 scheme='' rest authority host port address shown ports p cidr cidrs=()
+ local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:]+$' local_answer='^(127\.|169\.254\.|::1$|[fF][eE]80:|0\.0\.0\.0$)'
+ ipv4="^$octet\.$octet\.$octet\.$octet$"
  # what a refusal or a log line names: the site key and, for the LLM, the OCR
  # and an origin, the URL's origin; never a proxy URL (its file may carry what
  # proxy_file_check refuses)
  case $key in trust.proxy_file) shown='a proxy URL in trust.proxy_file';; *) shown="$key ($(url_origin_only "$url"))";; esac
  if [[ $url == *://* ]]; then scheme=${url%%://*}; rest=${url#*://}; else rest=$url; fi
+ scheme=${scheme,,}
  authority=${rest%%[/?#]*}; authority=${authority##*@}
  if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; port=${authority##*]}; port=${port#:}
  elif [[ $authority == *:* ]]; then host=${authority%%:*}; port=${authority##*:}
  else host=$authority; port=''; fi
- [[ -n $port ]] || case $scheme in https) port=443;; socks5|socks5h|socks4|socks4a) port=1080;; *) port=80;; esac
- { [[ $host =~ ^[A-Za-z0-9._~%-]+$ || $host =~ $ipv6 ]] && [[ $port =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )); } \
-   || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
- port=$((10#$port))
- if [[ $host =~ $ipv4 ]]; then jq -n --arg cidr "$host/32" --argjson port "$port" '{cidr:$cidr,port:$port}'; return 0; fi
- if [[ $host == *:* ]]; then jq -n --arg cidr "$host/128" --argjson port "$port" '{cidr:$cidr,port:$port}'; return 0; fi
- if [[ $host == *.svc || $host == *.svc.* ]]; then
-   log "$shown names an in-cluster Service; this release's outbound list admits addresses outside the cluster only, so the gsj pod gets no rule for it"; return 0
+ if [[ -n $port ]]; then ports=$port
+ else
+   # the scheme's port; a proxy URL without a port is dialled on the scheme's
+   # port by the pod's Python and node clients and on 1080 by curl, so a
+   # port-less proxy gets both
+   case $scheme in https) ports=443;; socks5|socks5h|socks4|socks4a) ports=1080;; *) ports=80;; esac
+   [[ $key != trust.proxy_file || $ports == 1080 ]] || { ports="$ports 1080"; log "$shown names no port; the gsj pod gets a rule on the scheme's port and on 1080 (curl's proxy default); name the port in the proxy file to admit one"; }
  fi
- if ! command -v getent >/dev/null 2>&1; then log "getent is not available on this machine; $shown gets no outbound rule"; return 0; fi
- while read -r address; do
-   [[ -n $address ]] || continue
-   answered=1
-   if [[ $address == *:* ]]; then jq -n --arg cidr "$address/128" --argjson port "$port" '{cidr:$cidr,port:$port}'
-   else jq -n --arg cidr "$address/32" --argjson port "$port" '{cidr:$cidr,port:$port}'; fi
- done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
- (( answered )) || log "$shown names a host this machine cannot resolve; the gsj pod gets no outbound rule for it (fix this machine's DNS for that name, or name the address in the site file, and run again)"
+ # an IPv4-mapped IPv6 literal is its IPv4 address; a zone-scoped literal
+ # (fe80::1%eth0) is no address a policy can name and fails the check below
+ if [[ $host =~ ^::[fF]{4}:(.*)$ ]]; then local mapped=${BASH_REMATCH[1]}; [[ $mapped =~ $ipv4 ]] && host=$mapped; fi
+ [[ $host =~ ^[A-Za-z0-9._~-]+$ || $host =~ $ipv6 ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+ for p in $ports; do
+   { [[ $p =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )); } || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+ done
+ if [[ $host =~ $ipv4 ]]; then cidrs=("$host/32")
+ elif [[ $host == *:* ]]; then cidrs=("$host/128")
+ elif [[ $host == *.svc || $host == *.svc.* ]]; then
+   log "$shown names an in-cluster Service; this release's outbound list admits addresses outside the cluster only, so the gsj pod gets no rule for it"; return 0
+ elif ! command -v getent >/dev/null 2>&1; then log "getent is not available on this machine; $shown gets no outbound rule"; return 0
+ else
+   # a dotted quad that is no address (999.1.1.1, 010.0.0.7) is a name here,
+   # and the resolver says what it is
+   while read -r address; do
+     [[ -n $address ]] || continue
+     if [[ $address =~ $local_answer ]]; then
+       log "$shown resolves to $address on this machine, an address the pod could never reach; the gsj pod gets no outbound rule for that answer"; continue
+     fi
+     if [[ $address == *:* ]]; then cidrs+=("$address/128"); else cidrs+=("$address/32"); fi
+   done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+   (( ${#cidrs[@]} )) || { log "$shown names a host this machine cannot resolve to an address the pod could reach; the gsj pod gets no outbound rule for it (fix this machine's DNS for that name, or name the address in the site file, and run again)"; return 0; }
+ fi
+ for cidr in "${cidrs[@]}"; do for p in $ports; do jq -n --arg cidr "$cidr" --argjson port "$((10#$p))" '{cidr:$cidr,port:$port}'; done; done
 }
 egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --argjson egress_endpoints
  local site=$1 fresh=0 recorded urls key url
@@ -1278,15 +1295,24 @@ egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --a
      fi
    done
  fi
+ # with nothing recorded, a continued operation resolves once and keeps the
+ # list in its state: a repair that re-enters compares its transition file
+ # byte for byte, and a resolver answer that changed between two runs must
+ # not be what differs
+ local kept="${STATE_DIR:-}/egress-endpoints.json"
+ if (( ! fresh )) && [[ -n ${STATE_DIR:-} && -f $kept && ! -L $kept ]] && jq -e 'type=="array"' "$kept" >/dev/null 2>&1; then cat "$kept"; return 0; fi
  # a refusal inside a command substitution must still stop the compile:
  # errexit does not reach a $(...) subshell, so the status is checked here
  urls=$(egress_endpoint_urls "$site") || return 1
- {
+ local list
+ list=$({
    while IFS=$'\t' read -r key url; do
      [[ -n $url ]] || continue
-     resolve_endpoint "$key" "$url"
+     resolve_endpoint "$key" "$url" || exit 1
    done <<< "$urls"
- } | jq -s 'unique'
+ } | jq -s 'unique') || return 1
+ if (( ! fresh )) && [[ -n ${STATE_DIR:-} && -d ${STATE_DIR:-} ]]; then printf '%s\n' "$list" | atomic "$kept"; fi
+ printf '%s\n' "$list"
 }
 compile_values() { # merged site file -> the chart's values on stdout: compile.jq plus the outbound list
  local endpoints; endpoints=$(egress_endpoints "$1") || exit 1
@@ -4187,7 +4213,15 @@ network_verify() {
  # is asserted only when the endpoint answers this machine now: an endpoint
  # that is merely down keeps its acceptance skip and the install completes,
  # as the preflight said; one that answers here and not from the pod names a
- # wrong list. What the probe found is kept in the operation's state.
+ # wrong list. What the probe found is kept in the operation's state. All of
+ # it applies to a chart that renders the outbound policy: a corrected
+ # program applying an earlier release's chart has no list to hold, and the
+ # record says so.
+ if ! k get networkpolicy "$RELEASE-gsj-egress" -o name >/dev/null 2>&1; then
+   log "the applied chart renders no outbound policy for the gsj pod ($RELEASE-gsj-egress is absent): the three pairs are proven, the closed list is not held"
+   jq -n --arg source "$forge" --argjson seconds "$elapsed" '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,egress:"not rendered by the applied chart"}' > "$STATE_DIR/network-check.json"
+   return 0
+ fi
  local node llm ocr probe llm_state='' ocr_state='' unreached reached
  node=$(k get pod "$pod" -o json | jq -r '.status.hostIP // ""')
  [[ -n $node ]] || fail "the application pod $pod reports no host address; the outbound check cannot name the node"
@@ -4233,10 +4267,23 @@ network_verify() {
      egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
              isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
 }
-endpoint_answers_here() { # a URL -> 0 when it answers this machine with any HTTP status within 10 s
- local code
- code=$(curl --silent --show-error --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
- [[ $code =~ ^[1-5][0-9][0-9]$ ]]
+endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s, with the site's own trust inputs
+ # the pod dials it with the site's CA bundle and through the site's proxy,
+ # so this machine dials it the same way; a TLS-level answer (a certificate
+ # this bundle does not trust, a handshake that failed) is still an answer —
+ # the host is there
+ local code rc=0 file args=(--silent --show-error --max-time 10 -o /dev/null -w '%{http_code}')
+ file=$(j '.trust.ca_file // ""'); [[ -z $file ]] || { file=$(resolve_file "$file"); [[ -r $file ]] && { cat "$(system_ca_bundle)" "$file" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null && args+=(--cacert "$GSJ_WORK/answers-here-ca.pem"); }; }
+ file=$(j '.trust.proxy_file // ""')
+ if [[ -n $file ]]; then
+   file=$(resolve_file "$file")
+   if [[ -r $file ]]; then
+     local proxy; proxy=$(jq -r --arg url "$1" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$file" 2>/dev/null)
+     [[ -z $proxy ]] || args+=(--proxy "$proxy")
+   fi
+ fi
+ code=$(curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
+ case $rc in 0) [[ $code =~ ^[1-5][0-9][0-9]$ ]];; 35|51|58|60) return 0;; *) return 1;; esac
 }
 isolation_verify() { # $1: true when the site routes through a proxy
  # The door's own isolation panel, read through the public route as the
@@ -4250,7 +4297,10 @@ isolation_verify() { # $1: true when the site routes through a proxy
  # session ends with a logout. The panel's answer is kept in the state.
  local proxied=${1:-false} url host port ca connect jar code
  url=$(j .public_url); url=${url%/}; host=$(printf '%s' "$url" | sed -E 's#https://([^/:]+).*#\1#'); port=$(printf '%s' "$url" | sed -nE 's#https://[^/:]+:([0-9]+).*#\1#p'); port=${port:-443}
- local args=(--silent --show-error --max-time 60)
+ # the panel probes every canary from both vantages in turn, each with its
+ # own connect timeout, and a CNI that drops rather than rejects spends that
+ # timeout on every address: the read's budget is minutes, not seconds
+ local args=(--silent --show-error --max-time 300)
  ca=$(j .verification.ca_file); [[ -z $ca ]] || args+=(--cacert "$(resolve_file "$ca")")
  connect=$(j .verification.connect_host); [[ -z $connect ]] || args+=(--connect-to "$host:$port:$connect:$(j .verification.connect_port)")
  jar="$GSJ_WORK/isolation-cookies"; : > "$jar"; chmod 600 "$jar"

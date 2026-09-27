@@ -2807,8 +2807,11 @@ reach exactly:
   `abandon`, the named repairs), keep the addresses the operation recorded:
   they never ask this machine's resolver again, so a backup runs on a machine
   without the site's DNS and an interrupted operation resumes whatever the
-  resolver answers today. A restore to a machine that does not carry the
-  proxy file yet takes the proxy from the archive. A name your cluster's DNS
+  resolver answers today. An operation that recorded nothing (one that began
+  before this list existed) resolves once and keeps the answer in its state.
+  A restore to a machine that does not carry the proxy file yet gets no
+  proxy rule from that operation: put the file in place first, or run
+  `install` afterwards. A name your cluster's DNS
   answers with another address than this machine's DNS is yours to
   reconcile: the Pod would resolve the name, connect to the cluster's answer
   and be refused, and the Verbindungstest would say "Nicht verbunden". A
@@ -2860,12 +2863,17 @@ the list as documentation. A public address that is not translated to a Pod
 at all (a load balancer outside the cluster) is not admitted: an address
 rule for it would admit everything behind that address; point
 `verification.connect_host` and `connect_port` at a node and the ingress
-NodePort instead, which the cluster translates to the controller. (2) The controller's
+NodePort instead, which the cluster translates to the controller. A
+controller that runs on the host network (a common bare-metal ingress-nginx
+layout) is not a Pod peer either and is not supported by this release's
+list. (2) The controller's
 namespace is admitted on every port. Under `managed-traefik` the installer
 narrows that to the controller's own Pods; under `reuse` it cannot know the
 controller's labels, so a controller that shares its namespace with other
 workloads (k3s's bundled Traefik in `kube-system`) shares this admission with
-them — run the controller in a namespace of its own. (3) DNS is admitted to
+them — run the controller in a namespace of its own; on k3s the servicelb
+peer is keyed by namespace alone, so every klipper-lb Pod fronting a
+LoadBalancer Service of that namespace is admitted. (3) DNS is admitted to
 the CoreDNS Pods of `kube-system`; a cluster whose Pods resolve through
 NodeLocal DNSCache (a link-local address served from the node) is not
 supported by this release's list. (4) DNS lookups still leave the cluster:
