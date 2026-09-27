@@ -22,29 +22,43 @@ from tests.test_installer import _runtime
 
 WRITES = ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
 HOST = "legal.example"                        # _site()'s public_url host
+NAMESPACE = "synthetic-namespace"             # the runtime fixture's target namespace
 CLASS = "gsj-ingress"                         # _site()'s ingress.class
 VERSIONS = {"clientVersion": {"gitVersion": "v1.33.1"}, "serverVersion": {"gitVersion": "v1.33.6+k3s1"}}
 PASSWORD = "synthetic-operator-password"
 OWNER = "a" * 40
 
 # The shared fake answers `get pods`, and `get ingresses` without -A, with
-# every object in the cluster whatever namespace kubectl was given, so a check
-# that read the wrong namespace would pass on it. This front keeps that
-# namespace and lists only the objects that live there; -A lists them all.
+# every object in the cluster whatever namespace kubectl was given, a named
+# `get secret` by its name alone, and under namespace_absent every namespace as
+# absent, so a check that read the wrong namespace would pass on it. This front
+# keeps that namespace: a list holds only the objects that live there (-A lists
+# them all), a Secret is found only in the namespace _cluster keyed it under,
+# and namespace_absent names the namespaces that do not exist, every other one
+# does (read -o name, as preflight_site_checks reads it). Every call still
+# reaches the shared fake, which records it.
 NAMESPACED = '''#!/usr/bin/env python3
-import json, subprocess, sys
+import json, os, pathlib, subprocess, sys
 args, namespace = sys.argv[1:], "default"
 while args and args[0] in ("--context", "--namespace", "-n"):
     namespace = namespace if args[0] == "--context" else args[1]
     args = args[2:]
 answer = subprocess.run([@SHARED@, *sys.argv[1:]], stdout=subprocess.PIPE)
-listed = answer.stdout
-if answer.returncode == 0 and args[:2] in (["get", "pods"], ["get", "ingresses"]) and not {"-A", "--all-namespaces"} & set(args):
+listed, code = answer.stdout, answer.returncode
+state = json.loads(pathlib.Path(os.environ["TEST_KUBECTL_STATE"]).read_text())
+named = args[:1] == ["get"] and len(args) > 2 and not args[2].startswith("-")
+missing = b"", 0 if "--ignore-not-found" in args else 1
+if code == 0 and args[:2] in (["get", "pods"], ["get", "ingresses"]) and not {"-A", "--all-namespaces"} & set(args):
     document = json.loads(listed)
     document["items"] = [o for o in document["items"] if o["metadata"].get("namespace", "default") == namespace]
     listed = json.dumps(document).encode()
+elif named and args[1] in ("secret", "secrets"):
+    found = state.get("resources", {}).get("Secret/" + namespace + "/" + args[2])
+    listed, code = (json.dumps(found).encode(), 0) if found else missing
+elif named and args[1] == "namespace" and "namespace_absent" in state and not state.get("namespace_read_fails"):
+    listed, code = missing if args[2] in state["namespace_absent"] else (f"namespace/{args[2]}".encode(), 0)
 sys.stdout.buffer.write(listed)
-sys.exit(answer.returncode)
+sys.exit(code)
 '''
 
 
@@ -123,13 +137,13 @@ def _intermediate(tmp_path, ca_crt, ca_key):
     return crt, key
 
 
-def _tls_secret(crt, key, kind="kubernetes.io/tls", name="gsj-tls"):
-    return {"apiVersion": "v1", "kind": "Secret", "type": kind, "metadata": {"name": name},
+def _tls_secret(crt, key, kind="kubernetes.io/tls", name="gsj-tls", namespace=NAMESPACE):
+    return {"apiVersion": "v1", "kind": "Secret", "type": kind, "metadata": {"name": name, "namespace": namespace},
             "data": {"tls.crt": _b64(crt.read_bytes()), "tls.key": _b64(key.read_bytes())}}
 
 
-def _operator_secret(password):
-    return {"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "metadata": {"name": "gsj-operator"},
+def _operator_secret(password, namespace=NAMESPACE):
+    return {"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "metadata": {"name": "gsj-operator", "namespace": namespace},
             "data": {"password": _b64(password)}}
 
 
@@ -162,7 +176,10 @@ def _site(work, change=None):
 
 def _cluster(state, *objects, **flags):
     """Keyed by namespace too where an object has one, so two Ingresses of one
-    name in two namespaces are two objects."""
+    name in two namespaces are two objects. Every Secret names its namespace:
+    the front finds one only there, so a Secret without one would pass a
+    refusal test as missing for no reason the test meant."""
+    assert all(o["metadata"].get("namespace") for o in objects if o["kind"] == "Secret"), objects
     state.write_text(json.dumps({"lease": None, "calls": [], **flags, "resources": {
         "/".join(filter(None, (o["kind"], o["metadata"].get("namespace"), o["metadata"]["name"]))): o for o in objects}}))
 
@@ -352,6 +369,16 @@ def test_a_certificate_followed_by_its_chain_is_judged_by_its_leaf(runtime, tmp_
     assert "origin-tls-failed" not in result.stderr, result.stderr
 
 
+def test_a_tls_secret_that_lives_only_in_ingress_namespace_is_refused_as_missing_in_the_target_namespace(runtime, tmp_path):
+    """The Ingress names tls.secret in target.namespace, the one namespace
+    managed_dependencies reads it from; the same name elsewhere is not it."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "elsewhere")
+    _cluster(state, _tls_secret(crt, key, namespace="gsj-ingress"), CONTROLLER)
+    _refusal(_checks(run), state, "TLS Secret is unavailable", f"namespace {NAMESPACE} holds none of that name")
+
+
 # --- tls.profile files: the file, its host, an existing Secret ------------------------
 
 def _files_site(work, crt, key):
@@ -443,10 +470,21 @@ def test_a_controller_is_recognized_by_its_name_or_its_image_alone(runtime, tmp_
         assert name not in line and "registry.example" not in line, line
 
 
-def test_an_ingress_namespace_that_does_not_exist_is_refused(runtime, tmp_path):
+def test_an_ingress_namespace_that_does_not_exist_is_refused_while_the_target_namespace_exists(runtime, tmp_path):
     run, state, work = runtime
-    _baseline(tmp_path, state, work, namespace_absent=True)
+    _baseline(tmp_path, state, work, namespace_absent=["gsj-ingress"])
     _refusal(_checks(run), state, "ingress.namespace gsj-ingress does not exist", "kubectl get pods -A")
+
+
+def test_a_target_namespace_that_does_not_exist_yet_is_not_read_as_ingress_namespace(runtime, tmp_path):
+    """A first install creates target.namespace under the Lease; the namespace
+    that must already exist is ingress.namespace, read by its own name."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "files")
+    _files_site(work, crt, key)
+    _cluster(state, CONTROLLER, namespace_absent=[NAMESPACE])
+    _admitted(_checks(run), state)
 
 
 def test_an_ingress_namespace_without_a_running_pod_is_refused_by_counts(runtime, tmp_path):
@@ -740,6 +778,18 @@ def test_an_operator_secret_that_differs_from_the_password_file_is_refused_with_
     result = _checks(run)
     _refusal(result, state, "Secret gsj-operator differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite")
     assert PASSWORD not in result.stderr and "the-previous-password" not in result.stderr
+
+
+@pytest.mark.parametrize("namespace", ["gsj-ingress", "other-namespace"])
+def test_an_operator_secret_that_lives_only_in_another_namespace_is_not_compared(runtime, tmp_path, namespace):
+    """secret_file creates and compares the operator Secret in target.namespace
+    alone: one of that name elsewhere, holding another password, is another
+    deployment's and stops nothing."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _operator_secret("the-previous-password", namespace=namespace))
+    result = _checks(run)
+    _admitted(result, state)
+    assert result.stderr == "", result.stderr
 
 
 def test_an_operator_password_with_a_control_character_is_refused(runtime, tmp_path):
