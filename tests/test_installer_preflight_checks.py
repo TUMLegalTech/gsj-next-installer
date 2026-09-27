@@ -215,7 +215,7 @@ def test_a_site_that_matches_its_cluster_passes_every_check_without_a_write(runt
               password=PASSWORD + "\n\n")
     result = _checks(run)
     _admitted(result, state)
-    assert "kubectl" not in result.stderr, "a matching site logs nothing"
+    assert result.stderr == "", "a matching site logs nothing"
 
 
 # --- tls.profile existing: the Secret, its host, its expiry ---------------------------
@@ -408,12 +408,23 @@ def test_an_existing_tls_secret_that_differs_from_the_files_is_refused_with_secr
 
 # --- ingress.profile reuse: the controller's namespace --------------------------------
 
-def test_a_controller_recognized_by_its_image_alone_passes(runtime, tmp_path):
+@pytest.mark.parametrize("name, image, recognized", [
+    ("edge-7f9c", "docker.io/library/traefik:v3.3.6", True),            # by its image alone
+    ("haproxy-edge-7f9c", "registry.example/edge/proxy:2.9", True),     # by its name alone
+    ("edge-7f9c", "registry.example/edge/proxy:2.9", False)])           # by neither
+def test_a_controller_is_recognized_by_its_name_or_its_image_alone(runtime, tmp_path, name, image, recognized):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
     crt, key = _self_signed(tmp_path, "served2")
-    _cluster(state, _tls_secret(crt, key), _pod("edge-7f9c", "docker.io/library/traefik:v3.3.6"))
-    _admitted(_checks(run), state)
+    _cluster(state, _tls_secret(crt, key), _pod(name, image))
+    result = _checks(run)
+    _admitted(result, state)
+    if recognized:
+        assert result.stderr == "", result.stderr
+    else:
+        line = _logged(result, "ingress.namespace gsj-ingress holds 1 Running Pod(s)", "none of them is an ingress controller",
+                       "The run goes on")
+        assert name not in line and "registry.example" not in line, line
 
 
 def test_an_ingress_namespace_that_does_not_exist_is_refused(runtime, tmp_path):
@@ -503,7 +514,9 @@ def test_a_reused_controller_in_the_target_namespace_itself_is_checked_there(run
     _baseline(tmp_path, state, work, _pod("ingress-nginx-controller-5d8f7c", "registry.k8s.io/ingress-nginx/controller:v1.12.1",
                                           namespace="synthetic-namespace"))
     _site(work, lambda s: s["ingress"].update(namespace="synthetic-namespace"))
-    _admitted(_checks(run), state)
+    result = _checks(run)
+    _admitted(result, state)
+    assert "Running Pod" not in result.stderr, result.stderr
     calls = json.loads(state.read_text())["calls"]
     assert ["get", "namespace", "synthetic-namespace", "-o", "name", "--ignore-not-found"] in calls, calls
 
