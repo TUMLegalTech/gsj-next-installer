@@ -139,9 +139,16 @@ def _pod(name, image, phase="Running", namespace="gsj-ingress"):
 CONTROLLER = _pod("ingress-nginx-controller-5d8f7c", "registry.k8s.io/ingress-nginx/controller:v1.12.1")
 
 
-def _ingress(namespace, name, host):
-    return {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": name, "namespace": namespace},
-            "spec": {"rules": [{"host": host}]}}
+def _ingress(namespace, name, host, class_name=None, annotated=None):
+    """class_name is spec.ingressClassName; annotated is the older
+    kubernetes.io/ingress.class annotation."""
+    ingress = {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": name, "namespace": namespace},
+               "spec": {"rules": [{"host": host}]}}
+    if class_name:
+        ingress["spec"]["ingressClassName"] = class_name
+    if annotated:
+        ingress["metadata"]["annotations"] = {"kubernetes.io/ingress.class": annotated}
+    return ingress
 
 
 def _site(work, change=None):
@@ -532,6 +539,47 @@ def test_an_ingress_of_another_deployment_on_the_same_host_is_refused_by_name(ru
     line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/other-web",
                     "two deployments cannot share one host", "public_url")
     assert "synthetic-release-web" not in line and "third-web" not in line
+
+
+@pytest.mark.parametrize("marked", ["field", "annotation"])
+def test_an_ingress_of_this_site_s_ingress_class_on_the_host_is_refused(runtime, tmp_path, marked):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST,
+                                              **{"class_name" if marked == "field" else "annotated": "gsj-ingress"}))
+    _refusal(_checks(run), state, "is already served by Ingress other-namespace/other-web", "ingress.class gsj-ingress",
+             "two deployments cannot share one host")
+
+
+def test_an_ingress_of_no_class_on_the_host_is_refused_as_the_cluster_s_default_may_be_this_site_s(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
+    result = _checks(run)
+    _refusal(result, state, "is already served by Ingress other-namespace/other-web", "or of no class")
+    assert "another controller" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("marked", ["field", "annotation"])
+def test_an_ingress_of_another_class_on_the_host_is_logged_and_passed(runtime, tmp_path, marked):
+    """Another controller serves it; this site's controller routes nothing to
+    it, so it is named in a log line and the run goes on."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST,
+                                              **{"class_name" if marked == "field" else "annotated": "nginx-public"}))
+    result = _checks(run)
+    _admitted(result, state)
+    line = _logged(result, "also served by another controller's Ingress other-namespace/other-web", f"public_url's host {HOST}",
+                   "nothing routes to it here", "The run goes on")
+    assert "nginx-public" not in line and "already served" not in result.stderr, line
+
+
+def test_ingresses_of_this_class_and_of_another_on_the_host_are_refused_and_logged_apart(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST, class_name="nginx-public"),
+              _ingress("third", "third-web", HOST, class_name="gsj-ingress"))
+    result = _checks(run)
+    line = _refusal(result, state, "is already served by Ingress third/third-web")
+    assert "other-namespace/other-web" not in line, line
+    _logged(result, "also served by another controller's Ingress other-namespace/other-web", "nothing routes to it here")
 
 
 def test_the_deployment_s_own_ingress_name_in_another_namespace_is_a_collision(runtime, tmp_path):

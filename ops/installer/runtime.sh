@@ -1337,7 +1337,7 @@ preflight_site_checks() {
  # credential may not make is logged and passed, as the capacity check does:
  # a namespace-scoped operator is a supported shape, and the later checks
  # still stand.
- local versions=$1 host secret existing crt key ca ns found pods controller counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
+ local versions=$1 host secret existing crt key ca ns found others class pods controller counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
  host=$(j '.public_url // ""' | sed -nE 's#^https://([^/:]+).*#\1#p')
  # kubectl is supported within one minor of the server (init's kubectl-skew
  # row). A kubectl this run downloaded is the release's pin, not the
@@ -1441,18 +1441,30 @@ preflight_site_checks() {
      (( controllers > 0 )) || log "ingress.namespace $ns holds $running Running Pod(s), and none of them is an ingress controller this check recognizes by its name, its image or the controller IngressClass $(j .ingress.class) names. The application's NetworkPolicy admits every Pod in that namespace to its web port, so a controller running there under another name is served all the same; if no controller runs there, the install stops at its public HTTPS route check once the application is up. The run goes on"
    fi
  fi
- # Two deployments cannot share one host: the controller routes it to one of
- # them, and the other's acceptance check fails hours in on a trust error.
- # Not a collision: this installation's own Ingress (an upgrade's); one
- # already being deleted; cert-manager's HTTP-01 solver Ingress (labelled
+ # Two deployments cannot share one host on one controller: it routes the
+ # host to one of them, and the other's acceptance check fails hours in on a
+ # trust error. A collision is an Ingress this site's controller would serve:
+ # its class (spec.ingressClassName, else the older kubernetes.io/ingress.class
+ # annotation) is ingress.class, or it names none and goes to the cluster's
+ # default class, which may be this site's. One of another class is another
+ # controller's, which this site's controller never routes: it is named in a
+ # log line, never by its class, and the run goes on. Not a collision either:
+ # this installation's own Ingress (an upgrade's); one already being deleted;
+ # cert-manager's HTTP-01 solver Ingress (labelled
  # acme.cert-manager.io/http01-solver), which serves public_url's host from
  # this namespace while a renewal is pending, and removing it would only
  # fight cert-manager; one without rules, which serves no host.
  if [[ -n $host ]]; then
-   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(.metadata.deletionTimestamp==null and .metadata.labels["acme.cert-manager.io/http01-solver"]!="true")|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))|"\(.metadata.namespace)/\(.metadata.name)"]|unique|join(", ")' 2>/dev/null); then
+   class=$(j .ingress.class)
+   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" --arg class "$class" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(.metadata.deletionTimestamp==null and .metadata.labels["acme.cert-manager.io/http01-solver"]!="true")|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))
+       |{name:"\(.metadata.namespace)/\(.metadata.name)", ours:((.spec.ingressClassName // .metadata.annotations["kubernetes.io/ingress.class"] // "")|IN("",$class))}]
+       |"\(map(select(.ours).name)|unique|join(", "))|\(map(select(.ours|not).name)|unique|join(", "))"' 2>/dev/null); then
      log "public_url's host $host was not checked against other Ingresses: this credential could not list Ingresses cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-ingresses.err). If another deployment serves $host, the acceptance check fails on it hours in rather than here"
-   elif [[ -n $found ]]; then
-     fail "public_url's host $host is already served by Ingress $found: two deployments cannot share one host. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"
+   else
+     # One line, "COLLISIONS|OTHERS": no namespace or Ingress name holds a "|".
+     IFS='|' read -r found others <<< "$found"
+     [[ -z $others ]] || log "public_url's host $host is also served by another controller's Ingress $others; nothing routes to it here, because its class is not ingress.class $class. Clients reach this deployment only where $host's address leads to this site's controller. The run goes on"
+     [[ -z $found ]] || fail "public_url's host $host is already served by Ingress $found, of ingress.class $class or of no class: two deployments cannot share one host on one controller. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"
    fi
  fi
  # Leftover managed add-on CRDs: cluster-scoped, so they outlive the add-on's
