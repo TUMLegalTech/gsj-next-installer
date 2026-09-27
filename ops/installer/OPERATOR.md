@@ -66,7 +66,8 @@ runs without that capability — scanned pages are not read, or the agent cannot
 answer — until you set the endpoint and run `install` again (the LLM can also be
 set per case, in the lawyer's Einstellungen — under the closed outbound list
 only an origin whose address is on the list, an `llm.allowed_origins` entry,
-is reachable). Skipping is never quiet and never
+is reachable, and an origin listed there also receives the site's LLM API
+key, so list only origins that may hold it). Skipping is never quiet and never
 a setting: an endpoint that is configured and answers is always exercised, and
 must pass. **Your OCR endpoint must be able to read an image**, further down
 this step, has the probe and the reasons. It need not be a second server: nothing in the site file ties `ocr.*` to `llm.*`, so if the

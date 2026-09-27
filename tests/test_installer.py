@@ -2086,13 +2086,14 @@ def test_a_name_this_machine_cannot_resolve_is_said_never_refused(runtime, tmp_p
     assert cidrs == {"203.0.113.%d/32" % (sum(other.encode()) % 200 + 10)}
 
 
-@pytest.mark.parametrize("command", ["resume", "repair", "restore-repair", "backup", "sweep", "abandon", "credential-repair"])
+@pytest.mark.parametrize("command", ["resume", "restore-repair", "backup", "sweep", "abandon", "credential-repair"])
 def test_a_continued_or_non_applying_command_reuses_the_recorded_outbound_list(runtime, tmp_path, command):
     """Once an operation has recorded its values, every later run of it —
     and every verb that applies nothing — compiles the very same list, so
-    the byte comparisons of resume, repair and the restore program hold
-    whatever this machine's resolver answers today, and a backup never
-    depends on it. The resolver is not asked at all."""
+    the byte comparisons of resume and the restore program hold whatever
+    this machine's resolver answers today, and a backup never depends on
+    it. The resolver is not asked at all. (A repair is the exception: it
+    may carry a corrected endpoint, so it resolves the site it is given.)"""
     run, state, work = runtime
     payload = _payload_for_compile(tmp_path)
     recorded = [{"cidr": "198.51.100.7/32", "port": 443}]
@@ -3749,7 +3750,52 @@ def test_a_dependency_deadline_under_two_minutes_is_said_at_compile(runtime, tmp
     site = json.loads((work / "site.json").read_text()); site["deadlines"]["dependencies_seconds"] = 60
     (work / "site.json").write_text(json.dumps(site))
     result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
-    assert result.returncode == 0 and "deadlines.dependencies_seconds is 60" in result.stderr and "may expire before the marker appears" in result.stderr, result.stderr
+    assert result.returncode == 0 and "deadlines.dependencies_seconds is 60" in result.stderr and "counts from the pod's start" in result.stderr and "likely to expire once" in result.stderr, result.stderr
     site["deadlines"]["dependencies_seconds"] = 120; (work / "site.json").write_text(json.dumps(site))
     result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
     assert result.returncode == 0 and "dependencies_seconds" not in result.stderr, result.stderr
+
+
+def test_a_repair_resolves_the_site_it_is_given_once_and_keeps_that_list(runtime, tmp_path):
+    """A repair is the cure for a wrong endpoint: it resolves the endpoints
+    of the site it is given, not the list the operation recorded, so a
+    corrected llm.base_url reaches the pod; the answer is kept under the
+    operation, so a re-entering repair compares the same bytes."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    (work / "values.pending.json").write_text(json.dumps({"networkPolicy": {"egress": {"endpoints": [{"cidr": "198.51.100.7/32", "port": 443}]}}}))
+    site = json.loads((work / "site.json").read_text()); site["llm"]["base_url"] = "https://corrected.example/v1"
+    (work / "site.json").write_text(json.dumps(site))
+    program = 'COMMAND=repair; RESUME_ID=aaaaaaaaaaaaaaaaaaaaaaaa; STATE_DIR="$TEST_WORK/state"; mkdir -p "$STATE_DIR"; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n'
+    result = run(program, TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0, result.stderr
+    endpoints = json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+    corrected = {"cidr": "203.0.113.%d/32" % (sum(b"corrected.example") % 200 + 10), "port": 443}
+    assert corrected in endpoints and {"cidr": "198.51.100.7/32", "port": 443} not in endpoints
+    asked = list(json.loads(state.read_text())["resolved"])
+    result = run(program, TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0 and json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"] == endpoints
+    assert json.loads(state.read_text())["resolved"] == asked, "the second run reused the kept list"
+
+
+def test_a_proxied_endpoint_is_judged_by_the_proxys_rule_alone(runtime):
+    """When the site's proxy routes the endpoint, the pod dials the proxy:
+    an endpoint whose own address is on the list while the proxy's is not
+    is not admitted, and the assertion is not held."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": ""}))
+    site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = "proxies.json"
+    (work / "site.json").write_text(json.dumps(site))
+    result = run(NETWORK_VERIFY)   # the applied list carries the endpoints' own addresses, not the proxy's
+    assert result.returncode == 0, result.stderr
+    assert json.loads((work / "network-check.json").read_text())["egress"]["asserted"] == {"llm": False, "ocr": False, "isolation": False}
+
+
+def test_a_no_proxy_glob_entry_matches_every_host_without_touching_the_directory(runtime):
+    """A '*' entry in NO_PROXY means every host: it is read as that, never
+    expanded against the installer's working directory."""
+    run, state, work = runtime
+    (work / "afile").write_text("")
+    result = run('cd "$TEST_WORK"; no_proxy_covers llm.example "*" && echo covered; no_proxy_covers llm.example "a*" && echo wrongly || echo not-covered\n')
+    assert result.returncode == 0 and result.stdout.split() == ["covered", "not-covered"], (result.stdout, result.stderr)

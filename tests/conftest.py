@@ -45,6 +45,8 @@ import tempfile
 _SYNTHETIC_GETENT = """#!/usr/bin/env python3
 import ipaddress, json, os, pathlib, sys
 a = sys.argv[1:]
+# the runtime ends the options with "--" so a name starting with "-" is a name; glibc's getent reads it the same way
+if len(a) >= 2 and a[1] == "--": del a[1]
 if a[:1] not in (["ahosts"], ["ahostsv6"]) or len(a) != 2: sys.exit(1)
 # a machine without IPv6 answers nothing for any IPv6 query, a literal included, when a test's state says so
 if a[0] == "ahostsv6":

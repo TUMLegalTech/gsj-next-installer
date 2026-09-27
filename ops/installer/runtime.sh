@@ -1287,7 +1287,8 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
      # the resolver does answer is the canonical form, and is taken
      ( LC_ALL=C; ipv6_literal_ok "$host" "$ipv4" ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
      if command -v getent >/dev/null 2>&1; then
-       local parsed; parsed=$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+       local parsed; parsed=$(getent ahostsv6 -- "$host" 2>/dev/null | awk 'NR==1{print $1}')
+       [[ $parsed =~ $ipv6 || $parsed =~ $ipv4 ]] || parsed=''
        [[ -z $parsed ]] || host=$parsed
      fi
    fi
@@ -1312,7 +1313,7 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
        log "$shown resolves to $address on this machine, an address the pod could never reach; the gsj pod gets no outbound rule for that answer"; continue
      fi
      if [[ $address == *:* ]]; then cidrs+=("$address/128"); else cidrs+=("$address/32"); fi
-   done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+   done < <(getent ahosts -- "$host" 2>/dev/null | awk '{print $1}' | sort -u | grep -E '^([0-9.]+|[0-9A-Fa-f:.]+)$' || true)
    if (( ! ${#cidrs[@]} )); then
      if [[ $host == *.svc || $host == *.svc.* ]]; then
        log "$shown names an in-cluster Service; this release's outbound list admits addresses outside the cluster only, so the gsj pod gets no rule for it"
@@ -1325,9 +1326,12 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  for cidr in "${cidrs[@]}"; do for p in $ports; do jq -n --arg cidr "$cidr" --argjson port "$((10#$p))" '{cidr:$cidr,port:$port}'; done; done
 }
 egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --argjson egress_endpoints
- local site=$1 fresh=0 recorded urls key url
- case ${COMMAND:-} in install|upgrade|restore) fresh=1;; esac
- if (( ! fresh )); then
+ local site=$1 fresh=0 replacement=0 recorded urls key url
+ case ${COMMAND:-} in install|upgrade|restore) fresh=1;; repair) replacement=1;; esac
+ # a repair may carry a changed site (a corrected endpoint is what a repair
+ # is for), so it resolves the site it is given — once, kept under its
+ # operation below — instead of the list the operation recorded
+ if (( ! fresh && ! replacement )); then
    # the operation being continued recorded its list in its intent; before
    # that, or for a verb that continues nothing, the retained values
    for recorded in "${STATE_DIR:-}/operation-intents/${RESUME_ID:-}/values.json" "${STATE_DIR:-}/values.pending.json"; do
@@ -1363,7 +1367,7 @@ compile_values() { # merged site file -> the chart's values on stdout: compile.j
  # provisioning Job's write: a dependency deadline near the schema's floor
  # would expire first, and is said so here
  local deadline; deadline=$(jq -r '.deadlines.dependencies_seconds // 0' "$1" 2>/dev/null || echo 0)
- [[ ! $deadline =~ ^[0-9]+$ ]] || (( deadline == 0 || deadline >= 120 )) || log "deadlines.dependencies_seconds is $deadline: the gsj pod's ready marker reaches it through a mounted ConfigMap, which the kubelet refreshes within about 80 s of the provisioning Job's write, so a deadline under 120 s may expire before the marker appears"
+ [[ ! $deadline =~ ^[0-9]+$ ]] || (( deadline == 0 || deadline >= 120 )) || log "deadlines.dependencies_seconds is $deadline: the gsj pod's ready marker reaches it through a mounted ConfigMap on the kubelet's next pod sync (60-90 s with the default sync period, longer where it is raised), and the deadline counts from the pod's start, so it must also cover the provisioning Job's run; an expiry only restarts wait-deps, which then finds the marker — a deadline under 120 s is likely to expire once"
  local endpoints; endpoints=$(egress_endpoints "$1") || exit 1
  jq --slurpfile release "$GSJ_PAYLOAD/release.json" --argjson egress_endpoints "$endpoints" -f "$GSJ_PAYLOAD/compile.jq" "$1"
 }
@@ -4344,7 +4348,8 @@ network_verify() {
      egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
              isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
 }
-no_proxy_covers() { # host, the proxy file's NO_PROXY -> 0 when the pod dials the host directly (the pod's list carries the cluster names too)
+no_proxy_covers() ( # host, the proxy file's NO_PROXY -> 0 when the pod dials the host directly (the pod's list carries the cluster names too); a subshell, so no glob expands and no option leaks
+ set -f
  local host=$1 entry
  local IFS=','
  for entry in $2 localhost .localhost 127.0.0.1 .svc .cluster.local "$RELEASE-forgejo" "$RELEASE-chroma"; do
@@ -4354,7 +4359,7 @@ no_proxy_covers() { # host, the proxy file's NO_PROXY -> 0 when the pod dials th
    [[ $host == "$entry" || $host == *".$entry" ]] && return 0
  done
  return 1
-}
+)
 endpoint_admitted() { # site key, URL -> 0 when the applied values admit the pod's dial: an IPv4 literal the chart derives, an address the name resolves to now (any one, since answer sets rotate), or the proxy the site routes the scheme through
  local rest authority host want proxy='' pfile
  rest=${2#*://}; authority=${rest%%[/?#]*}; authority=${authority##*@}
@@ -4363,9 +4368,12 @@ endpoint_admitted() { # site key, URL -> 0 when the applied values admit the pod
  pfile=$(j '.trust.proxy_file // ""')
  if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && proxy=$(jq -r --arg url "$2" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$pfile" 2>/dev/null); fi
  # a host the file's NO_PROXY covers is dialled directly, whatever proxy the scheme has
+ # the pod dials the proxy, not the endpoint: the proxy's rule decides alone
  if [[ -n $proxy ]] && ! no_proxy_covers "$host" "$(jq -r '.NO_PROXY // ""' "$pfile" 2>/dev/null)"; then
-   want=$(resolve_endpoint trust.proxy_file "$proxy" 2>/dev/null | jq -s '.') && [[ $want != '[]' ]] \
-     && jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1 && return 0
+   want=$(resolve_endpoint trust.proxy_file "$proxy" 2>/dev/null | jq -s '.') || return 1
+   [[ $want != '[]' ]] || return 1
+   jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1
+   return
  fi
  want=$(resolve_endpoint "$1" "$2" 2>/dev/null | jq -s '.') || return 1
  [[ $want != '[]' ]] || return 1
