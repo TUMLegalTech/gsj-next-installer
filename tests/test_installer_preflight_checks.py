@@ -898,11 +898,19 @@ def test_a_site_that_selects_no_managed_add_on_does_not_list_crds(runtime, tmp_p
 SKEWED = {"clientVersion": {"gitVersion": "v1.30.2"}, "serverVersion": {"gitVersion": "v1.33.6+k3s1"}}
 
 
-def test_a_fetched_kubectl_more_than_one_minor_from_the_server_is_refused(runtime, tmp_path):
+@pytest.mark.parametrize("fetched", ["helm kubectl jq", "kubectl"])
+def test_a_fetched_kubectl_more_than_one_minor_from_the_server_is_refused(runtime, tmp_path, fetched):
+    """The remedy works on a machine with no kubectl of its own, or one below
+    the floor, where client_preflight points at --fetch-tools=kubectl: every
+    --fetch-tools that fetches kubectl brings this same pin back, so a kubectl
+    within one minor is installed here first."""
     run, state, work = runtime
     _baseline(tmp_path, state, work)
-    line = _refusal(_checks(run, SKEWED, before='FETCH_SET="helm kubectl jq"\n'), state,
-                    "1.30.2", "1.33.6", "without --fetch-tools", "--fetch-tools=helm")
+    line = _refusal(_checks(run, SKEWED, before=f'FETCH_SET="{fetched}"\n'), state,
+                    "the kubectl --fetch-tools downloaded for this run is 1.30.2 and the server is 1.33.6",
+                    "any --fetch-tools that fetches kubectl downloads it again",
+                    "Install a kubectl within one minor of 1.33.6 on this machine, then run without --fetch-tools,"
+                    " or with --fetch-tools=helm, which fetches only Helm and keeps this machine's kubectl")
     assert "k3s1" not in line
 
 

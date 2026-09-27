@@ -1353,15 +1353,19 @@ preflight_site_checks() {
  host=$(j '.public_url // ""' | sed -nE 's#^https://([^/:@?\#]+)(:[0-9]+)?([/?\#].*)?$#\1#p')
  # kubectl is supported within one minor of the server (init's kubectl-skew
  # row). A kubectl this run downloaded is the release's pin, not the
- # operator's choice, so a skew there is refused with the way to keep this
- # machine's own; a skew in this machine's own kubectl is said, and the run
- # goes on. Only the numbers are repeated: a gitVersion is what the server says.
+ # operator's choice, so a skew there is refused; a skew in this machine's own
+ # kubectl is said, and the run goes on. The refusal names installing a
+ # kubectl here first: every --fetch-tools that fetches kubectl brings the same
+ # pin back, and a machine with no kubectl of its own, or one below the floor,
+ # is sent to --fetch-tools=kubectl by client_preflight, so running without
+ # --fetch-tools, or with --fetch-tools=helm, works only once one is installed.
+ # Only the numbers are repeated: a gitVersion is what the server says.
  client=$(jq -r '.clientVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
  server=$(jq -r '.serverVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
  if [[ $client =~ ^v?([0-9]+\.([0-9]+)(\.[0-9]+)?) ]]; then cv=${BASH_REMATCH[1]}; cm=${BASH_REMATCH[2]}; fi
  if [[ $server =~ ^v?([0-9]+\.([0-9]+)(\.[0-9]+)?) ]]; then sv=${BASH_REMATCH[1]}; sm=${BASH_REMATCH[2]}; fi
  if [[ -n $cv && -n $sv ]] && (( 10#$cm - 10#$sm > 1 || 10#$sm - 10#$cm > 1 )); then
-   [[ " ${FETCH_SET:-} " != *" kubectl "* ]] || fail "kubectl version skew: the kubectl --fetch-tools downloaded for this run is $cv and the server is $sv, more than one minor apart, and kubectl is supported within one minor of the server. Run without --fetch-tools to use this machine's kubectl, or with --fetch-tools=helm, which fetches only Helm and keeps this machine's kubectl"
+   [[ " ${FETCH_SET:-} " != *" kubectl "* ]] || fail "kubectl version skew: the kubectl --fetch-tools downloaded for this run is $cv and the server is $sv, more than one minor apart, and kubectl is supported within one minor of the server; it is this release's pinned kubectl, and any --fetch-tools that fetches kubectl downloads it again. Install a kubectl within one minor of $sv on this machine, then run without --fetch-tools, or with --fetch-tools=helm, which fetches only Helm and keeps this machine's kubectl"
    log "kubectl $cv is more than one minor from the server ($sv), and kubectl is supported within one minor of the server. The run goes on with it; if a step fails on it, install a kubectl within one minor of $sv"
  fi
  # The operator Secret, when it exists, must hold this password file's
