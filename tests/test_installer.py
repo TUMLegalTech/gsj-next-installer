@@ -3210,7 +3210,7 @@ def test_a_foreign_source_verification_verdict_listed_first_neither_restarts_nor
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
                                         waiting=[_with_verdict(_foreign_pod(), "source-verification-failed"),
                                                  _application_pod(own)])
-    assert "not the application Pod" not in result.stderr and "stopped terminally" not in result.stderr, result.stderr
+    assert "could not be recreated" not in result.stderr and "stopped terminally" not in result.stderr, result.stderr
     assert result.stderr.count(FOREIGN_NOT_OWNED) == result.stdout.count(OWN_PROGRESS) >= 1, result.stderr
     if own == "waiting":
         assert result.returncode == 0, result.stderr

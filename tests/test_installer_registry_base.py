@@ -253,32 +253,73 @@ def test_managed_addon_images_are_named_as_unmoved_not_silently_left_behind(runt
     assert "docker.io/traefik@sha256:" in result.stderr
     assert "cert-manager" not in result.stderr and "busybox" not in result.stderr, "only the add-ons this site SELECTS"
 
-
 # --- the pull probe: the node's own runtime answers, by name ------------------------
 
+# The fake serves the probe's Pods one at a time, as the probe creates them:
+# the i-th create is answered from status-<i>.json, from that Pod's m-th poll
+# on by status-<i>-after-<m>.json when there is one, and every create and
+# delete is logged in order to events. ADMIT is where a test puts the
+# namespace's admission in front of a create.
+ADMIT = 'create) doc=$(cat)'
 PROBE_PRELUDE = '''
 GSJ_PAYLOAD="{payload}"; OPERATION=aaaaaaaaaaaabbbbbbbbbbbb; CONFIG="$TEST_WORK/site.json"
-trap 'echo "HINT=${{RECOVERY_HINT:-}}" >&2' EXIT      # what cleanup_exit would print as the next step
+# what cleanup_exit would remove, and what it would print as the next step
+trap 'echo "PROBE_POD=${{PROBE_POD:-}}" >&2; echo "HINT=${{RECOVERY_HINT:-}}" >&2' EXIT
 sleep() {{ :; }}
 k() {{
   case "$1" in
-    create) cat > "$TEST_WORK/probe-pod.json";;
+    ''' + ADMIT + '''
+            i=$(( $(cat "$TEST_WORK/creates" 2>/dev/null || echo 0) + 1 )); echo "$i" > "$TEST_WORK/creates"
+            printf '%s' "$doc" > "$TEST_WORK/probe-pod-$i.json"
+            echo "create $(jq -r .metadata.name <<< "$doc")" >> "$TEST_WORK/events";;
     get) n=$(cat "$TEST_WORK/polls" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$TEST_WORK/polls"
-         if [ -f "$TEST_WORK/status-after-$n.json" ]; then cp "$TEST_WORK/status-after-$n.json" "$TEST_WORK/status.json"; fi
+         i=$(cat "$TEST_WORK/creates"); m=$(cat "$TEST_WORK/polls-$i" 2>/dev/null || echo 0); m=$((m+1)); echo "$m" > "$TEST_WORK/polls-$i"
+         if [ -f "$TEST_WORK/status-$i-after-$m.json" ]; then cp "$TEST_WORK/status-$i-after-$m.json" "$TEST_WORK/status-$i.json"; fi
          # each container's status reports the image its own container in the Pod asked for, as the kubelet
          # does for a pull it has not finished: a refusal can only name the reference the probe composed
-         jq --slurpfile pod "$TEST_WORK/probe-pod.json" '($pod[0].spec.containers|map({{key:.name,value:.image}})|from_entries) as $asked
-           | if .status.containerStatuses then .status.containerStatuses[] |= (.image = $asked[.name]) else . end' "$TEST_WORK/status.json";;
-    delete) echo deleted >> "$TEST_WORK/deletes";;
+         jq --slurpfile pod "$TEST_WORK/probe-pod-$i.json" '($pod[0].spec.containers|map({{key:.name,value:.image}})|from_entries) as $asked
+           | if .status.containerStatuses then .status.containerStatuses[] |= (.image = $asked[.name]) else . end' "$TEST_WORK/status-$i.json";;
+    delete) echo "$*" >> "$TEST_WORK/events";;
   esac
 }}
 '''
 
 
-def _statuses(states):
-    return json.dumps({"status": {"containerStatuses": [
-        {"name": "pull-" + role.lower(), "state": state}
-        for role, state in zip(ROLES, states)]}})
+def _pod_status(pod, state):
+    """What the API reports for the pod-th probe Pod: its one container in
+    this state, or a whole Pod status given as JSON text."""
+    if isinstance(state, str):
+        return state
+    return json.dumps({"status": {"containerStatuses": [{"name": "pull-" + ROLES[pod - 1].lower(), "state": state}]}})
+
+
+def _queue(work, states, after=()):
+    """The status each of the six probe Pods is answered with, in the
+    release's image order; after: {(pod, poll): state}, that Pod's status from
+    its poll-th poll on. A previous run's queue and counters are cleared."""
+    for stale in [*work.glob("status-*.json"), *work.glob("polls*"), *work.glob("probe-pod-*.json"),
+                  work / "creates", work / "events"]:
+        stale.unlink(missing_ok=True)
+    for pod, state in enumerate(states, 1):
+        (work / f"status-{pod}.json").write_text(_pod_status(pod, state))
+    for (pod, poll), state in dict(after).items():
+        (work / f"status-{pod}-after-{poll}.json").write_text(_pod_status(pod, state))
+
+
+def _pods(work):
+    """Every probe Pod the probe created, in the order it created them."""
+    created = int((work / "creates").read_text()) if (work / "creates").exists() else 0
+    return [json.loads((work / f"probe-pod-{i}.json").read_text()) for i in range(1, created + 1)]
+
+
+def _refs(release, base=BASE):
+    """The reference the probe composes for each image, in the release's order."""
+    return [(base + "/" + value["repository"].rsplit("/", 1)[1] if base else value["repository"]) + "@" + value["digest"]
+            for value in release["images"].values()]
+
+
+def _images(work):
+    return [container["image"] for pod in _pods(work) for container in pod["spec"]["containers"]]
 
 
 PULLED = {"terminated": {"reason": "StartError", "exitCode": 128}}
@@ -302,14 +343,13 @@ def test_without_a_base_the_probe_proves_the_release_s_own_repositories_by_diges
     out the initialization deadline, hours in. The probe asks the node first,
     for every site."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    _queue(work, [PULLED] * 6)
     release, result = _probe(run, work, tmp_path, base="")
     assert result.returncode == 0, result.stderr
-    pod = json.loads((work / "probe-pod.json").read_text())
-    assert sorted(c["image"] for c in pod["spec"]["containers"]) == sorted(
-        v["repository"] + "@" + v["digest"] for v in release["images"].values()), "the six release repositories, by digest"
-    assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
-    assert pod["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "synthetic-node"}
+    assert _images(work) == _refs(release, base=""), "the six release repositories, by digest"
+    for pod in _pods(work):
+        assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
+        assert pod["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "synthetic-node"}
     assert "Proving node synthetic-node can pull all 6 images from the release's own repositories" in result.stderr
     assert "All 6 images pulled from the release's own repositories" in result.stderr
     assert "registry.base" not in result.stderr, "a site that never set it is not told about it"
@@ -317,37 +357,56 @@ def test_without_a_base_the_probe_proves_the_release_s_own_repositories_by_diges
 
 def test_the_probe_names_all_six_relocated_digests_on_the_storage_node_with_the_pull_secret(runtime, tmp_path):
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    _queue(work, [PULLED] * 6)
     release, result = _probe(run, work, tmp_path)
     assert result.returncode == 0, result.stderr
-    pod = json.loads((work / "probe-pod.json").read_text())
-    images = sorted(container["image"] for container in pod["spec"]["containers"])
-    assert images == sorted(BASE + "/" + release["images"][role]["repository"].rsplit("/", 1)[1] + "@" + release["images"][role]["digest"]
-                            for role in ROLES)
-    assert pod["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "synthetic-node"}, "another node's cache proves nothing"
-    assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
-    assert pod["spec"]["restartPolicy"] == "Never"
-    labels = pod["metadata"]["labels"]
-    assert labels == {"gsj.io/pull-probe": "synthetic-release"}, (
-        "restore refuses a target holding Pods labelled gsj.io/owner or app.kubernetes.io/instance; "
-        "the probe Pod is not part of the deployment and must not look like it")
-    assert pod["spec"]["activeDeadlineSeconds"] == 900 + 300
-    assert (work / "deletes").exists(), "the probe Pod is removed on success"
+    assert _images(work) == _refs(release)
+    for pod in _pods(work):
+        assert pod["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "synthetic-node"}, "another node's cache proves nothing"
+        assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
+        assert pod["spec"]["restartPolicy"] == "Never"
+        assert pod["metadata"]["labels"] == {"gsj.io/pull-probe": "synthetic-release"}, (
+            "restore refuses a target holding Pods labelled gsj.io/owner or app.kubernetes.io/instance; "
+            "the probe Pod is not part of the deployment and must not look like it")
+        assert pod["spec"]["activeDeadlineSeconds"] == 900 + 300
     assert "All 6 images pulled" in result.stderr
+
+
+def test_the_six_images_are_proven_one_pod_at_a_time_each_deleted_before_the_next_is_created(runtime, tmp_path):
+    """Six containers in one Pod asked for six times one container's request
+    at once, beside the running deployment. One image per Pod, created,
+    judged and deleted in turn -- the kubelet pulls one image at a time on a
+    node anyway -- asks for one container's request at any moment. An
+    earlier run's Pod is removed by the label first; each Pod is deleted,
+    and its deletion waited for, before the next is created, so the
+    scheduler never counts two."""
+    run, _, work = runtime
+    _queue(work, [PULLED] * 6)
+    release, result = _probe(run, work, tmp_path)
+    assert result.returncode == 0, result.stderr
+    pods = _pods(work)
+    assert [len(pod["spec"]["containers"]) for pod in pods] == [1] * 6
+    names = [pod["metadata"]["name"] for pod in pods]
+    assert names == ["gsj-pull-aaaaaaaaaaaa-" + role.lower() for role in ROLES]
+    events = (work / "events").read_text().splitlines()
+    assert events[0] == "delete pod -l gsj.io/pull-probe=synthetic-release --ignore-not-found --wait=true --timeout=60s"
+    assert events[1:] == [line for name in names
+                          for line in ("create " + name, f"delete pod {name} --ignore-not-found --wait=true --timeout=60s")]
+    assert "PROBE_POD=\n" in result.stderr, "no Pod is left for cleanup_exit once all six pulled"
 
 
 def test_a_registry_that_does_not_hold_the_digest_is_refused_by_the_condition_the_kubelet_reported(runtime, tmp_path):
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
-    _, result = _probe(run, work, tmp_path)
+    _queue(work, [PULLED] * 5 + [BACKOFF])
+    release, result = _probe(run, work, tmp_path)
     assert result.returncode != 0
     assert "registry.base (" + BASE + ")" in result.stderr
-    assert "1 of 6 images" in result.stderr
+    assert "image 6 of 6, " + _refs(release)[5] + " (5 pulled before it, 0 not yet tried)" in result.stderr
     assert "does not hold" in result.stderr and "manifest unknown" not in result.stderr, \
         "the cause is the CONDITION the runtime's message establishes, never its words (a review finding)"
     assert "Helm has applied nothing in this run" in result.stderr, (
         "true on every chain; 'nothing was applied' was false on a repair of a quiesced deployment")
-    assert (work / "deletes").exists(), "the probe Pod is removed on refusal too"
+    assert "PROBE_POD=gsj-pull-aaaaaaaaaaaa-decisionsdata\n" in result.stderr, "cleanup_exit removes the failing image's Pod"
     # The cure is a CHANGED site file. `resume` refuses a changed site by design, so
     # naming it first (the default hint) would send the operator into a second refusal;
     # and on a FIRST install a repair would complete it without the storage check, so the
@@ -357,48 +416,71 @@ def test_a_registry_that_does_not_hold_the_digest_is_refused_by_the_condition_th
     assert "180 s" in hint, "measured on the pilot host: a repair 110 s after the stop was refused as 'still live'"
 
 
-def test_six_failures_are_one_fact_said_once_not_six_times(runtime, tmp_path):
+def test_a_failure_every_image_would_meet_is_refused_at_the_first_image_and_said_once(runtime, tmp_path):
     """Measured on a proof deployment: a wrong prefix fails all six, and
     containerd's message repeats the reference three times -- 2.5 KB of one fact.
-    Every image is named; the condition the runtime reported is named once
-    (its words never: a review finding, they are kept in the state directory)."""
+    The first image's Pod meets it and the probe stops there: the image is
+    named, the condition the runtime reported is named once (its words never:
+    a review finding, they are kept in the state directory), and no other
+    image's Pod is created."""
     run, _, work = runtime
     words = "rpc error: code = NotFound desc = failed to pull and unpack image: not found " * 3
-    (work / "status.json").write_text(_statuses([{"waiting": {"reason": "ImagePullBackOff", "message": words}}] * 6))
-    _, result = _probe(run, work, tmp_path)
+    _queue(work, [{"waiting": {"reason": "ImagePullBackOff", "message": words}}] * 6)
+    release, result = _probe(run, work, tmp_path)
     assert result.returncode != 0
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
-    assert "6 of 6 images" in refusal
+    assert "image 1 of 6, " + _refs(release)[0] + " (0 pulled before it, 5 not yet tried)" in refusal
     assert refusal.count("rpc error") == 0 and refusal.count("does not hold") == 1, "the condition once; the runtime's words never"
     assert words in (work / "pull-probe-status.json").read_text()
     assert len(refusal) < 1800
+    assert len(_pods(work)) == 1
 
 
 @pytest.mark.parametrize("base", ["", BASE], ids=["release-repositories", "relocated"])
-def test_a_pull_failure_names_the_failing_container_s_own_reference(runtime, tmp_path, base):
-    """Each container's status reports the image its own container asked for,
-    so the refusal names the reference the probe composed for the one image
-    that failed -- relocated under registry.base or the release's own -- and
-    none of the five that pulled."""
+def test_a_pull_failure_names_the_failing_image_s_own_reference(runtime, tmp_path, base):
+    """One image per Pod: the refusal names the reference the probe composed
+    for the image that failed -- relocated under registry.base or the
+    release's own -- and none of the others."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED, BACKOFF] + [PULLED] * 4))      # the runner's pull fails
+    _queue(work, [PULLED, BACKOFF] + [PULLED] * 4)      # the runner's pull fails
     release, result = _probe(run, work, tmp_path, base=base)
     assert result.returncode != 0
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
     runner = release["images"]["runner"]
     own = (BASE + "/gsj-agent-runner" if base else runner["repository"]) + "@" + runner["digest"]
-    assert "1 of 6 images: " + own + ". " in refusal, refusal
+    assert "image 2 of 6, " + own + " (1 pulled before it, 4 not yet tried). " in refusal, refusal
     for role in ROLES:
         if role != "runner":
             assert release["images"][role]["digest"] not in refusal, role
+
+
+def test_the_second_image_failing_definitively_is_refused_by_its_own_name_after_the_first_pulled(runtime, tmp_path):
+    """The web image pulls, its Pod is deleted, and the runner's Pod meets a
+    refused credential: refused 90 s after its own first report, by the
+    runner's reference and the condition, with no Pod created for the four
+    after it; cleanup_exit is left the runner's Pod to remove."""
+    run, _, work = runtime
+    unauthorized = {"waiting": {"reason": "ErrImagePull", "message": "failed to authorize: 401 Unauthorized"}}
+    _queue(work, [PULLED, unauthorized] + [PULLED] * 4)
+    release, result = _probe(run, work, tmp_path)
+    assert result.returncode != 0
+    assert _polls(work) == 1 + 19, "the web image on its first poll, the runner refused on its 19th: 90 s"
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert "the node cannot pull this release from registry.base (" + BASE + "): image 2 of 6, " + _refs(release)[1] in refusal, refusal
+    assert "(1 pulled before it, 4 not yet tried). The container runtime reported the registry refused the pull (unauthorized" in refusal, refusal
+    assert release["images"]["web"]["digest"] not in refusal
+    events = (work / "events").read_text().splitlines()
+    assert events[1:] == ["create gsj-pull-aaaaaaaaaaaa-web",
+                          "delete pod gsj-pull-aaaaaaaaaaaa-web --ignore-not-found --wait=true --timeout=60s",
+                          "create gsj-pull-aaaaaaaaaaaa-runner"], events
+    assert "PROBE_POD=gsj-pull-aaaaaaaaaaaa-runner\n" in result.stderr
 
 
 def test_a_registry_that_stumbles_once_is_not_refused(runtime, tmp_path):
     """The kubelet retries with backoff. A refusal on the first ErrImagePull
     would be a false refusal of a healthy site."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
-    (work / "status-after-6.json").write_text(_statuses([PULLED] * 6))      # recovers on a retry, 30 s in
+    _queue(work, [PULLED] * 5 + [BACKOFF], after={(6, 7): PULLED})      # recovers on a retry, 30 s in
     _, result = _probe(run, work, tmp_path)
     assert result.returncode == 0, result.stderr
     assert "All 6 images pulled" in result.stderr
@@ -420,27 +502,23 @@ def test_a_base_that_is_REMOVED_on_upgrade_is_probed_not_waved_through(runtime, 
     already scaled the application to zero."""
     run, _, work = runtime
     _installed(work, BASE)                                   # installed WITH a base
-    (work / "status.json").write_text(_statuses([BACKOFF] * 6))
+    _queue(work, [PULLED] * 5 + [BACKOFF])
     release, result = _probe(run, work, tmp_path, base="")   # upgraded WITHOUT one
     assert result.returncode != 0, "a changed image location must be proven, whichever way it changed"
-    pod = json.loads((work / "probe-pod.json").read_text())
-    assert sorted(c["image"] for c in pod["spec"]["containers"]) == sorted(
-        v["repository"] + "@" + v["digest"] for v in release["images"].values()), "it probes the UN-relocated references"
+    assert _images(work) == _refs(release, base=""), "it probes the UN-relocated references"
     assert "no longer sets registry.base" in result.stderr and BASE in result.stderr
 
 
 def test_an_unchanged_empty_base_is_probed_and_a_failure_names_the_release_s_own_repositories(runtime, tmp_path):
     run, _, work = runtime
     _installed(work, None)                                   # recorded before the field existed
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    _queue(work, [PULLED] * 5 + [BACKOFF])
     release, result = _probe(run, work, tmp_path, base="")
     assert result.returncode != 0, "an upgrade of a plain site proves its pulls before the backup quiesces it"
-    pod = json.loads((work / "probe-pod.json").read_text())
-    assert sorted(c["image"] for c in pod["spec"]["containers"]) == sorted(
-        v["repository"] + "@" + v["digest"] for v in release["images"].values())
-    assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
+    assert _images(work) == _refs(release, base="")
+    assert all(pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}] for pod in _pods(work))
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
-    assert "cannot pull this release from the release's own repositories: 1 of 6 images" in refusal
+    assert "cannot pull this release from the release's own repositories: image 6 of 6" in refusal
     assert "no longer sets registry.base" not in refusal, "the base did not change"
     # nothing was relocated: the advice is the credential and the node, not a prefix or a copy
     assert "prefix" not in refusal and "copied there" not in refusal
@@ -452,7 +530,7 @@ def test_a_short_dependency_deadline_still_gets_the_named_refusal(runtime, tmp_p
     """deadlines.dependencies_seconds may legally be 60. The 90 s retry rule then
     never fires, and the deadline check used to win with a nameless timeout."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([BACKOFF] * 6))
+    _queue(work, [BACKOFF] * 6)
     release = _public_release()
     payload = _payload(tmp_path, release)
     site = _site()
@@ -472,8 +550,7 @@ def test_the_first_failure_s_words_survive_the_back_off_that_replaces_them(runti
     run, _, work = runtime
     cause = {"waiting": {"reason": "ErrImagePull", "message": "failed to resolve reference: pull access denied, unauthorized"}}
     generic = {"waiting": {"reason": "ImagePullBackOff", "message": "Back-off pulling image \"x\""}}
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [cause]))
-    (work / "status-after-3.json").write_text(_statuses([PULLED] * 5 + [generic]))
+    _queue(work, [PULLED] * 5 + [cause], after={(6, 3): generic})
     _, result = _probe(run, work, tmp_path)
     assert result.returncode != 0
     assert "unauthorized" in result.stderr, "the informative message is the one classified (a review finding: never quoted)"
@@ -482,7 +559,7 @@ def test_the_first_failure_s_words_survive_the_back_off_that_replaces_them(runti
 def test_a_pod_evicted_before_its_pull_is_not_proof_of_a_pull(runtime, tmp_path):
     run, _, work = runtime
     unknown = {"terminated": {"reason": "ContainerStatusUnknown", "exitCode": 137}}
-    (work / "status.json").write_text(_statuses([unknown] * 6))
+    _queue(work, [unknown] * 6)
     _, result = _probe(run, work, tmp_path)
     assert result.returncode != 0, "terminated/ContainerStatusUnknown with no imageID pulled nothing"
     assert "All 6 images pulled" not in result.stderr
@@ -490,10 +567,12 @@ def test_a_pod_evicted_before_its_pull_is_not_proof_of_a_pull(runtime, tmp_path)
 
 def test_a_reported_image_id_is_proof_whatever_the_state(runtime, tmp_path):
     run, _, work = runtime
-    status = json.loads(_statuses([{"waiting": {"reason": "ContainerCreating"}}] * 6))
-    for entry in status["status"]["containerStatuses"]:
-        entry["imageID"] = "registry.company.com/team/project/x@sha256:" + "a" * 64
-    (work / "status.json").write_text(json.dumps(status))
+    statuses = []
+    for pod in range(1, 7):
+        status = json.loads(_pod_status(pod, {"waiting": {"reason": "ContainerCreating"}}))
+        status["status"]["containerStatuses"][0]["imageID"] = "registry.company.com/team/project/x@sha256:" + "a" * 64
+        statuses.append(json.dumps(status))
+    _queue(work, statuses)
     _, result = _probe(run, work, tmp_path)
     assert result.returncode == 0, result.stderr
 
@@ -507,8 +586,7 @@ def test_a_namespace_that_refuses_the_probe_pod_says_so_by_name(runtime, tmp_pat
     (work / "site.json").write_text(json.dumps(site))
     (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": []}}))
     prelude = PROBE_PRELUDE.format(payload=payload).replace(
-        'create) cat > "$TEST_WORK/probe-pod.json";;',
-        'create) cat >/dev/null; echo "pods \"gsj-pull\" is forbidden: violates PodSecurity restricted" >&2; return 1;;')
+        ADMIT, ADMIT + '; echo "pods \\"gsj-pull\\" is forbidden: violates PodSecurity restricted" >&2; return 1')
     result = run(prelude + "relocated_images_probe")
     assert result.returncode != 0
     # a review finding: the refusal names the class of the admission verdict, never kubectl's words (an
@@ -554,7 +632,7 @@ def test_a_sustained_pull_failure_names_the_node_side_causes_too(runtime, tmp_pa
     ImagePullBackOff; an operator who follows the list changes site values
     that were right."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    _queue(work, [PULLED] * 5 + [BACKOFF])
     _, result = _probe(run, work, tmp_path)
     assert result.returncode != 0
     assert "node's side" in result.stderr
@@ -579,7 +657,7 @@ def test_a_sustained_pull_failure_over_an_installed_source_names_repair_and_resu
     the operation's OWN verb again (install, or upgrade --to) -- never the
     other one."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    _queue(work, [PULLED] * 5 + [BACKOFF])
     (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": kind, "status": status}))
     if installed:
         (work / "installed.json").write_text(json.dumps({"status": "complete"}))
@@ -615,7 +693,7 @@ def test_a_sustained_pull_failure_during_a_restore_names_the_verb_its_state_acce
     (applying) is repair's; a restore keeps its site byte for byte, so a
     changed registry.base or registry.pull_secret cannot continue it."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    _queue(work, [PULLED] * 5 + [BACKOFF])
     (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": status}))
     release = _public_release()
     payload = _payload(tmp_path, release)
@@ -639,7 +717,7 @@ def test_a_restore_continued_under_a_corrected_program_names_that_installer(runt
     restore-repair before the application starts (restore-files-verified),
     repair at applying -- in every phase the probe runs in."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    _queue(work, [PULLED] * 5 + [BACKOFF])
     (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": status}))
     release = _public_release(); payload = _payload(tmp_path, release)
     site = _site(); site["registry"].update(base=BASE, pull_secret="corp-pull")
@@ -678,7 +756,7 @@ def test_the_runtime_s_words_are_classified_and_never_repeated_bearer_included(r
     }
     for message, (word, other) in cases.items():
         waiting = {"waiting": {"reason": "ImagePullBackOff", "message": message}}
-        (work / "status.json").write_text(_statuses([PULLED] * 5 + [waiting]))
+        _queue(work, [PULLED] * 5 + [waiting])
         _, result = _probe(run, work, tmp_path)
         assert result.returncode != 0
         line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
@@ -710,6 +788,19 @@ def test_a_probe_pod_kubectl_could_not_create_is_named_without_kubectl_s_words(r
         assert marker in (work / "pull-probe-create.err").read_text()
 
 
+CREATING = {"waiting": {"reason": "ContainerCreating"}}
+
+
+def _placed_and_pulling(reason):
+    """The first Pod placed, its container still pulling, and one condition
+    False whose message is the kubelet's free text."""
+    status = json.loads(_pod_status(1, CREATING))
+    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "True"},
+                                      {"type": "ContainersReady", "status": "False", "reason": reason,
+                                       "message": "containers with unready status: [pull-web] ZZSECRET-CANARY"}]
+    return json.dumps(status)
+
+
 def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(runtime, tmp_path):
     """The deadline refusal joined every False condition's MESSAGE -- free
     text the kubelet and the scheduler compose (a container's name, a taint's
@@ -719,12 +810,7 @@ def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(run
     own refusal, pinned below."""
     run, _, work = runtime
     marker = "ZZSECRET-CANARY"
-    waiting = {"waiting": {"reason": "ContainerCreating"}}
-    status = json.loads(_statuses([waiting] * 6))
-    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "True"},
-                                      {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady",
-                                       "message": "containers with unready status: [pull-web] " + marker}]
-    (work / "status.json").write_text(json.dumps(status))
+    _queue(work, [_placed_and_pulling("ContainersNotReady")] + [PULLED] * 5)
     release = _public_release(); payload = _payload(tmp_path, release); site = _site()
     site["registry"].update(base=BASE, pull_secret="corp-pull"); site.setdefault("deadlines", {})["dependencies_seconds"] = 10
     (work / "site.json").write_text(json.dumps(site))
@@ -733,6 +819,7 @@ def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(run
     assert result.returncode != 0
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "did not finish pulling" in line and "ContainersReady: ContainersNotReady" in line and "pull-probe-status.json" in line
+    assert "image 1 of 6, " + _refs(release)[0] + " (0 pulled before it, 5 not yet tried), was not pulled" in line, line
     assert "PodScheduled" not in line, "a condition that is True is not a reason the pull did not finish"
     assert marker not in result.stdout + result.stderr
     assert marker in (work / "pull-probe-status.json").read_text()
@@ -744,12 +831,7 @@ def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, t
     repeated."""
     run, _, work = runtime
     marker = "ZZSECRET-CANARY"
-    waiting = {"waiting": {"reason": "ContainerCreating"}}
-    status = json.loads(_statuses([waiting] * 6))
-    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "True"},
-                                      {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady" + "ZZSECRETCANARY",
-                                       "message": "containers with unready status: [pull-web] " + marker}]
-    (work / "status.json").write_text(json.dumps(status))
+    _queue(work, [_placed_and_pulling("ContainersNotReady" + "ZZSECRETCANARY")] + [PULLED] * 5)
     release = _public_release(); payload = _payload(tmp_path, release); site = _site()
     site["registry"].update(base=BASE, pull_secret="corp-pull"); site.setdefault("deadlines", {})["dependencies_seconds"] = 10
     (work / "site.json").write_text(json.dumps(site))
@@ -764,19 +846,24 @@ def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, t
 
 # --- how long a pull in progress may take, and what the deadline names -------------
 
-CREATING = {"waiting": {"reason": "ContainerCreating"}}
-
-
-def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix="", states=None, status=None):
-    """The probe over containers that are still pulling (no failure reported,
-    unless states says otherwise; status: the Pod's whole status instead):
-    each poll is 5 s, so poll n sees spent = 5*(n-1). pulled_at: the poll
-    whose status has all six pulled; None: they never finish. recorded: the
-    base the installed deployment was recorded with (None: no installed
-    record)."""
-    (work / "status.json").write_text(status or _statuses(states or [CREATING] * 6))
+def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix="", states=None, status=None, after=()):
+    """The probe over Pods whose containers are still pulling (no failure
+    reported, unless states says otherwise; status: the first Pod's whole
+    status instead). Each poll is 5 s, and a Pod that pulls leaves the
+    time spent where it was for the next: poll n of the first Pod sees
+    spent = 5*(n-1). pulled_at: the poll, counted per Pod, from which every
+    Pod not already pulled reports its image pulled; None: they never
+    finish. after: {(pod, poll): state}, as for _queue. recorded: the base
+    the installed deployment was recorded with (None: no installed record)."""
+    states = list(states or [CREATING] * 6)
+    if status:
+        states[0] = status
+    after = dict(after)
     if pulled_at:
-        (work / f"status-after-{pulled_at}.json").write_text(_statuses([PULLED] * 6))
+        for pod in range(1, 7):
+            if states[pod - 1] != PULLED:
+                after.setdefault((pod, pulled_at), PULLED)
+    _queue(work, states, after)
     if recorded is not None:
         _installed(work, recorded)
     if operation:
@@ -795,17 +882,19 @@ def test_a_plain_site_still_pulling_at_the_dependency_deadline_is_not_refused_an
     six by deadlines.dependencies_seconds and refused a slow link that had
     installed before. With the location unchanged, a pull still in progress
     goes on past that deadline, once said, up to the initialization deadline
-    beyond it."""
+    beyond it. The time is the probe's, not each Pod's: the web image pulls
+    10 s in, and the runner's Pod, still pulling as it starts, is past the
+    10 s deadline at once."""
     run, _, work = runtime
-    result = _slow(run, work, tmp_path, base="", pulled_at=6)          # spent 25 s: past the 10 s deadline
+    result = _slow(run, work, tmp_path, base="", states=[CREATING] * 2 + [PULLED] * 4, pulled_at=3)     # 20 s in all
     assert result.returncode == 0, result.stderr
     assert "did not finish pulling" not in result.stderr
     assert result.stderr.count("still pulling") == 1, "said once, at deadlines.dependencies_seconds"
     line = next(l for l in result.stderr.splitlines() if "still pulling" in l)
     assert "deadlines.dependencies_seconds (10 s)" in line and "slow link" in line and "wait goes on" in line, line
     assert "All 6 images pulled" in result.stderr
-    pod = json.loads((work / "probe-pod.json").read_text())
-    assert pod["spec"]["activeDeadlineSeconds"] == 10 + 20 + 300, "the Pod outlives the wait it serves"
+    assert _polls(work) == 3 + 3 + 4
+    assert [pod["spec"]["activeDeadlineSeconds"] for pod in _pods(work)] == [10 + 20 + 300] * 6, "each Pod outlives the wait it serves"
 
 
 def test_a_plain_site_still_pulling_is_refused_at_both_deadlines_together(runtime, tmp_path):
@@ -815,7 +904,7 @@ def test_a_plain_site_still_pulling_is_refused_at_both_deadlines_together(runtim
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "did not finish pulling" in line
     assert "deadlines.dependencies_seconds plus deadlines.initialization_seconds (30 s)" in line, line
-    assert json.loads((work / "probe-pod.json").read_text())["spec"]["activeDeadlineSeconds"] == 30 + 300
+    assert _pods(work)[0]["spec"]["activeDeadlineSeconds"] == 30 + 300
 
 
 @pytest.mark.parametrize("base, recorded", [(BASE, None), ("", BASE)], ids=["set", "removed"])
@@ -823,12 +912,26 @@ def test_a_set_or_changed_base_still_pulling_is_refused_at_the_dependency_deadli
     """A relocated site, or one whose base changed, keeps the dependency
     deadline: its images were proven under it before."""
     run, _, work = runtime
-    result = _slow(run, work, tmp_path, base=base, pulled_at=6, recorded=recorded)
+    result = _slow(run, work, tmp_path, base=base, states=[CREATING] + [PULLED] * 5, pulled_at=6, recorded=recorded)
     assert result.returncode != 0
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "did not finish pulling" in line and "within deadlines.dependencies_seconds (10 s)" in line, line
     assert "still pulling" not in result.stderr
-    assert json.loads((work / "probe-pod.json").read_text())["spec"]["activeDeadlineSeconds"] == 10 + 300
+    assert _pods(work)[0]["spec"]["activeDeadlineSeconds"] == 10 + 300
+
+
+def test_the_time_the_probe_spends_is_counted_across_its_pods_against_one_bound(runtime, tmp_path):
+    """Six Pods in turn get the one bound the six containers of one Pod got,
+    not six of it: the web image pulls 5 s in, and the runner's Pod is
+    refused when the probe's 10 s are spent, at its own second poll."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=BASE, states=[CREATING] * 2 + [PULLED] * 4, after={(1, 2): PULLED})
+    assert result.returncode != 0
+    assert _polls(work) == 2 + 2
+    release = _public_release()
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "did not finish pulling this release's images from registry.base (" + BASE + ") within deadlines.dependencies_seconds (10 s): " in line, line
+    assert "image 2 of 6, " + _refs(release)[1] + " (1 pulled before it, 4 not yet tried), was not pulled" in line, line
 
 
 # --- a pull failure: refused after 90 s only when a retry cannot change it ------
@@ -856,6 +959,8 @@ def test_a_pull_failure_a_retry_can_clear_is_waited_out_on_a_plain_site_and_said
     assert len(retried) == 1, result.stderr
     assert "could not connect to the registry" in retried[0] and "a retry can clear" in retried[0], retried[0]
     assert "up to deadlines.dependencies_seconds (200 s) after it was first reported" in retried[0], retried[0]
+    corpus = _public_release()["images"]["decisionsData"]
+    assert "The node's pull of this release's images from the release's own repositories is failing and being retried, for image 6 of 6, " + corpus["repository"] + "@" + corpus["digest"] + ". " in retried[0], retried[0]
     assert "initialization_seconds" not in retried[0], "a failure is never given the long bound of a pull in progress"
     assert "i/o timeout" not in result.stderr, "the runtime's words are classified, never repeated"
 
@@ -874,23 +979,25 @@ def test_a_definitive_pull_failure_is_still_refused_after_90_s_on_a_plain_site(r
     run, _, work = runtime
     result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [waiting], dependencies=100, initialization=200)
     assert result.returncode != 0
-    assert _polls(work) == 19, "refused at 90 s, not at the 300 s bound"
+    assert _polls(work) == 5 + 19, "five Pods pulled on their first poll; the sixth refused at 90 s, not at the 300 s bound"
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "cannot pull this release" in line and condition in line, line
     assert "(300 s)" not in line and "being retried" not in result.stderr
 
 
-def test_a_definitive_failure_of_one_image_is_not_masked_by_a_retried_failure_of_another(runtime, tmp_path):
-    """The first failing container's words decided the class: an image whose
-    pull times out ahead of one the registry refuses would have waited the
-    refusal out to the bound."""
+def test_a_definitive_failure_after_a_retried_one_cleared_is_refused_90_s_after_its_own_report(runtime, tmp_path):
+    """Each Pod's failure is timed from its own first report: the chroma
+    image times out and pulls on a retry 30 s in, and the corpus image's
+    refused credential that follows is refused 90 s after it was first
+    reported, by its own class -- never by the connection that cleared."""
     run, _, work = runtime
-    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 4 + [TIMEOUT, UNAUTHORIZED], dependencies=100, initialization=200)
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 4 + [TIMEOUT, UNAUTHORIZED], after={(5, 7): PULLED},
+                   dependencies=100, initialization=200)
     assert result.returncode != 0
-    assert _polls(work) == 19, "refused at 90 s"
+    assert _polls(work) == 4 + 7 + 19, "the chroma image pulled at 30 s; the corpus image refused at 120 s"
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
-    assert "2 of 6 images" in line and "the registry refused the pull (unauthorized" in line, line
-    assert "could not connect" not in line
+    assert "image 6 of 6" in line and "the registry refused the pull (unauthorized" in line, line
+    assert "could not connect" not in line and "being retried" not in result.stderr
 
 
 @pytest.mark.parametrize("base, still", [
@@ -906,9 +1013,9 @@ def test_a_retried_pull_failure_still_failing_at_the_dependency_deadline_is_refu
     run, _, work = runtime
     result = _slow(run, work, tmp_path, base=base, states=[PULLED] * 5 + [TIMEOUT], dependencies=100, initialization=200)
     assert result.returncode != 0
-    assert _polls(work) == 21, "refused at deadlines.dependencies_seconds (100 s), not at 90 s nor at the 300 s bound"
+    assert _polls(work) == 5 + 21, "refused at deadlines.dependencies_seconds (100 s), not at 90 s nor at the 300 s bound"
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
-    assert "cannot pull this release" in line and "1 of 6 images" in line, line
+    assert "cannot pull this release" in line and "image 6 of 6" in line, line
     assert "the node could not connect to the registry" in line and still in line, line
     assert "did not finish pulling" not in line and "i/o timeout" not in result.stderr
     assert result.stderr.count("is failing and being retried") == 1
@@ -941,10 +1048,10 @@ def test_a_failure_a_retry_could_clear_that_persists_to_the_dependency_deadline_
     run, _, work = runtime
     result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [waiting], dependencies=100, initialization=200)
     assert result.returncode != 0
-    assert _polls(work) == 21, "refused at 100 s: not at 90 s (poll 19), not at the 300 s bound (poll 61)"
+    assert _polls(work) == 5 + 21, "refused at 100 s: not at 90 s (its 19th poll), not at the 300 s bound (its 61st)"
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     corpus = _public_release()["images"]["decisionsData"]
-    assert "cannot pull this release from the release's own repositories: 1 of 6 images: " + corpus["repository"] + "@" + corpus["digest"] + ". " in line, line
+    assert "cannot pull this release from the release's own repositories: image 6 of 6, " + corpus["repository"] + "@" + corpus["digest"] + " (5 pulled before it, 0 not yet tried). " in line, line
     assert condition in line and "still failing deadlines.dependencies_seconds (100 s) after it was first reported" in line, line
     assert waiting["waiting"]["message"] not in result.stderr, "the runtime's words are classified, never repeated"
     assert result.stderr.count("is failing and being retried") == 1
@@ -957,10 +1064,10 @@ def test_a_failure_first_reported_past_the_dependency_deadline_is_given_that_dea
     deadlines.dependencies_seconds after its first report, and the slow link
     said once, at the deadline, while the containers were still pulling."""
     run, _, work = runtime
-    (work / "status-after-31.json").write_text(_statuses([PULLED] * 5 + [TIMEOUT]))     # first reported 150 s in
-    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [CREATING], dependencies=100, initialization=400)
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [CREATING], after={(6, 31): TIMEOUT},     # first reported 150 s in
+                   dependencies=100, initialization=400)
     assert result.returncode != 0
-    assert _polls(work) == 51, "150 s + 100 s; not on the first sighting past the deadline, not at the 500 s bound"
+    assert _polls(work) == 5 + 51, "150 s + 100 s; not on the first sighting past the deadline, not at the 500 s bound"
     assert result.stderr.count("still pulling") == 1
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "could not connect to the registry" in line and "still failing deadlines.dependencies_seconds (100 s) after it was first reported" in line, line
@@ -1012,65 +1119,78 @@ def test_the_pull_deadline_over_an_installed_source_names_repair_after_raising_i
 
 # --- the probe Pod's resources, and a LimitRange or ResourceQuota that refuses it ---
 
-def test_every_probe_container_asks_50m_and_64Mi_with_both_limits_equal_so_six_fit_beside_a_running_deployment(runtime, tmp_path):
+def test_every_probe_pod_is_one_container_at_the_storage_check_s_request_with_both_limits_equal(runtime, tmp_path):
     """10m CPU and 16Mi memory under a memory limit alone: a LimitRange minimum
     of 32Mi refused the probe, and the CPU limit a LimitRange injects where
-    none is set made a limit-to-request ratio of 100. The storage check's
-    100m and 128Mi then made six 600m and 768Mi, asked before the backup,
-    beside the running deployment's reservations: on a node sized to the
-    guide's figures -- 9 GiB, the deployment reserving 8.25 GiB -- that is
-    the whole remainder, before the kubelet's own reservation and the system
-    Pods, and the scheduler could not place it. 50m and 64Mi, both limits
-    equal (ratio 1, nothing injected): six are 300m and 384Mi, half that
-    remainder, and still above the LimitRange minimum."""
+    none is set made a limit-to-request ratio of 100. 50m and 64Mi then fell
+    below a minimum of 100m and 128Mi that admits every other Pod the
+    installer and the chart create. Each Pod now asks what the storage check
+    asks, 100m and 128Mi, both limits equal (ratio 1, nothing injected), for
+    ONE image: six such containers together were 768Mi, the whole of what a
+    node sized to the guide's figures -- 9 GiB, the deployment reserving
+    8.25 GiB -- leaves before the kubelet's own reservation and the system
+    Pods; one is a sixth of that."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    _queue(work, [PULLED] * 6)
     _, result = _probe(run, work, tmp_path)
     assert result.returncode == 0, result.stderr
-    pod = json.loads((work / "probe-pod.json").read_text())
-    assert [c["resources"] for c in pod["spec"]["containers"]] == [
-        {"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"cpu": "50m", "memory": "64Mi"}}] * 6
-    memory = sum(int(c["resources"]["requests"]["memory"][:-2]) for c in pod["spec"]["containers"])
-    cpu = sum(int(c["resources"]["requests"]["cpu"][:-1]) for c in pod["spec"]["containers"])
-    assert (cpu, memory) == (300, 384)
-    assert memory <= (9 * 1024 - 8.25 * 1024) / 2, "at most half of what the guide's node leaves beside the deployment"
+    pods = _pods(work)
+    assert [[c["resources"] for c in pod["spec"]["containers"]] for pod in pods] == [
+        [{"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}}]] * 6
+    storage_check = re.search(r'name:"storage-check".*?resources:\{requests:\{cpu:"([^"]+)",memory:"([^"]+)"\}',
+                              (INSTALLER / "runtime.sh").read_text())
+    assert storage_check.groups() == ("100m", "128Mi"), "the storage check's own request, not a copy that drifts"
+    memory = int(pods[0]["spec"]["containers"][0]["resources"]["requests"]["memory"][:-2])
+    assert memory <= (9 * 1024 - 8.25 * 1024) / 2, "the one Pod asking at any moment is at most half of what the guide's node leaves"
 
 
-# A namespace LimitRange that admits every Pod the previous release created: a
-# 32Mi minimum per container, a CPU limit of 1 injected where none is set, and a
-# limit at most 10 times the request. The fake applies it to what the manifest
-# asks and answers as the API server does.
-LIMIT_RANGE_CREATE = r"""create) doc=$(cat)
-           refused=$(jq -r 'def mi: if endswith("Gi") then (.[:-2]|tonumber)*1024 else .[:-2]|tonumber end;
+def _limit_range(memory, cpu=""):
+    """A namespace LimitRange that admits every Pod the previous release
+    created: a Container minimum of `memory` (and of `cpu`, when given), a
+    CPU limit of 1 injected where none is set, and a limit at most 10 times
+    the request. The fake applies it to what each manifest asks and answers
+    as the API server does, in front of the queue's create."""
+    return ADMIT + r'''
+           refused=$(jq -r --arg memory "''' + memory + '''" --arg cpu "''' + cpu + r'''" 'def mi: if endswith("Gi") then (.[:-2]|tonumber)*1024 else .[:-2]|tonumber end;
              def milli: if endswith("m") then .[:-1]|tonumber else (tonumber*1000) end;
              [.spec.containers[].resources |
-               (if (.requests.memory|mi) < 32 then "minimum memory usage per Container is 32Mi, but request is \(.requests.memory)" else empty end),
+               (if (.requests.memory|mi) < ($memory|mi) then "minimum memory usage per Container is \($memory), but request is \(.requests.memory)" else empty end),
+               (if $cpu == "" then empty elif (.requests.cpu|milli) < ($cpu|milli) then "minimum cpu usage per Container is \($cpu), but request is \(.requests.cpu)" else empty end),
                ((((.limits.cpu // "1")|milli) / (.requests.cpu|milli)) as $ratio | if $ratio > 10 then "cpu max limit to request ratio per Container is 10, but provided ratio is \($ratio)" else empty end)]
              | unique | join(", ")' <<< "$doc")
-           if [ -n "$refused" ]; then echo "Error from server (Forbidden): error when creating \"STDIN\": pods \"gsj-pull-aaaaaaaaaaaa\" is forbidden: [$refused]" >&2; return 1; fi
-           printf '%s' "$doc" > "$TEST_WORK/probe-pod.json";;"""
+           if [ -n "$refused" ]; then echo "Error from server (Forbidden): error when creating \"STDIN\": pods \"gsj-pull-aaaaaaaaaaaa\" is forbidden: [$refused]" >&2; return 1; fi'''
 
 
-def test_a_limit_range_that_admits_the_previous_release_s_pods_admits_the_probe(runtime, tmp_path):
-    """The probe's 16Mi fell below that 32Mi minimum and its 10m under the
-    injected CPU limit of 1 made a ratio of 100: the namespace admitted a whole
-    deployment and refused the Pod meant to prove its pulls. What the manifest
-    asks now passes both rules; the old request does not, so the fake bites."""
+@pytest.mark.parametrize("memory, cpu, earlier, refused", [
+    ("32Mi", "", {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "16Mi"}},
+     ("minimum memory usage per Container is 32Mi, but request is 16Mi", "ratio per Container is 10, but provided ratio is 100")),
+    ("128Mi", "100m", {"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"cpu": "50m", "memory": "64Mi"}},
+     ("minimum memory usage per Container is 128Mi, but request is 64Mi", "minimum cpu usage per Container is 100m, but request is 50m")),
+], ids=["32Mi-minimum", "storage-check-minimum"])
+def test_a_limit_range_that_admits_the_previous_release_s_pods_admits_the_probe(runtime, tmp_path, memory, cpu, earlier, refused):
+    """The probe's 16Mi fell below a 32Mi minimum and its 10m under the
+    injected CPU limit of 1 made a ratio of 100; its 50m and 64Mi then fell
+    below a minimum of 100m and 128Mi, the floor every other installer Pod
+    and the chart's containers ask for. Either way the namespace admitted a
+    whole deployment and refused the Pod meant to prove its pulls. What each
+    probe Pod asks now passes both; the earlier requests do not, so the
+    fake bites."""
     run, _, work = runtime
-    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    _queue(work, [PULLED] * 6)
     release = _public_release(); payload = _payload(tmp_path, release); site = _site()
     site["registry"].update(base=BASE, pull_secret="corp-pull")
     (work / "site.json").write_text(json.dumps(site))
     (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
-    prelude = PROBE_PRELUDE.format(payload=payload).replace('create) cat > "$TEST_WORK/probe-pod.json";;', LIMIT_RANGE_CREATE)
+    prelude = PROBE_PRELUDE.format(payload=payload).replace(ADMIT, _limit_range(memory, cpu))
     result = run(prelude + "relocated_images_probe")
     assert result.returncode == 0, result.stderr
     assert "All 6 images pulled" in result.stderr and "could not be created" not in result.stderr
-    old = json.dumps({"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"memory": "16Mi"}}}]}})
-    refused = run(prelude + "k create -f - <<< " + json.dumps(old))
-    assert refused.returncode != 0
-    assert "minimum memory usage per Container is 32Mi, but request is 16Mi" in refused.stderr
-    assert "ratio per Container is 10, but provided ratio is 100" in refused.stderr
+    assert len(_pods(work)) == 6, "every one of the six Pods was admitted"
+    old = json.dumps({"metadata": {"name": "earlier"}, "spec": {"containers": [{"resources": earlier}]}})
+    denied = run(prelude + "k create -f - <<< " + json.dumps(old))
+    assert denied.returncode != 0
+    for words in refused:
+        assert words in denied.stderr, (words, denied.stderr)
 
 
 @pytest.mark.parametrize("words", [
@@ -1091,7 +1211,7 @@ def test_a_limit_range_or_quota_that_refuses_the_probe_is_not_blamed_on_permissi
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "an admission policy (LimitRange or ResourceQuota) refused the Pod" in line, line
     assert "permissions" not in line and "32Mi" not in line and "exceeded" not in line
-    assert "cpu 50m and memory 64Mi, with limits equal to those requests" in line and "LimitRange" in line and "ResourceQuota" in line
+    assert "cpu 100m and memory 128Mi, with limits equal to those requests" in line and "LimitRange" in line and "ResourceQuota" in line
 
 
 # --- a probe Pod the scheduler cannot place --------------------------------------
@@ -1107,27 +1227,43 @@ def _unscheduled(reason="Unschedulable"):
 
 
 @pytest.mark.parametrize("base", ["", BASE], ids=["plain", "relocated"])
-def test_a_probe_pod_the_scheduler_cannot_place_is_refused_after_300_s_by_name(runtime, tmp_path, base):
+def test_an_unschedulable_first_probe_pod_is_refused_after_300_s_by_name(runtime, tmp_path, base):
     """The probe runs before the backup, beside the running deployment's
     reservations. A Pod the scheduler could not place reported no container
     status, was logged as a slow link at deadlines.dependencies_seconds and,
     on a site without registry.base, refused a day later as a pull that did
     not finish. Unscheduled for 300 s -- the storage check's bound and the
     capacity reader's -- it is refused by what it is: storage.node, what the
-    Pod asks for in all, and the condition's reason; the scheduler's words
-    are kept, never repeated."""
+    Pod asks for, and the condition's reason; the scheduler's words are
+    kept, never repeated, and no other image's Pod is created."""
     run, _, work = runtime
     result = _slow(run, work, tmp_path, base=base, status=_unscheduled(), dependencies=600, initialization=1200)
     assert result.returncode != 0
     assert _polls(work) == 61, "refused at 300 s, not at deadlines.dependencies_seconds nor at the long bound"
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
-    assert "the image pull probe's Pod was not scheduled (PodScheduled: Unschedulable) within 300 s" in line, line
-    assert "storage.node (synthetic-node) has no room for" in line and "cpu 300m and memory 384Mi" in line, line
+    assert "the image pull probe's Pod was not scheduled (PodScheduled: Unschedulable) within 300 s, so whether the node can pull image 1 of 6 from" in line, line
+    assert "storage.node (synthetic-node) has no room for its request, cpu 100m and memory 128Mi, beside" in line, line
     assert "pull-probe-status.json" in line and "Helm has applied nothing in this run" in line, line
     assert "did not finish pulling" not in line and "cannot pull" not in line, "the registry is not blamed"
     assert "still pulling" not in result.stderr, "a Pod the scheduler has not placed is not pulling on a slow link"
     assert "ZZSECRET-CANARY" not in result.stdout + result.stderr
     assert UNPLACED_WORDS in (work / "pull-probe-status.json").read_text()
+    assert len(_pods(work)) == 1 and "PROBE_POD=gsj-pull-aaaaaaaaaaaa-web\n" in result.stderr
+
+
+def test_a_later_probe_pod_the_scheduler_cannot_place_is_refused_300_s_after_its_own_report(runtime, tmp_path):
+    """Room can go between two Pods -- another workload scheduled beside the
+    deployment -- so each Pod's 300 s run from its own first report: the web
+    image pulls 50 s in, and the runner's unplaced Pod is refused at 350 s,
+    by its own number."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[CREATING, _unscheduled()] + [PULLED] * 4, after={(1, 11): PULLED},
+                   dependencies=600, initialization=1200)
+    assert result.returncode != 0
+    assert _polls(work) == 11 + 61
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "the image pull probe's Pod was not scheduled (PodScheduled: Unschedulable) within 300 s, so whether the node can pull image 2 of 6 from" in line, line
+    assert "PROBE_POD=gsj-pull-aaaaaaaaaaaa-runner\n" in result.stderr
 
 
 @pytest.mark.parametrize("reason, word", [("SchedulerError", "SchedulerError"), ("Unschedulable" + "ZZSECRETCANARY", "other")],
@@ -1150,8 +1286,8 @@ def test_a_probe_pod_placed_within_300_s_is_not_refused(runtime, tmp_path):
     """Room freed beside it -- a Pod finishing, a node added -- places the Pod
     within minutes; the grace is not held against it once placed."""
     run, _, work = runtime
-    (work / "status-after-60.json").write_text(_statuses([CREATING] * 6))       # placed and pulling 295 s in
-    result = _slow(run, work, tmp_path, base="", status=_unscheduled(), pulled_at=70, dependencies=600, initialization=1200)
+    result = _slow(run, work, tmp_path, base="", status=_unscheduled(), states=[CREATING] + [PULLED] * 5,
+                   after={(1, 60): CREATING}, pulled_at=70, dependencies=600, initialization=1200)      # placed and pulling 295 s in
     assert result.returncode == 0, result.stderr
     assert "All 6 images pulled" in result.stderr and "was not scheduled" not in result.stderr
 
@@ -1170,7 +1306,7 @@ def test_the_slow_link_line_is_said_only_while_the_containers_report_a_pull(runt
 @pytest.mark.parametrize("operation, installed, starts, present, absent", [
     ({"kind": "install", "status": "owned"}, False, "abandon --operation aaaaaaaaaaaabbbbbbbbbbbb",
      ("install again from the corrected file with another storage.node", "(a repair would complete this first install without the storage check)",
-      "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once room is freed on node synthetic-node for the probe Pod's cpu 300m and memory 384Mi"),
+      "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once room is freed on node synthetic-node for the probe Pod's cpu 100m and memory 128Mi"),
      (" repair --operation", "after raising")),
     ({"kind": "upgrade", "status": "owned"}, True, "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once room is freed on node synthetic-node",
      ("a changed storage.node is refused for an installed release, whose claims stay where they are",),
