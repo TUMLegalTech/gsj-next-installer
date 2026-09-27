@@ -1031,6 +1031,88 @@ def test_a_link_that_appears_beside_the_installer_is_never_written_through(tmp_p
     assert _report(result)["verification"]["companions_saved"] == 0
 
 
+# init_publish in the background, in a process group of its own: a run that
+# blocks on the destination is reported as HUNG and its group killed, so the
+# test fails by name instead of leaving a writer blocked on a FIFO.
+_PUBLISH = """INIT_STAGE="$TEST_STAGE"
+set -m
+( rc=0; init_publish release.pem "$TEST_DEST" || rc=$?; printf 'rc=%s why=%s\\n' "$rc" "${INIT_WHY:-}" ) > "$TEST_WORK/publish.out" 2>&1 & pid=$!
+set +m
+for i in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "-$pid"; echo HUNG; exit 0; fi
+wait "$pid" || true
+cat "$TEST_WORK/publish.out"
+"""
+
+
+def _publish(runtime, tmp_path, plant=None):
+    run, _, _ = runtime
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    (stage / "release.pem").write_text("the checked copy\n")
+    if plant:
+        plant(dest / "release.pem")
+    return run(_PUBLISH, TEST_STAGE=str(stage), TEST_DEST=str(dest)), dest
+
+
+@pytest.mark.parametrize("planted", ["a FIFO", "a link to a FIFO", "a link to a file", "a dangling link", "a directory", "a link to a directory"])
+def test_a_name_planted_where_a_companion_is_published_is_never_opened_nor_replaced(runtime, tmp_path, planted):
+    """Between discovery and publication a name can appear where a companion
+    is to be saved. noclobber refused only an existing regular file: a FIFO
+    there (or a link to one) was opened for writing -- the run blocked until
+    something read it -- and the unguarded write that followed opened the
+    name again. The copy is written to a fresh private name and linked into
+    place with ln, which fails for an existing name of any type and never
+    opens it (ln -T: a plain ln links INTO a directory, or a link to one):
+    the planted name is left exactly as it was, nothing is left beside it or
+    in it, and the result is the 'appeared' refusal (2)."""
+    fifo, precious, elsewhere = tmp_path / "fifo", tmp_path / "precious", tmp_path / "elsewhere"
+    precious.write_text("precious")
+    elsewhere.mkdir()
+
+    def plant(name):
+        if planted == "a FIFO":
+            os.mkfifo(name)
+        elif planted == "a link to a FIFO":
+            os.mkfifo(fifo); name.symlink_to(fifo)
+        elif planted == "a link to a file":
+            name.symlink_to(precious)
+        elif planted == "a directory":
+            name.mkdir()
+        elif planted == "a link to a directory":
+            name.symlink_to(elsewhere)
+        else:
+            name.symlink_to(tmp_path / "absent")
+    result, dest = _publish(runtime, tmp_path, plant)
+    assert "HUNG" not in result.stdout, "init_publish opened the planted name and blocked on it"
+    assert "rc=2" in result.stdout and "appeared during the download and was not replaced" in result.stdout, result.stdout + result.stderr
+    name = dest / "release.pem"
+    if planted == "a FIFO":
+        assert stat.S_ISFIFO(os.lstat(name).st_mode)
+    elif planted == "a directory":
+        assert name.is_dir() and not name.is_symlink() and list(name.iterdir()) == []
+    else:
+        assert name.is_symlink()
+    assert precious.read_text() == "precious" and not (tmp_path / "absent").exists() and list(elsewhere.iterdir()) == []
+    assert sorted(p.name for p in dest.iterdir()) == ["release.pem"], "a temporary name was left beside the planted one"
+
+
+def test_a_companion_is_published_whole_and_private_and_an_unwritable_folder_is_named(runtime, tmp_path):
+    result, dest = _publish(runtime, tmp_path)
+    assert "rc=0" in result.stdout, result.stdout + result.stderr
+    assert (dest / "release.pem").read_text() == "the checked copy\n"
+    assert stat.S_IMODE((dest / "release.pem").stat().st_mode) == 0o600 and not (dest / "release.pem").is_symlink()
+    assert sorted(p.name for p in dest.iterdir()) == ["release.pem"]
+    if os.geteuid() != 0:                                               # root writes through mode 555
+        again = tmp_path / "again"
+        again.mkdir()
+        os.chmod(tmp_path / "again", 0o755)
+        result, dest = _publish(runtime, again, lambda name: os.chmod(name.parent, 0o555))
+        os.chmod(dest, 0o755)
+        assert "rc=1" in result.stdout and f"{dest} is not writable" in result.stdout, result.stdout + result.stderr
+        assert list(dest.iterdir()) == []
+
+
 def test_run_through_a_symlink_beside_the_installer_means_beside_the_file(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     box.place(*COMPANIONS)
