@@ -129,6 +129,44 @@ def check_application(installed, manifest, expected=None):
             and verdict["network"].get("status") == "passed", "public TLS or real NetworkPolicy gate failed")
 
 
+def client_versions(context):
+    """The exact clients this run drives the installer with, and the server
+    it drives them against: helm's `version --short` first token, kubectl's
+    client gitVersion and the gitVersion the site's context answers for its
+    server, and `jq --version`, each as the tool prints it. qualify() never
+    passes --fetch-tools, so the installer runs on these same PATH clients
+    and a passed report vouches for exactly them. One that cannot be read is
+    refused in words, never in the tool's own text."""
+    def read(*argv):
+        try:
+            return run(*argv, capture=True)
+        except OSError:
+            return ""
+        except subprocess.CalledProcessError as exc:
+            # kubectl prints its own version and exits 1 when the server does
+            # not answer: keep what it printed, so the refusal names the server
+            return exc.stdout or ""
+
+    def git_version(document, key):
+        value = document.get(key) if isinstance(document, dict) else None
+        return value.get("gitVersion") if isinstance(value, dict) else None
+
+    helm = read("helm", "version", "--short").split()
+    try:
+        kubectl = json.loads(read("kubectl", "--context", context, "version", "-o", "json"))
+    except ValueError:
+        kubectl = None
+    versions = {"helm": helm[0] if helm else "", "kubectl": git_version(kubectl, "clientVersion"),
+                "jq": read("jq", "--version").strip(), "server": git_version(kubectl, "serverVersion")}
+    sources = {"helm": "helm version --short", "kubectl": "kubectl version -o json, its clientVersion",
+               "jq": "jq --version", "server": "kubectl version -o json against the site's context, its serverVersion"}
+    for name, value in versions.items():
+        require(isinstance(value, str) and value.strip(),
+                f"the {name} version this qualification runs with cannot be read ({sources[name]}); a report must "
+                "name the exact clients and server it qualified, so the run stops before its first phase")
+    return versions
+
+
 def bundle(directory):
     run(sys.executable, "-B", ROOT / "ops/installer/build.py", "verify", "--installer", directory / "gsj-install.sh",
         "--descriptor", directory / "installer-descriptor.json", "--signature", directory / "installer-descriptor.sig", "--public-key", directory / "release.pem")
@@ -258,8 +296,12 @@ def qualify(args):
     site = read_site(site_path)
     context, namespace, release = (site["target"][k] for k in ("context", "namespace", "release"))
     require(args.disposable_target and namespace.startswith("gsj-qualification-"), "qualification requires an explicitly disposable namespace")
+    # Before the first phase and before the report exists: a report that
+    # cannot name what it ran on is refused here, in words (gate() requires it).
+    clients = client_versions(context)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     report = {"schema": "gsj.installer-qualification/1", "mode": args.mode, "status": "running", "checks": [],
+              "clients": clients,
               "installer_sha256": sha(target / "gsj-install.sh"), "release_identity": manifest["identity"],
               "corpus_fingerprint": manifest["corpus"]["fingerprint"], "rows": manifest["corpus"]["rows"],
               "chunks": manifest["corpus"]["chunks"], "disposable_target_cleanup": "pending"}
@@ -600,6 +642,10 @@ def gate(directory, reports):
                 and report.get("disposable_target_cleanup") == "passed"
                 and report.get("installer_sha256") == descriptor["installer"]["sha256"]
                 and report.get("release_identity") == descriptor["releaseId"], "qualification report does not bind the candidate bytes")
+        clients = report.get("clients")
+        require(isinstance(clients, dict) and all(isinstance(clients.get(name), str) and clients[name].strip()
+                                                  for name in ("helm", "kubectl", "jq", "server")),
+                "qualification report does not name the helm, kubectl, jq and server versions it ran with")
         require(len(report.get("checks", [])) == len(required[mode])
                 and {x["name"] for x in report["checks"] if x.get("status") == "passed"} == required[mode],
                 "required installer qualification was skipped or failed")
