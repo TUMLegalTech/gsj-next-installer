@@ -21,6 +21,7 @@ from tests.test_installer import _runtime
 
 WRITES = ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
 HOST = "legal.example"                        # _site()'s public_url host
+CLASS = "gsj-ingress"                         # _site()'s ingress.class
 VERSIONS = {"clientVersion": {"gitVersion": "v1.33.1"}, "serverVersion": {"gitVersion": "v1.33.6+k3s1"}}
 PASSWORD = "synthetic-operator-password"
 OWNER = "a" * 40
@@ -554,7 +555,7 @@ def test_an_ingress_namespace_this_credential_cannot_read_is_logged_and_passed(r
 def test_an_ingress_of_another_deployment_on_the_same_host_is_refused_by_name(runtime, tmp_path):
     run, state, work = runtime
     _baseline(tmp_path, state, work, _ingress("synthetic-namespace", "synthetic-release-web", HOST),
-              _ingress("other-namespace", "other-web", HOST), _ingress("third", "third-web", "elsewhere.example"))
+              _ingress("other-namespace", "other-web", HOST, CLASS), _ingress("third", "third-web", "elsewhere.example", CLASS))
     line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/other-web",
                     "two deployments cannot share one host", "public_url")
     assert "synthetic-release-web" not in line and "third-web" not in line
@@ -569,12 +570,62 @@ def test_an_ingress_of_this_site_s_ingress_class_on_the_host_is_refused(runtime,
              "two deployments cannot share one host")
 
 
-def test_an_ingress_of_no_class_on_the_host_is_refused_as_the_cluster_s_default_may_be_this_site_s(runtime, tmp_path):
+def _saved_class(work, default):
+    """The IngressClass preflight saved for ingress.class under reuse; default
+    is its ingressclass.kubernetes.io/is-default-class annotation (None:
+    none)."""
+    annotations = {} if default is None else {"ingressclass.kubernetes.io/is-default-class": default}
+    (work / "ingress-class.json").write_text(json.dumps({
+        "apiVersion": "networking.k8s.io/v1", "kind": "IngressClass",
+        "metadata": {"name": CLASS, "annotations": annotations}, "spec": {"controller": "k8s.io/ingress-nginx"}}))
+
+
+def test_an_ingress_of_no_class_on_the_host_is_refused_when_this_site_s_class_is_the_cluster_default(runtime, tmp_path):
+    """A class-less Ingress goes to the cluster's default class, which is
+    this site's here, so this site's controller serves it."""
     run, state, work = runtime
     _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
+    _saved_class(work, "true")
     result = _checks(run)
-    _refusal(result, state, "is already served by Ingress other-namespace/other-web", "or of no class")
+    _refusal(result, state, "is already served by Ingress other-namespace/other-web", "or of no class",
+             "the cluster's default ingress class")
     assert "another controller" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("default", [None, "false", "True"])
+def test_an_ingress_of_no_class_on_the_host_is_logged_when_a_reused_class_is_not_the_cluster_default(runtime, tmp_path, default):
+    """Only the default class serves a class-less Ingress, and the annotation
+    marks it only as the exact string "true"."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
+    _saved_class(work, default)
+    result = _checks(run)
+    _admitted(result, state)
+    _logged(result, "also served by another controller's Ingress other-namespace/other-web", f"public_url's host {HOST}",
+            "nothing routes to it here", "names none", "The run goes on")
+    assert "already served" not in result.stderr, result.stderr
+
+
+def test_an_ingress_of_no_class_on_the_host_is_logged_under_managed_traefik(runtime, tmp_path):
+    """The managed Traefik is never the default class and serves its own class
+    alone, whatever IngressClass an earlier reuse run saved."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
+    _saved_class(work, "true")
+    _site(work, MANAGED["traefik"])
+    result = _checks(run, before=_addon_reads({"items": []}, {"items": []}, {"items": []}))
+    _admitted(result, state)
+    _logged(result, "also served by another controller's Ingress other-namespace/other-web", "nothing routes to it here",
+            "The run goes on")
+    assert "already served" not in result.stderr, result.stderr
+
+
+def test_an_ingress_of_the_managed_traefik_s_class_on_the_host_is_refused(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST, CLASS))
+    _site(work, MANAGED["traefik"])
+    _refusal(_checks(run, before=_addon_reads({"items": []}, {"items": []}, {"items": []})), state,
+             "is already served by Ingress other-namespace/other-web", "ingress.class gsj-ingress")
 
 
 @pytest.mark.parametrize("marked", ["field", "annotation"])
@@ -605,13 +656,14 @@ def test_the_deployment_s_own_ingress_name_in_another_namespace_is_a_collision(r
     """Only this deployment's own namespace and name is exempt."""
     run, state, work = runtime
     _baseline(tmp_path, state, work, _ingress("synthetic-namespace", "synthetic-release-web", HOST),
-              _ingress("other-namespace", "synthetic-release-web", HOST))
+              _ingress("other-namespace", "synthetic-release-web", HOST, CLASS))
     line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/synthetic-release-web")
     assert "synthetic-namespace/" not in line, line
 
 
 def _solver(namespace, name, labelled=True):
-    ingress = _ingress(namespace, name, HOST)
+    """cert-manager gives its solver the class the issuer names: this site's."""
+    ingress = _ingress(namespace, name, HOST, CLASS)
     if labelled:
         ingress["metadata"]["labels"] = {"acme.cert-manager.io/http01-solver": "true"}
     return ingress
@@ -626,7 +678,7 @@ def test_an_acme_solver_or_a_deleting_ingress_on_the_host_is_not_a_collision(run
     if passing == "solver":
         other = _solver("synthetic-namespace", "cm-acme-http-solver-x7k2p")
     else:
-        other = _ingress("other-namespace", "other-web", HOST)
+        other = _ingress("other-namespace", "other-web", HOST, CLASS)
         other["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z"
     _baseline(tmp_path, state, work, _ingress("synthetic-namespace", "synthetic-release-web", HOST), other)
     _admitted(_checks(run), state)
@@ -649,7 +701,7 @@ def test_an_ingress_list_this_credential_may_not_read_is_logged_and_passed(runti
 
 def test_a_public_url_with_a_port_is_checked_by_its_host_alone(runtime, tmp_path):
     run, state, work = runtime
-    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST, CLASS))
     _site(work, lambda s: s.update(public_url=f"https://{HOST}:30443/"))
     line = _refusal(_checks(run), state, f"public_url's host {HOST} is already served by Ingress other-namespace/other-web")
     assert "30443" not in line
@@ -657,12 +709,16 @@ def test_a_public_url_with_a_port_is_checked_by_its_host_alone(runtime, tmp_path
 
 def test_ingresses_without_rules_or_hosts_are_passed_over(runtime, tmp_path):
     run, state, work = runtime
-    bare = {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": "bare", "namespace": "third"}}
-    backend = {**bare, "metadata": {"name": "backend", "namespace": "third"}, "spec": {"defaultBackend": {"service": {"name": "x"}}}}
-    hostless = {**bare, "metadata": {"name": "hostless", "namespace": "third"}, "spec": {"rules": [{"http": {"paths": []}}]}}
+    marked = {"kubernetes.io/ingress.class": CLASS}
+    bare = {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+            "metadata": {"name": "bare", "namespace": "third", "annotations": marked}}
+    backend = {**bare, "metadata": {"name": "backend", "namespace": "third", "annotations": marked},
+               "spec": {"defaultBackend": {"service": {"name": "x"}}}}
+    hostless = {**bare, "metadata": {"name": "hostless", "namespace": "third", "annotations": marked},
+                "spec": {"rules": [{"http": {"paths": []}}]}}
     _baseline(tmp_path, state, work, bare, backend, hostless)
     _admitted(_checks(run), state)
-    _baseline(tmp_path, state, work, bare, backend, hostless, _ingress("other-namespace", "other-web", HOST))
+    _baseline(tmp_path, state, work, bare, backend, hostless, _ingress("other-namespace", "other-web", HOST, CLASS))
     line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/other-web")
     assert "third/" not in line, line
 
@@ -961,7 +1017,7 @@ EXEMPT = ["restore", "restore-repair", "backup", "backup-repair", "resume", "rep
 def test_the_recovery_verbs_are_not_refused_on_the_site_checks(runtime, tmp_path, command):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
-    _cluster(state, _ingress("other-namespace", "other-web", HOST))     # no TLS Secret, the host taken
+    _cluster(state, _ingress("other-namespace", "other-web", HOST, CLASS))     # no TLS Secret, the host taken
     result = _preflight(run, work, command)
     _admitted(result, state)
     calls = json.loads(state.read_text())["calls"]

@@ -1457,26 +1457,33 @@ preflight_site_checks() {
  # host to one of them, and the other's acceptance check fails hours in on a
  # trust error. A collision is an Ingress this site's controller would serve:
  # its class (spec.ingressClassName, else the older kubernetes.io/ingress.class
- # annotation) is ingress.class, or it names none and goes to the cluster's
- # default class, which may be this site's. One of another class is another
- # controller's, which this site's controller never routes: it is named in a
- # log line, never by its class, and the run goes on. Not a collision either:
+ # annotation) is ingress.class, or it names none and ingress.class is the
+ # cluster's default class, the one class a class-less Ingress goes to: the
+ # IngressClass preflight saved under reuse carries
+ # ingressclass.kubernetes.io/is-default-class "true". The managed Traefik is
+ # never the default (installed with isDefaultClass false and its provider
+ # held to ingress.class), whatever an earlier reuse run saved. Any other
+ # Ingress on the host is another controller's, or no controller's, and this
+ # site's controller never routes it: it is named in a log line, never by its
+ # class, and the run goes on. Not a collision either:
  # this installation's own Ingress (an upgrade's); one already being deleted;
  # cert-manager's HTTP-01 solver Ingress (labelled
  # acme.cert-manager.io/http01-solver), which serves public_url's host from
  # this namespace while a renewal is pending, and removing it would only
  # fight cert-manager; one without rules, which serves no host.
  if [[ -n $host ]]; then
+   local default=false
    class=$(j .ingress.class)
-   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" --arg class "$class" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(.metadata.deletionTimestamp==null and .metadata.labels["acme.cert-manager.io/http01-solver"]!="true")|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))
-       |{name:"\(.metadata.namespace)/\(.metadata.name)", ours:((.spec.ingressClassName // .metadata.annotations["kubernetes.io/ingress.class"] // "")|IN("",$class))}]
+   if [[ $(j '.ingress.profile // ""') == reuse ]] && jq -e '.metadata.annotations["ingressclass.kubernetes.io/is-default-class"]=="true"' "$STATE_DIR/ingress-class.json" >/dev/null 2>&1; then default=true; fi
+   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" --arg class "$class" --argjson default "$default" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(.metadata.deletionTimestamp==null and .metadata.labels["acme.cert-manager.io/http01-solver"]!="true")|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))
+       |{name:"\(.metadata.namespace)/\(.metadata.name)", ours:((.spec.ingressClassName // .metadata.annotations["kubernetes.io/ingress.class"] // "") as $named | $named==$class or ($named=="" and $default))}]
        |"\(map(select(.ours).name)|unique|join(", "))|\(map(select(.ours|not).name)|unique|join(", "))"' 2>/dev/null); then
      log "public_url's host $host was not checked against other Ingresses: this credential could not list Ingresses cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-ingresses.err). If another deployment serves $host, the acceptance check fails on it hours in rather than here"
    else
      # One line, "COLLISIONS|OTHERS": no namespace or Ingress name holds a "|".
      IFS='|' read -r found others <<< "$found"
-     [[ -z $others ]] || log "public_url's host $host is also served by another controller's Ingress $others; nothing routes to it here, because its class is not ingress.class $class. Clients reach this deployment only where $host's address leads to this site's controller. The run goes on"
-     [[ -z $found ]] || fail "public_url's host $host is already served by Ingress $found, of ingress.class $class or of no class: two deployments cannot share one host on one controller. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"
+     [[ -z $others ]] || log "public_url's host $host is also served by another controller's Ingress $others; nothing routes to it here, because it names an ingress class other than ingress.class $class, or names none and $class is not the cluster's default ingress class. Clients reach this deployment only where $host's address leads to this site's controller. The run goes on"
+     [[ -z $found ]] || fail "public_url's host $host is already served by Ingress $found, of ingress.class $class, or of no class where $class is the cluster's default ingress class: two deployments cannot share one host on one controller. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"
    fi
  fi
  # Leftover managed add-on CRDs: cluster-scoped, so they outlive the add-on's
