@@ -484,10 +484,12 @@ def test_altered_installer_bytes_fail_verification_and_init_stops_before_inspect
 
 
 def test_the_published_verifier_runs_after_the_internal_check_and_its_own_refusal_stops_init(tmp_path, keypair):
-    """A descriptor with a second installer sha256 line passes init's own
-    reading (the first line) and is refused by verify-release.sh, whose sed
-    demands one unique digest: the verifier is a check of its own, and its
-    refusal stops init before inspect."""
+    """The verifier is a check of its own, run after init's: its refusal stops
+    init before inspect, and its line is shown. init now reads the
+    descriptor exactly as the verifier does, so no signed descriptor passes
+    the one and fails the other; the refusal here is the verifier's own
+    reading of the key file, on a box whose openssl cannot parse it (init
+    itself never parses the key, it hashes it)."""
     box = Box(tmp_path, keypair)
     box.place(*COMPANIONS)
     result = box.run()
@@ -498,16 +500,35 @@ def test_the_published_verifier_runs_after_the_internal_check_and_its_own_refusa
     assert "was not executed" not in result.stdout + result.stderr
     assert "init: the published verify-release.sh confirms the signed descriptor and the exact bytes of this installer" in result.stdout
     assert result.stderr.index("init: running the published verify-release.sh") < result.stderr.index("init: running inspect")
-    descriptor = json.loads((box.assets / "installer-descriptor.json").read_text())
-    descriptor["zz"] = {"sha256": "0" * 64}
-    (box.assets / "installer-descriptor.json").write_bytes(builder.canonical(descriptor))
-    _sign(box.keypair[0], box.assets / "installer-descriptor.json", box.assets / "installer-descriptor.sig")
     again = Box(tmp_path / "again", keypair)
+    openssl = Path(again.path) / "openssl"
+    openssl.write_text(openssl.read_text().replace('if [ "${1:-}" = version ]', 'if [ "${1:-}" = pkey ]; then exit 1; elif [ "${1:-}" = version ]', 1))
     again.serve(box.assets)
     result = again.run()
     _stop(result, "release verification FAILED: verify-release.sh refused this installer")
-    assert "Descriptor has no unique installer/key digest" in result.stderr          # the published verifier's own line
+    assert "Trusted public key is not a readable PEM public key" in result.stderr   # the published verifier's own line
     assert again.kube_calls() == [] and again.beside() == []
+
+
+@pytest.mark.parametrize("second", [{"sha256": "0" * 64, "bytes": 1}, {"bytes": 1}, {"sha256": "0" * 64}])
+def test_a_descriptor_with_a_second_digest_or_length_line_is_refused_by_inits_own_check(tmp_path, keypair, second):
+    """The three readers of the descriptor disagreed on an unusual layout: a
+    second object whose sha256 or bytes sits at the installer's indent
+    (sorted after "installer", so the first matching line is the real one).
+    init took the first line and passed; the published verifier demands
+    exactly one line and refused the digest (it never reads bytes, so a
+    second bytes line passed both). init now reads like the verifier:
+    exactly one matching line, else no value -- refused by its own check,
+    before the verifier runs and before anything is saved or inspected."""
+    box = Box(tmp_path, keypair)
+    descriptor = json.loads((box.assets / "installer-descriptor.json").read_text())
+    descriptor["zz"] = second
+    (box.assets / "installer-descriptor.json").write_bytes(builder.canonical(descriptor))
+    _sign(box.keypair[0], box.assets / "installer-descriptor.json", box.assets / "installer-descriptor.sig")
+    result = box.run()
+    _stop(result, "the descriptor names no installer digest and length")
+    assert "init: running the published verify-release.sh" not in result.stderr
+    assert box.kube_calls() == [] and box.beside() == []
 
 
 def test_a_wrong_key_published_at_the_origin_is_refused_and_nothing_is_saved(tmp_path, keypair):

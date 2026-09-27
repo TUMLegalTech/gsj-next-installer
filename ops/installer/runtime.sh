@@ -5642,10 +5642,23 @@ init_json_line() {
  # A string value from canonical JSON (build.py writes release.json and the
  # descriptor with sorted keys at two-space indents), read the way
  # verify-release.sh reads the descriptor: no jq, which may be one of the
- # tools init reports missing. $1 file, $2 indent, $3 key. One line, or none.
- sed -n 's/^'"$2"'"'"$3"'": "\([^"]*\)",*$/\1/p' "$1" 2>/dev/null | head -n1
+ # tools init reports missing, and EXACTLY one matching line. A second one (a
+ # nested object with the same key at that indent, a repeated key) leaves the
+ # value empty, so the caller's "names no ..." refusal fires: reading the
+ # first line passed a signed descriptor the verifier refuses, and one with a
+ # second installer length, which the verifier never reads. $1 file, $2
+ # indent, $3 key. The value, or nothing.
+ local found
+ found=$(sed -n 's/^'"$2"'"'"$3"'": "\([^"]*\)",*$/\1/p' "$1" 2>/dev/null; printf .); found=${found%.}
+ [[ $found == *$'\n' && ${found%$'\n'} != *$'\n'* ]] || return 0
+ printf '%s\n' "${found%$'\n'}"
 }
-init_json_number() { sed -n 's/^'"$2"'"'"$3"'": \([0-9][0-9]*\),*$/\1/p' "$1" 2>/dev/null | head -n1; }
+init_json_number() {
+ local found
+ found=$(sed -n 's/^'"$2"'"'"$3"'": \([0-9][0-9]*\),*$/\1/p' "$1" 2>/dev/null; printf .); found=${found%.}
+ [[ $found == *$'\n' && ${found%$'\n'} != *$'\n'* ]] || return 0
+ printf '%s\n' "${found%$'\n'}"
+}
 init_json_string() {
  # A JSON string literal from a bash value: backslash and quote escaped, the
  # control characters JSON forbids made spaces. Every value that reaches here
