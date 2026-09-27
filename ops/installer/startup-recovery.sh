@@ -1,4 +1,18 @@
 # Explicit recovery of a signed first startup. This file never declares readiness.
+startup_barrier_exact() { # a rendered web Deployment, this pod's generation, the marker name -> 0 when its first init is the exact provisioning barrier
+ # Either shape the barrier has had: the marker read through the API
+ # (WAIT_MARKER names it, a projected token), or the marker MOUNTED (the
+ # WAIT_MARKER_DIR env, the marker mount, the optional ConfigMap volume naming
+ # it, no token) — a continuation renders the target's own chart, which may
+ # be either release.
+ jq -e --arg generation "$2" --arg marker "$3" '
+   .spec.replicas==1 and .spec.template.spec.initContainers[0].name=="wait-deps" and .spec.template.spec.initContainers[0].command==["python","/scripts/wait-deps.py"]
+   and any(.spec.template.spec.initContainers[0].env[];.name=="GSJ_DEPLOYMENT_GENERATION" and .value==$generation)
+   and (any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER" and .value==$marker)
+        or (any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER_DIR" and .value=="/marker")
+            and any(.spec.template.spec.initContainers[0].volumeMounts[]?;.name=="marker" and .mountPath=="/marker")
+            and any(.spec.template.spec.volumes[]?;.name=="marker" and .configMap.name==$marker and .configMap.optional==true)))' "$1" >/dev/null
+}
 authenticate_predecessor() {
  local installer=$1 expected=$2 directory=$3 parent descriptor signature version marker count file
  parent=$(cd "$(dirname "$installer")" && pwd); installer="$parent/$(basename "$installer")"
@@ -629,10 +643,7 @@ startup_helm_stage() {
  jq --arg web "$RELEASE-web" '.[]|select(.kind=="Deployment" and .metadata.name==$web)' "$GSJ_WORK/startup-next-resources.json" > "$GSJ_WORK/startup-next-web.json"
  # First init must be the exact script/marker barrier for the new, not-yet
  # provisioned Helm revision. No corpus or application process may precede it.
- # The barrier reads the marker from a mounted ConfigMap volume (the pod
- # holds no API token): the volume names the marker, optional, mounted into
- # wait-deps at the directory its env names.
- jq -e --arg generation "$RELEASE_ID:$revision" --arg marker "$RELEASE-provisioned" '.spec.replicas==1 and .spec.template.spec.initContainers[0].name=="wait-deps" and .spec.template.spec.initContainers[0].command==["python","/scripts/wait-deps.py"] and any(.spec.template.spec.initContainers[0].env[];.name=="GSJ_DEPLOYMENT_GENERATION" and .value==$generation) and any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER_DIR" and .value=="/marker") and any(.spec.template.spec.initContainers[0].volumeMounts[];.name=="marker" and .mountPath=="/marker") and any(.spec.template.spec.volumes[];.name=="marker" and .configMap.name==$marker and .configMap.optional==true)' "$GSJ_WORK/startup-next-web.json" >/dev/null || fail 'successor application lacks its exact first-init provisioning barrier'
+ startup_barrier_exact "$GSJ_WORK/startup-next-web.json" "$RELEASE_ID:$revision" "$RELEASE-provisioned" || fail 'successor application lacks its exact first-init provisioning barrier'
  marker=$(k get configmap "$RELEASE-provisioned" -o json)
  jq -e --arg generation "$RELEASE_ID:$revision" '.data.generation!=$generation' <<< "$marker" >/dev/null || fail 'successor provisioning already ran outside this continuation'
  current=$(jq --arg web "$RELEASE-web" '.[]|select(.kind=="Deployment" and .metadata.name==$web)' "$GSJ_WORK/startup-continuation/live.json"); uid=$(jq -r .metadata.uid <<< "$current")

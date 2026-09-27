@@ -2662,9 +2662,11 @@ lower `limits.upload_mb`.
 
 NetworkPolicy closes the outbound traffic of the gsj Pod (web, agent runner
 and MCP) and of Chroma, and pins Forgejo's; the provisioning Job and the Pods
-the installer opens beside the release keep their egress. "Outgoing
-connections" below lists what is allowed, what the installer resolves for it,
-and what its network check proves.
+the installer opens beside the release keep their egress, except the
+credential-repair Pod and the startup source-proof Pod, which carry the gsj
+Pod's labels and are held to its list. "Outgoing connections" below lists
+what is allowed, what the installer resolves for it, and what its network
+check proves.
 
 Trust inputs serve different consumers:
 
@@ -2787,29 +2789,34 @@ reach exactly:
   acceptance verifier inside gsj-web dials `public_url` — and, on k3s with
   its bundled servicelb, the `svclb` Pod in `kube-system` that fronts the
   controller's Service, which is where the node's address is translated to;
-- the addresses of `llm.base_url`, `ocr.url`, each `llm.allowed_origins` entry,
-  each proxy URL in `trust.proxy_file`, and `public_url` itself (and
-  `verification.connect_host` when you set it). A NetworkPolicy names
-  addresses, never hosts, so **the installer resolves every hostname among
-  them on the machine it runs on when an operation starts — `install`,
-  `upgrade`, `restore`** — and writes the addresses into the chart's values
+- the addresses of `llm.base_url`, `ocr.url`, each `llm.allowed_origins` entry
+  and each proxy URL in `trust.proxy_file`. A NetworkPolicy names addresses,
+  never hosts, so **the installer resolves every hostname among them on the
+  machine it runs on when an operation starts — `install`, `upgrade`,
+  `restore`** — and writes the addresses into the chart's values
   (`networkPolicy.egress.endpoints`, one `{cidr, port}` per address). An IP
-  literal is used as it is. A name of the LLM, the OCR, an origin or a proxy
-  that this machine cannot resolve is refused by name before anything is
-  touched; the public URL's name and the verification route's get an entry
-  when they resolve and a line in the log when they do not (the cluster's
-  own translation carries them, below). A continued, resumed or repaired
+  literal is used as it is. A name this machine cannot resolve is never a
+  refusal — a site that installed before this list existed keeps installing
+  — but the Pod gets no rule for it: the installer says so in its log, the
+  endpoint preflight says what the endpoint answered from here, and
+  acceptance skips what the Pod cannot reach. The same holds for an LLM or
+  OCR served as a Service inside the cluster (`….svc…`): this release's list
+  admits addresses outside the cluster only, so such an endpoint is not
+  reachable from the Pod under this release. A continued, resumed or repaired
   operation, and every command that applies nothing (`backup`, `sweep`,
   `abandon`, the named repairs), keep the addresses the operation recorded:
   they never ask this machine's resolver again, so a backup runs on a machine
   without the site's DNS and an interrupted operation resumes whatever the
-  resolver answers today. A name your cluster's DNS answers with another
-  address than this machine's DNS is yours to reconcile: the Pod would
-  resolve the name, connect to the cluster's answer and be refused, and the
-  Verbindungstest would say "Nicht verbunden". A model origin a lawyer enters
-  in a case's settings works only if its address is on this list. A proxy on
-  the list is a door: what the proxy permits is reachable through it, so the
-  list bounds the proxy's address, not what lies behind it.
+  resolver answers today. A restore to a machine that does not carry the
+  proxy file yet takes the proxy from the archive. A name your cluster's DNS
+  answers with another address than this machine's DNS is yours to
+  reconcile: the Pod would resolve the name, connect to the cluster's answer
+  and be refused, and the Verbindungstest would say "Nicht verbunden". A
+  model origin a lawyer enters in a case's settings works only if its
+  address is on this list. A proxy on the list is a door: what the proxy
+  permits is reachable through it, so the list bounds the proxy's address,
+  not what lies behind it — and the application's isolation panel, whose
+  probes honour the proxy, then measures the proxy's policy.
 
 Chroma may reach DNS and nothing else. Nothing in the gsj Pod reaches the
 Kubernetes API: its start-up check reads the provisioning Job's ready marker
@@ -2825,10 +2832,10 @@ services, an arbitrary address on 443.
 The installer's network check (`networkpolicy` in the summary, `egress` in
 `network-check.json`) asserts this from inside the gsj Pod at every
 install: Forgejo, Chroma and DNS answer, and so do the LLM's `/v1/models` and
-the OCR route when the installer's own preflight found that endpoint working
-from this machine (an endpoint that is down from both places keeps its
-acceptance skip and the install completes, as step 0 says; one that answers
-here and not from the Pod names a wrong list); `huggingface.co`, `pypi.org`,
+the OCR route when that endpoint answers this machine at that moment (an
+endpoint that is down from both places keeps its acceptance skip and the
+install completes, as step 0 says; one that answers here and not from the Pod
+names a wrong list); `huggingface.co`, `pypi.org`,
 `github.com`, `api.github.com`, `pi.dev`, `mobile.events.data.microsoft.com`
 and an arbitrary public address on 443, and the node's own port 22, get no
 connection within 10 s; from Chroma nothing but DNS gets through (proven by a
@@ -2837,20 +2844,23 @@ that can open nothing never passes); the three pairs of the earlier check
 still hold (Forgejo reaches the door on 8780, Forgejo does not reach Chroma,
 the door reaches Chroma); and the application's own isolation panel, read
 through the public route as the operator, calls every canary "blockiert" from
-both its vantages. A check that finds a connection where none may exist stops
+both its vantages — on a site that names a proxy the panel's verdicts are
+recorded, not held, because its probes go through the proxy. A check that
+finds a connection where none may exist stops
 the install at `verifying`, as the earlier deny check did; what every probe
 found stays in the operation's state (`egress-probe.json`, `isolation.json`).
 
 Four limits to know. (1) The rules name what a packet reaches **after** the
 cluster's service translation (a Service's Pod, the controller's Pod, never a
 ClusterIP or a node port): measured on k3s (kube-router) for the NodePort,
-the load-balancer and the servicelb shapes; Calico and Cilium with kube-proxy
-are documented to evaluate in the same place, and a CNI that evaluates before
-the translation would need `ipBlock` entries for those addresses instead — a
-CNI that enforces nothing (step 0's probe) leaves the list as documentation.
-A public address that is not translated to a Pod at all (a load balancer
-outside the cluster, a host-networked controller) is carried by the entry the
-installer writes for `public_url`'s resolved address. (2) The controller's
+the load-balancer and the servicelb shapes; no other CNI was measured, and a
+CNI that evaluates before the translation would need `ipBlock` entries for
+those addresses instead — a CNI that enforces nothing (step 0's probe) leaves
+the list as documentation. A public address that is not translated to a Pod
+at all (a load balancer outside the cluster) is not admitted: an address
+rule for it would admit everything behind that address; point
+`verification.connect_host` and `connect_port` at a node and the ingress
+NodePort instead, which the cluster translates to the controller. (2) The controller's
 namespace is admitted on every port. Under `managed-traefik` the installer
 narrows that to the controller's own Pods; under `reuse` it cannot know the
 controller's labels, so a controller that shares its namespace with other

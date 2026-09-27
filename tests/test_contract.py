@@ -53,6 +53,9 @@ def validated(site):
     return json.loads(out.stdout)
 
 
+STAND_IN_ENDPOINTS = [{"cidr": "198.51.100.20/32", "port": 443}]
+
+
 def compiled(tmp_path, site, *extra):
     release = tmp_path / "release.json"
     release.write_text(json.dumps(_release()))
@@ -71,7 +74,7 @@ def rendered(tmp_path, values=None, *args, release="gsj"):
         command += ["--values", str(path)]
     else:  # the installer always sets fullnameOverride to the release name (§3 of the contract)
         command += ["--set", "fullnameOverride=" + release, "--set", "operator.password=x",
-                    "--set", "llm.model=openai@http://llm.test:8000/v1#test-model"]
+                    "--set", "llm.model=openai@http://198.51.100.10:8000/v1#test-model"]   # an IPv4 literal: the chart admits it without a resolved list
     out = subprocess.run(command + list(args), capture_output=True, text=True,
                          env=dict(os.environ, KUBECONFIG=os.devnull))
     assert out.returncode == 0, out.stderr
@@ -100,7 +103,10 @@ def web_deployment(docs, release="gsj"):
 @pytest.mark.parametrize("example", EXAMPLES, ids=[p.name for p in EXAMPLES])
 def test_every_example_site_validates_compiles_and_renders_with_the_pinned_chart(tmp_path, example):
     site = validated(merged(example))
-    values = compiled(tmp_path, site)
+    # the runtime passes the resolved outbound list; here a stand-in address
+    # stands for the examples' hostnames, so a chart that refuses a hostname
+    # with an empty list still renders them
+    values = compiled(tmp_path, site, "--argjson", "egress_endpoints", json.dumps(STAND_IN_ENDPOINTS))
     release = site["target"]["release"]
     docs = rendered(tmp_path, values, release=release)
     kinds = {(d["kind"], d["metadata"]["name"]) for d in docs}
@@ -143,6 +149,15 @@ def test_every_compiled_leaf_is_a_value_the_pinned_chart_declares(tmp_path, exam
     unknown = sorted(leaf for leaf in emitted
                      if leaf not in declared and not any(leaf.startswith(m + ".") or leaf == m for m in maps))
     assert unknown == [], f"compile.jq emits values the pinned chart does not declare: {unknown}"
+    # the runtime's compile adds the outbound list and the controller pod
+    # selector; once the pinned chart declares them, that compile is held to
+    # the same rule (a pinned chart that predates them is not asked)
+    if "networkPolicy.egress.endpoints" in declared:
+        values = compiled(tmp_path, validated(merged(example)), "--argjson", "egress_endpoints", json.dumps(STAND_IN_ENDPOINTS))
+        emitted = set(leaves(values))
+        unknown = sorted(leaf for leaf in emitted
+                         if leaf not in declared and not any(leaf.startswith(m + ".") or leaf == m for m in maps))
+        assert unknown == [], f"the runtime's compile emits values the pinned chart does not declare: {unknown}"
 
 
 def test_the_synthetic_site_compiles_to_the_documented_keys(tmp_path):
@@ -172,6 +187,8 @@ def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
                 ("ServiceAccount", "gsj-provisioner"), ("Role", "gsj-provisioner"), ("RoleBinding", "gsj-provisioner"),
                 ("NetworkPolicy", "gsj-default-deny-ingress"), ("NetworkPolicy", "gsj-gsj-web-ingress"),
                 ("NetworkPolicy", "gsj-forgejo-ingress"), ("NetworkPolicy", "gsj-forgejo-egress"), ("NetworkPolicy", "gsj-chroma-ingress"),
+                # the gsj pod's and Chroma's outbound lists: red while the pin names a chart that predates them, like the contract document's identity test
+                ("NetworkPolicy", "gsj-gsj-egress"), ("NetworkPolicy", "gsj-chroma-egress"),
                 ("Ingress", "gsj-web")}
     missing = expected - names
     assert not missing, f"the pinned chart no longer renders {sorted(missing)}"

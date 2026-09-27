@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -274,7 +275,12 @@ sys.exit(code)
     curl.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
 a = sys.argv[1:]
-url = next((v for v in a if v.startswith("https://")), "")
+url = next((v for v in a if v.startswith("https://") or v.startswith("http://")), "")
+if url and "/api/" not in url and "-w" in a and ("/models" in url or "/chat/completions" in url or "/v1" in url):
+    # the network check's host-side endpoint probe: the state's "silent" list names endpoints that answer nothing
+    p = pathlib.Path(os.environ["TEST_KUBECTL_STATE"]); s = json.loads(p.read_text())
+    if any(part in url for part in s.get("silent_endpoints", [])): sys.exit(7)
+    sys.stdout.write("200"); sys.exit(0)
 if "/api/login" in url or "/api/admin/isolation" in url or "/api/logout" in url:
     # the door's isolation panel, through the public route: the state's
     # "isolation" answer (every canary blocked unless a test says otherwise)
@@ -1794,7 +1800,7 @@ def test_networkpolicy_check_records_the_closed_outbound_list_from_inside_both_p
     record = json.loads((work / "network-check.json").read_text())
     assert record["status"] == "passed" and record["egress"]["gsj"]["refuse"]["pi.dev"]["connected"] is False
     assert record["egress"]["chroma"] == {"control": "connected", "forgejo": "blocked", "web": "blocked", "public-address": "blocked", "github.com": "blocked", "dns": "ok"}
-    assert record["egress"]["asserted"] == {"llm": True, "ocr": True}
+    assert record["egress"]["asserted"] == {"llm": True, "ocr": True, "isolation": True}
     assert record["egress"]["isolation"] == {"targets": ["https://huggingface.co", "https://pypi.org", "https://github.com"],
                                              "server": ["blockiert"] * 3, "runner": ["blockiert"] * 3}
     assert (work / "egress-probe.json").exists() and (work / "isolation.json").exists(), "the probe and the panel's answer stay in the state"
@@ -1838,28 +1844,47 @@ def test_networkpolicy_check_is_red_when_the_gsj_pod_reaches_out_or_cannot_reach
     assert "reported nothing readable" in words or (work / "egress-probe.json").exists()
 
 
-@pytest.mark.parametrize("preflight,answer,ok", [
-    ({"llm": "unreachable", "ocr": "working"}, {"llm": {"error": "ConnectError"}}, True),      # down from here too: not asserted, as preflight said
-    ({"llm": "working", "ocr": "unreachable"}, {"ocr": {"error": "ConnectError"}}, True),
-    ({"llm": "absent", "ocr": "absent"}, {"llm": {"error": "ConnectError"}, "ocr": {"error": "ConnectError"}}, True),
-    ({"llm": "working", "ocr": "working"}, {"ocr": {"error": "ConnectError"}}, False),          # answered here, not the pod: the list is wrong
-    (None, {"llm": {"error": "ConnectError"}}, True),                                           # no preflight record: nothing asserted
+@pytest.mark.parametrize("silent,answer,ok", [
+    (["llm.example"], {"llm": {"error": "ConnectError"}}, True),        # answers nowhere: not asserted, its acceptance skip stands
+    (["ocr.example"], {"ocr": {"error": "ConnectError"}}, True),
+    (["llm.example", "ocr.example"], {"llm": {"error": "ConnectError"}, "ocr": {"error": "ConnectError"}}, True),
+    ([], {"ocr": {"error": "ConnectError"}}, False),                     # answers this machine, not the pod: the list is wrong
 ])
-def test_the_site_endpoints_are_asserted_only_when_preflight_found_them_working(runtime, preflight, answer, ok):
+def test_the_site_endpoints_are_asserted_only_when_they_answer_this_machine_now(runtime, silent, answer, ok):
     """An endpoint that is merely down keeps its acceptance skip and the
-    install completes, as endpoint_preflight promised; one that answered
-    the installer host and not the pod names a wrong outbound list."""
+    install completes, as the preflight promised; one that answers the
+    installer host now and not the pod names a wrong outbound list. The
+    judgement is made now, not from a preflight record of another operation."""
     run, state, work = runtime
     _network_cluster(state, deny_code=1, egress_rules=[{"match": "egress-probe", "code": 0, "stdout": json.dumps(_closed_egress_probe(answer=answer))}])
-    if preflight is None: (work / "endpoint-preflight.json").unlink()
-    else: (work / "endpoint-preflight.json").write_text(json.dumps(preflight))
+    s = json.loads(state.read_text()); s["silent_endpoints"] = silent; state.write_text(json.dumps(s))
     result = run(NETWORK_VERIFY)
     assert (result.returncode == 0) is ok, result.stderr
     if ok:
         record = json.loads((work / "network-check.json").read_text())
-        assert record["egress"]["asserted"] == {"llm": (preflight or {}).get("llm") == "working", "ocr": (preflight or {}).get("ocr") == "working"}
+        assert record["egress"]["asserted"] == {"llm": "llm.example" not in silent, "ocr": "ocr.example" not in silent, "isolation": True}
     else:
         assert "did not reach ocr" in result.stderr
+
+
+def test_a_proxied_site_records_the_isolation_panel_instead_of_holding_it(runtime):
+    """On a site that names a proxy, the panel's probes go through the proxy
+    and measure its policy: the verdicts are recorded, said, and not held;
+    the raw-socket probe still proves the pod itself connects to nothing."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    s = json.loads(state.read_text())
+    s["isolation"] = {"targets": ["https://huggingface.co"], "server": [{"target": "https://huggingface.co", "verdict": "erreichbar"}],
+                      "runner": [{"target": "https://huggingface.co", "verdict": "erreichbar"}]}
+    state.write_text(json.dumps(s))
+    site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = str(work / "proxies.json")
+    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "http://proxy.example:3128", "HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": ""}))
+    (work / "site.json").write_text(json.dumps(site))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode == 0, result.stderr
+    assert "recorded, not held: the site names a proxy" in result.stderr
+    record = json.loads((work / "network-check.json").read_text())
+    assert record["egress"]["asserted"]["isolation"] is False and record["egress"]["isolation"]["server"] == ["erreichbar"]
 
 
 @pytest.mark.parametrize("report,words", [
@@ -1914,6 +1939,36 @@ def test_networkpolicy_probe_names_only_the_endpoints_the_site_has(runtime):
     assert set(spec["answer"]) == {"forgejo", "chroma"}
 
 
+def test_the_egress_probe_program_measures_what_it_reports():
+    """The probe the network check runs inside the door's container is a
+    real program: run here against a local listener (an answer), a closed
+    local port (a refusal within the timeout) and a name that does not
+    resolve (unresolved), with a spec on stdin, as the check feeds it."""
+    import http.server, socket, threading
+    source = (INSTALLER / "runtime.sh").read_text()
+    program = source[source.index("GSJ_EGRESS_PROBE_PY='") + len("GSJ_EGRESS_PROBE_PY='"):]
+    program = program[:program.index("\n'\n")]
+    class Quiet(http.server.BaseHTTPRequestHandler):
+        def do_GET(self): self.send_response(204); self.end_headers()
+        def log_message(self, *a): pass
+    server = http.server.HTTPServer(("127.0.0.1", 0), Quiet); port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    closed = socket.socket(); closed.bind(("127.0.0.1", 0)); closed_port = closed.getsockname()[1]; closed.close()
+    spec = {"answer": {"local": f"http://127.0.0.1:{port}/api/healthz"},
+            "refuse": {"closed": {"host": "127.0.0.1", "port": closed_port}, "nowhere": {"host": "nowhere.invalid", "port": 443}},
+            "resolve": {"cluster": "localhost"}}
+    try:
+        out = subprocess.run([sys.executable, "-c", program, "egress-probe"], input=json.dumps(spec), capture_output=True, text=True, timeout=60)
+    finally:
+        server.shutdown()
+    assert out.returncode == 0, out.stderr
+    report = json.loads(out.stdout)
+    assert report["answer"] == {"local": {"http": 204}}
+    assert report["refuse"]["closed"]["connected"] is False and report["refuse"]["closed"]["outcome"] == "ConnectionRefusedError"
+    assert report["refuse"]["nowhere"] == {"connected": False, "outcome": "unresolved", "seconds": report["refuse"]["nowhere"]["seconds"]}
+    assert report["resolve"] == {"cluster": True}
+
+
 # --- the closed outbound list: compile resolves every address the site names ---
 
 def _payload_for_compile(tmp_path):
@@ -1945,15 +2000,15 @@ def test_compile_resolves_every_outside_address_the_site_names_into_the_outbound
     llm = "203.0.113.%d/32" % (sum(b"llm.example") % 200 + 10)
     models = "203.0.113.%d/32" % (sum(b"models.example") % 200 + 10)
     proxy = "203.0.113.%d/32" % (sum(b"proxy.example") % 200 + 10)
-    public = "203.0.113.%d/32" % (sum(b"legal.example") % 200 + 10)
     assert values["networkPolicy"]["enabled"] is True
     assert values["networkPolicy"]["ingressControllerNamespace"] == site["ingress"]["namespace"]
     assert values["networkPolicy"]["ingressControllerPodSelector"] == {}
     endpoints = values["networkPolicy"]["egress"]["endpoints"]
-    assert {(e["cidr"], e["port"]) for e in endpoints} == {(llm, 443), ("10.0.0.7/32", 8080), (models, 9000), (proxy, 3128), (proxy, 1080), (public, 443)}
-    assert len(endpoints) == 6 and endpoints == sorted(endpoints, key=lambda e: (e["cidr"], e["port"]))
-    # an IP literal is itself: the resolver is never asked about 10.0.0.7
-    assert sorted(json.loads(state.read_text())["resolved"]) == ["legal.example", "llm.example", "llm.example", "models.example", "proxy.example", "proxy.example"]
+    assert {(e["cidr"], e["port"]) for e in endpoints} == {(llm, 443), ("10.0.0.7/32", 8080), (models, 9000), (proxy, 3128), (proxy, 1080)}
+    assert len(endpoints) == 5 and endpoints == sorted(endpoints, key=lambda e: (e["cidr"], e["port"]))
+    # an IP literal is itself: the resolver is never asked about 10.0.0.7; the
+    # public URL is reached through the cluster's own translation, never as an address
+    assert sorted(json.loads(state.read_text())["resolved"]) == ["llm.example", "llm.example", "models.example", "proxy.example", "proxy.example"]
 
 
 def test_compile_emits_an_empty_outbound_list_for_a_site_that_names_no_outside_address(runtime, tmp_path):
@@ -1962,31 +2017,35 @@ def test_compile_emits_an_empty_outbound_list_for_a_site_that_names_no_outside_a
     site = json.loads((work / "site.json").read_text())
     site["llm"].update(base_url="", model=""); site["ocr"]["url"] = ""
     (work / "site.json").write_text(json.dumps(site))
-    site["public_url"] = "https://192.0.2.44:8443"
     (work / "site.json").write_text(json.dumps(site))
     result = run('GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/values.pending.json"\n', TEST_PAYLOAD=str(payload))
     assert result.returncode == 0, result.stderr
-    assert json.loads((work / "values.pending.json").read_text())["networkPolicy"]["egress"] == {"endpoints": [{"cidr": "192.0.2.44/32", "port": 8443}]}
+    assert json.loads((work / "values.pending.json").read_text())["networkPolicy"]["egress"] == {"endpoints": []}
     assert "resolved" not in json.loads(state.read_text())
 
 
 @pytest.mark.parametrize("key,url,words", [
-    ("llm", "https://llm.invalid/v1", "llm.base_url (https://llm.invalid) names a host this machine cannot resolve"),
-    ("ocr", "https://ocr.invalid/v1/chat/completions", "ocr.url (https://ocr.invalid) names a host this machine cannot resolve"),
+    ("llm", "https://llm.invalid/v1", "llm.base_url (https://llm.invalid) names a host this machine cannot resolve; the gsj pod gets no outbound rule for it"),
+    ("ocr", "https://ocr.invalid/v1/chat/completions", "ocr.url (https://ocr.invalid) names a host this machine cannot resolve; the gsj pod gets no outbound rule for it"),
+    ("llm", "http://vllm.models.svc:8000/v1", "llm.base_url (http://vllm.models.svc:8000) names an in-cluster Service; this release's outbound list admits addresses outside the cluster only"),
 ])
-def test_compile_refuses_a_name_this_machine_cannot_resolve_by_name(runtime, tmp_path, key, url, words):
-    """A rule that names nothing would leave the agent without its model and
-    say so only in the Verbindungstest: the refusal comes at compile, before
-    anything is touched, and names the site key and the host."""
+def test_a_name_this_machine_cannot_resolve_is_said_never_refused(runtime, tmp_path, key, url, words):
+    """A site that installed before the list existed keeps installing: a
+    name this machine cannot resolve, or an in-cluster Service, gets no
+    rule and a line in the log naming the site key and the origin; the
+    other endpoints keep theirs. The endpoint preflight and acceptance say
+    what such an endpoint answers."""
     run, state, work = runtime
     payload = _payload_for_compile(tmp_path)
     site = json.loads((work / "site.json").read_text())
     if key == "llm": site["llm"]["base_url"] = url
     else: site["ocr"]["url"] = url
     (work / "site.json").write_text(json.dumps(site))
-    result = run('GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/values.pending.json"\n', TEST_PAYLOAD=str(payload))
-    assert result.returncode == 1
-    assert words in result.stderr and "GSJ:" in result.stderr, result.stderr
+    result = run('COMMAND=upgrade; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/values.pending.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0 and words in result.stderr, result.stderr
+    cidrs = {e["cidr"] for e in json.loads((work / "values.pending.json").read_text())["networkPolicy"]["egress"]["endpoints"]}
+    other = "ocr.example" if key == "llm" else "llm.example"
+    assert cidrs == {"203.0.113.%d/32" % (sum(other.encode()) % 200 + 10)}
 
 
 @pytest.mark.parametrize("command", ["resume", "repair", "restore-repair", "backup", "sweep", "abandon", "credential-repair"])
@@ -2006,47 +2065,39 @@ def test_a_continued_or_non_applying_command_reuses_the_recorded_outbound_list(r
     assert "resolved" not in json.loads(state.read_text())
 
 
-@pytest.mark.parametrize("command,strict", [("install", True), ("upgrade", True), ("restore", True), ("backup", False), ("resume", False), ("abandon", False)])
-def test_a_name_this_machine_cannot_resolve_refuses_only_when_an_operation_starts(runtime, tmp_path, command, strict):
-    """At an operation's start the LLM's host must resolve here; with no
-    recorded list, every other verb logs the name and goes on without a
-    rule for it (a backup on a machine without the site's DNS still runs)."""
+def test_the_public_route_is_never_an_address_rule(runtime, tmp_path):
+    """The site's own public URL and the verification route are reached
+    through the cluster's translation to the controller (the namespace
+    peers): an address rule for them would admit everything behind a
+    shared front, so neither is resolved into the list."""
     run, state, work = runtime
     payload = _payload_for_compile(tmp_path)
     site = json.loads((work / "site.json").read_text())
-    site["llm"]["base_url"] = "https://llm.invalid/v1"
-    (work / "site.json").write_text(json.dumps(site))
-    result = run(f'COMMAND={command}; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
-    if strict:
-        assert result.returncode == 1 and "llm.base_url (https://llm.invalid) names a host this machine cannot resolve" in result.stderr, result.stderr
-    else:
-        assert result.returncode == 0, result.stderr
-        assert "llm.base_url (https://llm.invalid) names a host this machine cannot resolve; the gsj pod gets no outbound rule" in result.stderr
-        cidrs = {e["cidr"] for e in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]}
-        assert "203.0.113.%d/32" % (sum(b"ocr.example") % 200 + 10) in cidrs
-
-
-def test_the_public_route_hosts_never_refuse_an_operation(runtime, tmp_path):
-    """public_url and verification.connect_host get a rule when they resolve
-    (a route outside the cluster's translation needs it) and a log line when
-    they do not: the cluster's own translation carries them, and a node's
-    name often resolves only inside the cluster."""
-    run, state, work = runtime
-    payload = _payload_for_compile(tmp_path)
-    site = json.loads((work / "site.json").read_text())
-    site["public_url"] = "https://cases.invalid"
-    site["verification"].update(connect_host="node.invalid", connect_port=30443)
-    (work / "site.json").write_text(json.dumps(site))
-    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
-    assert result.returncode == 0, result.stderr
-    assert "public_url (https://cases.invalid) names a host this machine cannot resolve; the gsj pod gets no outbound rule" in result.stderr
-    assert "verification.connect_host names a host this machine cannot resolve" in result.stderr and "node.invalid" not in result.stderr
+    site["public_url"] = "https://cases.example"
     site["verification"].update(connect_host="node.example", connect_port=30443)
     (work / "site.json").write_text(json.dumps(site))
     result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
     assert result.returncode == 0, result.stderr
-    node = "203.0.113.%d/32" % (sum(b"node.example") % 200 + 10)
-    assert {"cidr": node, "port": 30443} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+    assert not {"cases.example", "node.example"} & set(json.loads(state.read_text()).get("resolved", []))
+    ports = {e["port"] for e in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]}
+    assert 30443 not in ports
+
+
+def test_a_continued_operation_takes_the_list_from_its_own_intent_first(runtime, tmp_path):
+    """Between an operation's intent and its promotion the retained
+    values.pending.json still holds the previous operation's values: a
+    resume in that window compiles the list its own intent recorded."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    (work / "values.pending.json").write_text(json.dumps({"networkPolicy": {"egress": {"endpoints": [{"cidr": "198.51.100.1/32", "port": 443}]}}}))
+    intent = work / "operation-intents" / "abcdef0123456789abcdef01"; intent.mkdir(parents=True)
+    (intent / "values.json").write_text(json.dumps({"networkPolicy": {"egress": {"endpoints": [{"cidr": "198.51.100.2/32", "port": 443}]}}}))
+    result = run('COMMAND=resume; RESUME_ID=abcdef0123456789abcdef01; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0, result.stderr
+    assert json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"] == [{"cidr": "198.51.100.2/32", "port": 443}]
+    result = run('COMMAND=resume; RESUME_ID=ffffffffffffffffffffffff; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0, result.stderr
+    assert json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"] == [{"cidr": "198.51.100.1/32", "port": 443}]
 
 
 @pytest.mark.parametrize("url,words", [
@@ -2062,10 +2113,40 @@ def test_a_port_outside_the_range_a_policy_takes_is_refused_at_compile(runtime, 
     assert result.returncode == 1 and words in result.stderr, result.stderr
 
 
+def test_a_port_with_a_leading_zero_is_read_in_decimal(runtime, tmp_path):
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    site = json.loads((work / "site.json").read_text()); site["llm"]["base_url"] = "https://llm.example:08080/v1"
+    (work / "site.json").write_text(json.dumps(site))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0, result.stderr
+    llm = "203.0.113.%d/32" % (sum(b"llm.example") % 200 + 10)
+    assert {"cidr": llm, "port": 8080} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+
+
+def test_a_restore_without_the_proxy_file_takes_the_proxy_from_the_archive(runtime, tmp_path):
+    """A restore to a machine that does not carry the proxy file yet: the
+    archive's proxy Secret names the proxy the restored release will use,
+    and the list carries it."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = str(work / "absent-proxies.json")
+    (work / "site.json").write_text(json.dumps(site))
+    secret = {"kind": "Secret", "metadata": {"name": "synthetic-release-proxy"},
+              "data": {"HTTP_PROXY": base64.b64encode(b"http://proxy.example:3128").decode(), "HTTPS_PROXY": base64.b64encode(b"").decode(), "NO_PROXY": base64.b64encode(b"").decode()}}
+    (work / "restorable-secrets.json").write_text(json.dumps({"items": [secret]}))
+    result = run('COMMAND=restore; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0, result.stderr
+    proxy = "203.0.113.%d/32" % (sum(b"proxy.example") % 200 + 10)
+    assert {"cidr": proxy, "port": 3128} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+    assert "cannot be read here" not in result.stderr
+
+
 @pytest.mark.parametrize("proxies,rc,words", [
     (None, 0, "trust.proxy_file cannot be read here; the gsj pod gets no outbound rule for the proxy"),
     ({"HTTP_PROXY": "http://user:secret@proxy.example:3128", "HTTPS_PROXY": "", "NO_PROXY": ""}, 1, "proxy_file URLs must not carry credentials"),
     ({"HTTP_PROXY": "user:secret@proxy.invalid:3128", "HTTPS_PROXY": "", "NO_PROXY": ""}, 1, "proxy_file URLs must not carry credentials"),
+    ({"HTTP_PROXY": "http://user:secret@proxy.invalid:3128"}, 1, "proxy_file must contain exactly HTTP_PROXY, HTTPS_PROXY and NO_PROXY strings"),
 ])
 def test_a_proxy_file_that_cannot_serve_the_list_is_said_or_refused_without_repeating_it(runtime, tmp_path, proxies, rc, words):
     """A proxy file that is not there yet (a restore to a fresh machine
@@ -2109,8 +2190,7 @@ def test_load_site_compiles_the_outbound_list_and_a_direct_compile_keeps_the_ear
     assert result.returncode == 0, result.stderr
     compiled = json.loads((work / "values.pending.json").read_text())
     llm = "203.0.113.%d/32" % (sum(b"llm.example") % 200 + 10); ocr = "203.0.113.%d/32" % (sum(b"ocr.example") % 200 + 10)
-    public = "203.0.113.%d/32" % (sum(b"legal.example") % 200 + 10)
-    assert {(e["cidr"], e["port"]) for e in compiled["networkPolicy"]["egress"]["endpoints"]} == {(llm, 443), (ocr, 443), (public, 443)}
+    assert {(e["cidr"], e["port"]) for e in compiled["networkPolicy"]["egress"]["endpoints"]} == {(llm, 443), (ocr, 443)}
     direct = subprocess.run(["jq", "--slurpfile", "release", str(payload / "release.json"), "-f", str(payload / "compile.jq"), str(work / "site.json")],
                             capture_output=True, text=True, check=True)
     assert "egress" not in json.loads(direct.stdout)["networkPolicy"]
