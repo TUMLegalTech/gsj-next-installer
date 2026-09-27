@@ -1358,6 +1358,12 @@ egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --a
  printf '%s\n' "$list"
 }
 compile_values() { # merged site file -> the chart's values on stdout: compile.jq plus the outbound list
+ # the gsj pod's start-up check reads its ready marker from a mounted
+ # ConfigMap, which the kubelet refreshes within about 80 s of the
+ # provisioning Job's write: a dependency deadline near the schema's floor
+ # would expire first, and is said so here
+ local deadline; deadline=$(jq -r '.deadlines.dependencies_seconds // 0' "$1" 2>/dev/null || echo 0)
+ [[ ! $deadline =~ ^[0-9]+$ ]] || (( deadline == 0 || deadline >= 120 )) || log "deadlines.dependencies_seconds is $deadline: the gsj pod's ready marker reaches it through a mounted ConfigMap, which the kubelet refreshes within about 80 s of the provisioning Job's write, so a deadline under 120 s may expire before the marker appears"
  local endpoints; endpoints=$(egress_endpoints "$1") || exit 1
  jq --slurpfile release "$GSJ_PAYLOAD/release.json" --argjson egress_endpoints "$endpoints" -f "$GSJ_PAYLOAD/compile.jq" "$1"
 }
@@ -4338,6 +4344,17 @@ network_verify() {
      egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
              isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
 }
+no_proxy_covers() { # host, the proxy file's NO_PROXY -> 0 when the pod dials the host directly (the pod's list carries the cluster names too)
+ local host=$1 entry
+ local IFS=','
+ for entry in $2 localhost .localhost 127.0.0.1 .svc .cluster.local "$RELEASE-forgejo" "$RELEASE-chroma"; do
+   entry=${entry// /}; [[ -n $entry ]] || continue
+   [[ $entry == '*' ]] && return 0
+   entry=${entry#.}
+   [[ $host == "$entry" || $host == *".$entry" ]] && return 0
+ done
+ return 1
+}
 endpoint_admitted() { # site key, URL -> 0 when the applied values admit the pod's dial: an IPv4 literal the chart derives, an address the name resolves to now (any one, since answer sets rotate), or the proxy the site routes the scheme through
  local rest authority host want proxy='' pfile
  rest=${2#*://}; authority=${rest%%[/?#]*}; authority=${authority##*@}
@@ -4345,7 +4362,8 @@ endpoint_admitted() { # site key, URL -> 0 when the applied values admit the pod
  [[ ! $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
  pfile=$(j '.trust.proxy_file // ""')
  if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && proxy=$(jq -r --arg url "$2" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$pfile" 2>/dev/null); fi
- if [[ -n $proxy ]]; then
+ # a host the file's NO_PROXY covers is dialled directly, whatever proxy the scheme has
+ if [[ -n $proxy ]] && ! no_proxy_covers "$host" "$(jq -r '.NO_PROXY // ""' "$pfile" 2>/dev/null)"; then
    want=$(resolve_endpoint trust.proxy_file "$proxy" 2>/dev/null | jq -s '.') && [[ $want != '[]' ]] \
      && jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1 && return 0
  fi
@@ -4380,8 +4398,9 @@ endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s,
    if [[ -r $file ]]; then
      proxy=$(jq -r --arg url "$1" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$file" 2>/dev/null)
      [[ -z $proxy ]] || args+=(--proxy "$proxy")
-     local bypass; bypass=$(jq -r '.NO_PROXY // ""' "$file" 2>/dev/null)
-     [[ -z $bypass ]] || args+=(--noproxy "$bypass")
+     # the pod's NO_PROXY: the file's entries plus the cluster names the trust step adds
+     local bypass; bypass="$(jq -r '.NO_PROXY // ""' "$file" 2>/dev/null),localhost,.localhost,127.0.0.1,.svc,.cluster.local,$RELEASE-forgejo,$RELEASE-chroma"
+     args+=(--noproxy "${bypass#,}")
    fi
  fi
  # the shell's own proxy variables never route this probe: only the site's

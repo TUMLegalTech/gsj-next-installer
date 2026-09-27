@@ -2804,15 +2804,20 @@ reach exactly:
   refusal — a site that installed before this list existed keeps installing
   — but the Pod gets no rule for it: the installer says so in its log, the
   endpoint preflight says what the endpoint answered from here, and
-  acceptance skips what the Pod cannot reach. The same holds for an LLM or
-  OCR served as a Service inside the cluster (`….svc…`): this release's list
-  admits addresses outside the cluster only, so such an endpoint is not
-  reachable from the Pod under this release. A continued, resumed or repaired
+  acceptance skips what the Pod cannot reach. An LLM or OCR served as a Service
+  inside the cluster (`….svc…`) resolves nowhere on this machine and gets no
+  entry either: this release's list admits addresses outside the cluster
+  only, so such an endpoint is not reachable from the Pod under this
+  release — nor is one published on a NodePort or LoadBalancer of the same
+  cluster, whose packets are translated to its Pod before the rule is
+  evaluated. A continued, resumed or repaired
   operation, and every command that applies nothing (`backup`, `sweep`,
   `abandon`, the named repairs), keep the addresses the operation recorded:
   once the operation has recorded its list they never ask this machine's
-  resolver again, so a backup runs on a machine without the site's DNS and an
-  interrupted operation resumes whatever the resolver answers today. A
+  resolver again for that list, so a backup runs on a machine without the
+  site's DNS and an interrupted operation resumes whatever the resolver
+  answers today (the acceptance's host-side check resolves an endpoint once
+  more only to tell whether the list admits its dial). A
   continued operation that recorded nothing (one that began before this list
   existed) resolves once and keeps the answer in its state; a command that
   continues nothing and finds none recorded resolves what it can at each run,

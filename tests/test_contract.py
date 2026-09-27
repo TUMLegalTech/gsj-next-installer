@@ -146,6 +146,9 @@ def test_every_compiled_leaf_is_a_value_the_pinned_chart_declares(tmp_path, exam
     # placement selector) or declares empty: compare at the map
     maps = {"placement.nodeSelector", "ingress.annotations", "trust", "corpus.resources", "networkPolicy.ingressControllerPodSelector",
             "resources.web", "resources.mcp", "resources.runner", "resources.forgejo", "resources.chroma"}
+    # the pod-selector map is exempt as a map the chart hands on whole — a pinned chart that declares the outbound list must declare it too
+    if "networkPolicy.egress.endpoints" in declared:
+        assert "networkPolicy.ingressControllerPodSelector" in declared
     unknown = sorted(leaf for leaf in emitted
                      if leaf not in declared and not any(leaf.startswith(m + ".") or leaf == m for m in maps))
     assert unknown == [], f"compile.jq emits values the pinned chart does not declare: {unknown}"

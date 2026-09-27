@@ -3542,7 +3542,7 @@ def test_the_host_side_endpoint_probe_dials_as_the_pod_dials_and_a_tls_failure_k
     probes = json.loads(state.read_text())["host_probes"]
     llm = next(p for p in probes if "https://llm.example/v1/models" in p)
     assert llm[llm.index("--cacert") + 1].endswith("/answers-here-ca.pem") and llm[llm.index("--proxy") + 1] == "http://proxy.example:3128"
-    assert llm[llm.index("--noproxy") + 1] == "ocr.example"
+    assert llm[llm.index("--noproxy") + 1] == "ocr.example,localhost,.localhost,127.0.0.1,.svc,.cluster.local,synthetic-release-forgejo,synthetic-release-chroma"
     bundle = (work / "answers-here-ca.pem").read_text()
     assert bundle.endswith("MIIB\n-----END CERTIFICATE-----\n") and len(bundle) > 60, "the site's CA rides beside the system bundle"
     record = json.loads((work / "network-check.json").read_text())
@@ -3715,3 +3715,41 @@ def test_the_resolver_keeps_the_operators_locale_for_a_unicode_name(runtime, tmp
     assert result.returncode == 0, result.stderr
     assert "münchen.example" in json.loads(state.read_text())["resolved"]
     assert {"cidr": "203.0.113.%d/32" % (sum("münchen.example".encode()) % 200 + 10), "port": 443} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+
+
+def test_a_no_proxy_endpoint_on_a_proxied_site_is_dialled_directly_and_needs_its_own_rule(runtime):
+    """NO_PROXY makes the pod dial the endpoint itself, not the proxy: the
+    proxy's rule admits nothing for it, so with the endpoint's own address
+    off the list the pod's answer is not held, and the host-side probe
+    bypasses the proxy for it as the pod does (the cluster names the trust
+    step adds ride along)."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": ".example"}))
+    site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = "proxies.json"
+    (work / "site.json").write_text(json.dumps(site))
+    values = json.loads((work / "values.pending.json").read_text())
+    proxy = "203.0.113.%d/32" % (sum(b"proxy.example") % 200 + 10)
+    values["networkPolicy"]["egress"]["endpoints"] = [{"cidr": proxy, "port": 3128}]
+    (work / "values.pending.json").write_text(json.dumps(values))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode == 0, result.stderr
+    assert "llm.base_url (https://llm.example) answers this machine, but the applied outbound list carries no rule" in result.stderr
+    record = json.loads((work / "network-check.json").read_text())
+    assert record["egress"]["asserted"] == {"llm": False, "ocr": False, "isolation": False}
+    probe = next(p for p in json.loads(state.read_text())["host_probes"] if "https://llm.example/v1/models" in p)
+    assert probe[probe.index("--noproxy") + 1] == ".example,localhost,.localhost,127.0.0.1,.svc,.cluster.local,synthetic-release-forgejo,synthetic-release-chroma"
+
+
+def test_a_dependency_deadline_under_two_minutes_is_said_at_compile(runtime, tmp_path):
+    """The mounted ready marker takes the kubelet up to about 80 s: a deadline
+    near the schema's floor is said to be short, never refused."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    site = json.loads((work / "site.json").read_text()); site["deadlines"]["dependencies_seconds"] = 60
+    (work / "site.json").write_text(json.dumps(site))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0 and "deadlines.dependencies_seconds is 60" in result.stderr and "may expire before the marker appears" in result.stderr, result.stderr
+    site["deadlines"]["dependencies_seconds"] = 120; (work / "site.json").write_text(json.dumps(site))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode == 0 and "dependencies_seconds" not in result.stderr, result.stderr
