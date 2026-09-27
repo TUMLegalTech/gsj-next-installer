@@ -1735,14 +1735,22 @@ retained_site_matches() {
  # $1 selected site, $2 the site retained by an operation. Earlier installers
  # filled the two generated managed-local-ca trust paths into the saved site
  # after the operation was recorded; load_site now records them first.
- # Admit exactly that derivation of this operation's own CA, nothing else.
+ # Admit exactly that derivation of this operation's own CA. The one other
+ # difference admitted is corpus.allow_update, and only while the operation
+ # carries record_installed's corpus_update_reset marker: that operation is
+ # complete and was stopped between rewriting the operator's file and its
+ # saved site, which its resume finishes. Nothing else.
  cmp -s "$1" "$2" && return
- [[ -f $STATE_DIR/tls/ca.crt && ! -L $STATE_DIR/tls/ca.crt ]] || return 1
- jq -e --arg ca "$STATE_DIR/tls/ca.crt" --slurpfile o "$2" '
-   $o[0] as $o | $o.tls.profile=="managed-local-ca" and .tls.profile=="managed-local-ca" and
+ local derive=false spent=false
+ [[ ! -f $STATE_DIR/tls/ca.crt || -L $STATE_DIR/tls/ca.crt ]] || derive=true
+ ! jq -e '.corpus_update_reset=="pending"' "$STATE_DIR/operation.json" >/dev/null 2>&1 || spent=true
+ jq -e --arg ca "$STATE_DIR/tls/ca.crt" --argjson derive "$derive" --argjson spent "$spent" --slurpfile o "$2" '
+   def admitted: if $spent then del(.corpus.allow_update) else . end;
+   ($o[0]|admitted) as $o | admitted | ($spent and .==$o) or ($derive and
+   $o.tls.profile=="managed-local-ca" and .tls.profile=="managed-local-ca" and
    $o.tls.ca_file=="" and $o.verification.ca_file=="" and
    .tls.ca_file==$ca and .verification.ca_file==$ca and
-   del(.tls.ca_file,.verification.ca_file)==($o|del(.tls.ca_file,.verification.ca_file))
+   del(.tls.ca_file,.verification.ca_file)==($o|del(.tls.ca_file,.verification.ca_file)))
  ' "$1" >/dev/null
 }
 lease_repair() {
@@ -4653,10 +4661,18 @@ record_installed() {
  # resume compares them with the site its Helm target was compiled from. A
  # file that is a link is never rewritten through it, and then nothing is:
  # records that say false beside a file that says true would refuse every
- # later backup as a settings change.
+ # later backup as a settings change. The marker goes into the operation
+ # before any of it: a stop after the operation is complete and before both
+ # rewrites are done left a Lease whose resume said "already complete" beside
+ # a file that still said true, or refused the file it had rewritten as a
+ # changed configuration; with the marker the resume finishes them
+ # (corpus_reset_finish).
  local corpus_reset=''
  if jq -e --slurpfile release "$GSJ_PAYLOAD/release.json" '(.kind//"")!="restore" and (.corpus_update_from//"")!="" and .corpus_update_from!=$release[0].corpus.fingerprint' "$STATE_DIR/operation.json" >/dev/null && [[ $(j .corpus.allow_update) == true ]]; then
-   if [[ -f $CONFIG && ! -L $CONFIG ]]; then corpus_reset=rewrite; jq '.corpus.allow_update=false' "$SITE" | atomic "$SITE"
+   if [[ -f $CONFIG && ! -L $CONFIG ]]; then
+     corpus_reset=rewrite
+     jq '.corpus_update_reset="pending"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
+     jq '.corpus.allow_update=false' "$SITE" | atomic "$SITE"
    else corpus_reset=kept; fi
  fi
  storage_identity > "$GSJ_WORK/storage.json"
@@ -4668,19 +4684,33 @@ record_installed() {
  if [[ $(jq -r '.kind//""' "$STATE_DIR/operation.json") == restore && -f $STATE_DIR/restoration.json ]]; then
    jq '.status="complete"' "$STATE_DIR/restoration.json" | atomic "$STATE_DIR/restoration.json"
  fi
- if [[ -n $corpus_reset ]]; then
-   local change; change="$(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")"
-   if [[ $corpus_reset == rewrite ]]; then
-     # The file first: a stop between the two writes leaves the file and the
-     # installed record agreeing, which is what the next backup compares.
-     jq '.corpus.allow_update=false' "$CONFIG" | atomic "$CONFIG"
-     jq '.corpus.allow_update=false' "$STATE_DIR/site.pending.json" | atomic "$STATE_DIR/site.pending.json"
-     log "The corpus change this operation admitted is complete (fingerprint $change); corpus.allow_update is set back to false in $CONFIG, the operation's saved site and the installed record, so a later release's corpus change is refused until it is admitted again after its own pre-migration backup"
-   else
-     log "The corpus change this operation admitted is complete (fingerprint $change), but $CONFIG is a symbolic link or no longer a regular file, so corpus.allow_update stays true there and in the installed record: set it to false in the file the link names, or a later release's corpus change is admitted without being asked for"
-   fi
+ if [[ $corpus_reset == rewrite ]]; then corpus_reset_finish
+ elif [[ $corpus_reset == kept ]]; then
+   log "The corpus change this operation admitted is complete (fingerprint $(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")), but $CONFIG is a symbolic link or no longer a regular file, so corpus.allow_update stays true there and in the installed record: set it to false in the file the link names, or a later release's corpus change is admitted without being asked for"
  fi
  installation_summary
+}
+corpus_reset_finish() {
+ # The rest of spending corpus.allow_update, once the operation is complete:
+ # the operator's file and the operation's saved site, then the marker
+ # record_installed wrote before any of it. record_installed runs this, and so
+ # does a resume of that complete operation while the marker is there; every
+ # write is idempotent, so a stop anywhere here is finished the same way.
+ assert_owner
+ local change; change="$(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")"
+ if [[ -f $CONFIG && ! -L $CONFIG ]]; then
+   # The file first: a stop between the two writes leaves the file and the
+   # installed record agreeing, which is what the next backup compares.
+   jq '.corpus.allow_update=false' "$CONFIG" | atomic "$CONFIG"
+   jq '.corpus.allow_update=false' "$STATE_DIR/site.pending.json" | atomic "$STATE_DIR/site.pending.json"
+   log "The corpus change this operation admitted is complete (fingerprint $change); corpus.allow_update is set back to false in $CONFIG, the operation's saved site and the installed record, so a later release's corpus change is refused until it is admitted again after its own pre-migration backup"
+ else
+   # It became a link after the records said false: those cannot be taken
+   # back, so the file the link names is the operator's to correct.
+   jq '.corpus.allow_update=false' "$STATE_DIR/site.pending.json" | atomic "$STATE_DIR/site.pending.json"
+   log "The corpus change this operation admitted is complete (fingerprint $change) and corpus.allow_update is false in the operation's saved site and the installed record, but $CONFIG is now a symbolic link or no longer a regular file and was not rewritten: set it to false in the file the link names, or every later backup is refused as a settings change"
+ fi
+ jq 'del(.corpus_update_reset)' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
 }
 installation_summary() {
  # The install summary: URL, operator login, redacted settings, identities,
@@ -4866,7 +4896,12 @@ resume_operation() {
    # launching Helm. The immutable target and a fresh Job must match first.
    helm_application_validate; stage_vectors; wait_application;;
  backup-verified) secret_inputs; relocated_images_probe; managed_dependencies; helm_apply; stage_vectors; wait_application;;
- complete) log 'Operation is already complete'; return;;
+ complete)
+   # record_installed was stopped after completing the operation and before
+   # both site rewrites were done (retained_site_matches admitted exactly that
+   # difference above): finish them.
+   if jq -e '.corpus_update_reset=="pending"' "$STATE_DIR/operation.json" >/dev/null; then corpus_reset_finish; fi
+   log 'Operation is already complete'; return;;
  *) fail "operation stopped in $phase; inspect saved state before explicit repair";;
  esac
  record_ready; verify_application; record_installed

@@ -407,9 +407,11 @@ main upgrade --expected-version v1.2.3 --config "$SITE" --non-interactive
         "corpus_update_from": "c" * 64}
 
 
-def _record_installed(runtime, operation, link=False):
+def _record_installed(runtime, operation, link=False, stop=None):
     """record_installed with the fake: the installed ConfigMap is rendered by a
-    stand-in for `create --dry-run` and captured at apply."""
+    stand-in for `create --dry-run` and captured at apply. stop: the write the
+    run is killed before -- "file" (the operator's site file) or "saved" (the
+    operation's saved site)."""
     run, _, work = runtime
     state = work / "state"
     state.mkdir()
@@ -437,24 +439,34 @@ def _record_installed(runtime, operation, link=False):
         (state / name).write_text("{}")
     (state / "operation.json").write_text(json.dumps(
         {"operation": OPERATION, "target": "synthetic-release", "kind": "upgrade", "status": "verifying", **operation}))
+    stopper = ""
+    if stop:
+        target = {"file": '"$CONFIG"', "saved": '"$STATE_DIR/site.pending.json"'}[stop]
+        stopper = ('eval "$(declare -f atomic | sed 1s/^atomic/real_atomic/)"\n'
+                   f'atomic() {{ [[ $1 != {target} ]] || exit 137; real_atomic "$@"; }}\n')
     result = run(f'''STATE_DIR="$TEST_WORK/state"; GSJ_PAYLOAD="$TEST_WORK/payload"; CONFIG="$TEST_CONFIG"; OPERATION={OPERATION}
 assert_owner() {{ :; }}
 storage_identity() {{ printf '[]\\n'; }}
 installation_summary() {{ :; }}
-k() {{ case "$1" in
+{stopper}k() {{ case "$1" in
   create) jq -n --arg name "$3" --rawfile record "${{4#--from-file=installed.json=}}" '{{apiVersion:"v1",kind:"ConfigMap",metadata:{{name:$name}},data:{{"installed.json":$record}}}}';;
   apply) cat > "$TEST_WORK/applied.json";;
   *) kubectl --context "$CONTEXT" --namespace "$NAMESPACE" "$@";;
 esac; }}
 record_installed
 ''', TEST_CONFIG=str(config))
+    return result, _places(runtime, config), own, config
+
+
+def _places(runtime, config):
+    _, _, work = runtime
+    state = work / "state"
     applied = json.loads(json.loads((work / "applied.json").read_text())["data"]["installed.json"])
-    places = {"site file": json.loads(config.read_text())["corpus"]["allow_update"],
-              "merged site": json.loads((work / "site.json").read_text())["corpus"]["allow_update"],
-              "saved operation site": json.loads((state / "site.pending.json").read_text())["corpus"]["allow_update"],
-              "installed record": applied["site"]["corpus"]["allow_update"],
-              "installed record kept here": json.loads((state / "installed.json").read_text())["site"]["corpus"]["allow_update"]}
-    return result, places, own, config
+    return {"site file": json.loads(config.read_text())["corpus"]["allow_update"],
+            "merged site": json.loads((work / "site.json").read_text())["corpus"]["allow_update"],
+            "saved operation site": json.loads((state / "site.pending.json").read_text())["corpus"]["allow_update"],
+            "installed record": applied["site"]["corpus"]["allow_update"],
+            "installed record kept here": json.loads((state / "installed.json").read_text())["site"]["corpus"]["allow_update"]}
 
 
 def test_a_completed_corpus_change_sets_allow_update_back_to_false_everywhere(runtime):
@@ -469,7 +481,8 @@ def test_a_completed_corpus_change_sets_allow_update_back_to_false_everywhere(ru
     assert json.loads(config.read_text()) == {**own, "corpus": {**own["corpus"], "allow_update": False}}
     assert "corpus.allow_update" in result.stderr and "set back to false" in result.stderr
     _, _, work = runtime
-    assert json.loads((work / "state" / "operation.json").read_text())["status"] == "complete"
+    recorded = json.loads((work / "state" / "operation.json").read_text())
+    assert recorded["status"] == "complete" and "corpus_update_reset" not in recorded, recorded
 
 
 @pytest.mark.parametrize("operation", [
@@ -494,3 +507,67 @@ def test_a_linked_site_file_keeps_allow_update_and_is_named(runtime):
     assert places == dict.fromkeys(places, True), places
     assert config.is_symlink()
     assert "is a symbolic link or no longer a regular file" in result.stderr and str(config) in result.stderr
+
+
+def _resume(runtime, config):
+    """A named resume of the operation the stop left: its Lease unrenewed for
+    180 s, and the merged site load_site builds from the operator's file as
+    that file now reads."""
+    run, state, work = runtime
+    cluster = json.loads(state.read_text())
+    cluster["lease"] = {"apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                        "metadata": {"name": "synthetic-release-operation", "resourceVersion": "7"},
+                        "spec": {"holderIdentity": OPERATION, "renewTime": "2000-01-01T00:00:00.000000Z"}}
+    state.write_text(json.dumps(cluster))
+    site = json.loads((work / "site.json").read_text())
+    site["corpus"]["allow_update"] = json.loads(config.read_text())["corpus"]["allow_update"]
+    (work / "site.json").write_text(json.dumps(site))
+    return run(f'''STATE_DIR="$TEST_WORK/state"; GSJ_PAYLOAD="$TEST_WORK/payload"; CONFIG="$TEST_CONFIG"; RESUME_ID={OPERATION}; COMMAND=resume
+assert_owner() {{ :; }}
+resume_operation
+''', TEST_CONFIG=str(config))
+
+
+@pytest.mark.parametrize("stop, file_after_stop", [("file", True), ("saved", False)])
+def test_a_stop_between_the_completed_record_and_the_site_rewrites_is_finished_by_resume(runtime, stop, file_after_stop):
+    """record_installed marks the operation complete and only then rewrites
+    the operator's file and the operation's saved site, in two steps. A stop
+    before the first left both true beside a false installed record -- the
+    resume said 'already complete' and every later backup was refused as a
+    settings change; a stop between them left the file false and the saved
+    site true, and the resume refused 'configuration changed'. The operation
+    now carries a marker, written before it is complete, that admits exactly
+    that difference, and the resume finishes both rewrites."""
+    _, _, work = runtime
+    result, places, own, config = _record_installed(runtime, {"corpus_update_from": "c" * 64}, stop=stop)
+    assert result.returncode == 137, result.stderr
+    stopped = json.loads((work / "state" / "operation.json").read_text())
+    assert stopped["status"] == "complete" and stopped.get("corpus_update_reset") == "pending", stopped
+    assert places["installed record"] is False and places["saved operation site"] is True
+    assert places["site file"] is file_after_stop
+    resumed = _resume(runtime, config)
+    assert resumed.returncode == 0, resumed.stderr
+    assert "configuration changed" not in resumed.stderr
+    after = _places(runtime, config)
+    del after["merged site"]           # rebuilt from the file by every run
+    assert after == dict.fromkeys(after, False), after
+    assert json.loads(config.read_text()) == {**own, "corpus": {**own["corpus"], "allow_update": False}}
+    finished = json.loads((work / "state" / "operation.json").read_text())
+    assert finished["status"] == "complete" and "corpus_update_reset" not in finished, finished
+    assert "set back to false" in resumed.stderr
+
+
+def test_the_marker_admits_a_difference_in_allow_update_alone(runtime):
+    """retained_site_matches admits the one value record_installed changes, and
+    only while the operation carries its marker; anything else still refuses."""
+    run, _, work = runtime
+    saved = json.loads((work / "site.json").read_text())
+    (work / "saved.json").write_text(json.dumps(saved))
+    only = {**saved, "corpus": {**saved["corpus"], "allow_update": not saved["corpus"]["allow_update"]}}
+    (work / "only.json").write_text(json.dumps(only))
+    (work / "more.json").write_text(json.dumps({**only, "public_url": "https://other.example"}))
+    body = 'for f in only more; do if retained_site_matches "$TEST_WORK/$f.json" "$TEST_WORK/saved.json"; then echo "$f=admitted"; else echo "$f=refused"; fi; done'
+    (work / "operation.json").write_text(json.dumps({"operation": OPERATION, "status": "complete", "corpus_update_reset": "pending"}))
+    assert run(body).stdout.split() == ["only=admitted", "more=refused"]
+    (work / "operation.json").write_text(json.dumps({"operation": OPERATION, "status": "complete"}))
+    assert run(body).stdout.split() == ["only=refused", "more=refused"]
