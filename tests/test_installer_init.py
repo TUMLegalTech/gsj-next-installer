@@ -571,18 +571,39 @@ def test_a_missing_or_libressl_openssl_is_refused_by_bootstrap_before_init_runs(
     assert json.loads(state.read_text())["calls"] == []
 
 
-def test_a_box_without_a_sha256_tool_is_named_for_init_and_unchanged_for_every_other_verb(runtime, tmp_path):
-    """init names the missing tool; every other verb keeps its refusal as it
-    was (the payload check, which blames the payload)."""
-    run, _, _ = runtime
+@pytest.mark.parametrize("verb", ["init", "inspect", "install", "upgrade", "backup", "restore", "repair"])
+def test_a_box_without_a_sha256_tool_is_named_for_every_verb(runtime, tmp_path, verb):
+    """Every verb names the missing tool in bootstrap's first seconds: without
+    it the payload check further on fails as 'embedded payload integrity
+    failed', which blames the payload for what is the box's."""
+    run, state, _ = runtime
     path = _tools(tmp_path / "tools", **FLOORS)
     for name in ("sha256sum", "shasum"):
         (Path(path) / name).unlink(missing_ok=True)
-    result = run("COMMAND=init; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    result = run(f"COMMAND={verb}; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path, TMPDIR=str(tmpdir))
     assert result.returncode != 0 and "REACHED" not in result.stdout
-    assert "bootstrap utility required: sha256sum or shasum" in result.stderr and "integrity" not in result.stderr
-    other = run("COMMAND=install; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
-    assert other.returncode != 0 and "sha256sum or shasum" not in other.stderr
+    assert "bootstrap utility required: sha256sum or shasum" in result.stderr and "integrity" not in result.stderr, result.stderr
+    assert list(tmpdir.iterdir()) == [] and json.loads(state.read_text())["calls"] == []
+
+
+@pytest.mark.parametrize("verb", ["init", "install"])
+def test_a_bootstrap_failure_after_its_work_directory_exists_leaves_nothing_under_tmpdir(runtime, tmp_path, verb):
+    """bootstrap makes the private work directory, then unpacks the payload
+    and fetches clients -- each of which can stop the run. main installed the
+    exit trap that removes the directory only after bootstrap returned, so
+    such a stop left a gsj-install.* directory behind. The script run here
+    carries no payload below its marker: the stop is 'installer payload
+    missing', after the directory exists."""
+    run, _, work = runtime
+    path = _tools(tmp_path / "tools", **FLOORS)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    (work / "no-payload.sh").write_text(f'source "$TEST_FUNCTIONS"\nCOMMAND={verb}; FETCH_TOOLS=false; RENEWER=\'\'\nbootstrap\necho REACHED\n')
+    result = run('exec bash "$TEST_WORK/no-payload.sh"', PATH=path, TMPDIR=str(tmpdir))
+    assert result.returncode == 1 and "installer payload missing" in result.stderr and "REACHED" not in result.stdout, result.stderr
+    assert sorted(p.name for p in tmpdir.iterdir()) == [], "the work directory was left behind"
 
 
 def test_bootstrap_skips_only_the_client_refusal_for_init(runtime, tmp_path):
@@ -1170,16 +1191,47 @@ def test_init_is_read_only_against_the_cluster(tmp_path, keypair):
     assert box.helm_calls() and all(call == ["version", "--short"] for call in box.helm_calls()), box.helm_calls()
 
 
+@pytest.mark.parametrize("verb", [["inspect"], ["install", "--non-interactive", "--config", "/nonexistent/site.json"]])
+def test_leftover_variables_never_reach_a_cluster_or_a_process_group_from_any_verb(tmp_path, keypair, verb):
+    """cleanup_exit acts on what these name: a process group to signal, a
+    probe Pod to delete, a Lease to release, an operation to name. main
+    cleared an operator's exported leftovers for init alone; an exported
+    HELM_PID made inspect's exit signal a process group it never started.
+    Every verb clears them before bootstrap: the sentinel outlives inspect
+    (which succeeds) and an install that stops at its missing configuration,
+    no mutating kubectl call is made and the leftover operation is not named."""
+    box = Box(tmp_path, keypair)
+    sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
+    try:
+        env = {**box.env, "PROBE_POD": "leftover-probe", "OPERATION": "leftover-op", "LEASE_ACQUIRED": "true",
+               "TRANSFER_HANDBACK_POD": "leftover-pod", "RECOVERY_HINT": "leftover-hint", "RENEWER": str(sentinel.pid),
+               "HELM_PID": str(sentinel.pid), "GSJ_ADDON_COMMAND_PID": str(sentinel.pid)}
+        result = subprocess.run([shutil.which("bash", path=SYSTEM_PATH), str(box.installer), *verb], env=env,
+                                cwd=str(box.installer.parent), capture_output=True, text=True, timeout=180)
+        assert sentinel.poll() is None, f"{verb[0]}'s exit signalled a process group it did not own"
+    finally:
+        sentinel.kill()
+        sentinel.wait()
+    assert result.returncode == (0 if verb[0] == "inspect" else 1), result.stderr
+    if verb[0] == "install":
+        assert "configuration file is missing" in result.stderr, result.stderr
+    assert "leftover" not in result.stderr, result.stderr
+    assert "MUTATION-REFUSED" not in result.stderr
+    assert not any(v in call for call in box.kube_calls() for v in ("delete", "replace", "create", "apply", "patch", "exec"))
+    assert list(box.tmpdir.iterdir()) == []
+
+
 def test_leftover_variables_never_reach_a_cluster_even_when_init_stops_before_its_own_code(runtime):
-    """A recovery bundle refuses init after the exit trap exists: the unset
-    lives in main, before the trap, so the leftovers are gone by then."""
+    """A recovery bundle refuses init after the exit trap exists (bootstrap
+    installs it): the unset lives in main, before bootstrap, so the leftovers
+    are gone by then."""
     run, state, work = runtime
     payload = work / "payload"
     (payload / "helpers").mkdir(parents=True)
     (payload / "helpers" / "lease-repair-source-release.json").write_text("{}")
     for name in ("verification-cleanup.sh", "startup-recovery.sh"):
         (payload / "helpers" / name).write_text("")
-    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { :; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n',
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { install_exit_traps; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n',
                  PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true")
     assert result.returncode != 0 and "supports only inspect and lease-repair" in result.stderr
     assert not (work / "init-ran").exists()

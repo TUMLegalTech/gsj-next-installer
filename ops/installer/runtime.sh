@@ -412,8 +412,9 @@ helm_verb_preflight() {
 }
 bootstrap() {
  for utility in bash curl tar gzip base64 openssl awk cut uname mktemp date sync; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
- # init alone names a box without a SHA-256 tool here (the payload check below would blame the payload).
- [[ ${COMMAND:-} != init ]] || command -v sha256sum >/dev/null || command -v shasum >/dev/null || fail 'bootstrap utility required: sha256sum or shasum'
+ # Every verb names a box without a SHA-256 tool here: the payload check below
+ # would fail as 'embedded payload integrity failed', blaming the payload.
+ command -v sha256sum >/dev/null || command -v shasum >/dev/null || fail 'bootstrap utility required: sha256sum or shasum'
  openssl_preflight
  # ${FETCH_TOOLS:-false}: main sets it while parsing arguments, but bootstrap
  # must not abort with an unbound variable if it is ever reached without that.
@@ -429,6 +430,10 @@ bootstrap() {
  os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m)
  case "$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) fail "unsupported installer architecture: $arch";; esac
  GSJ_PLATFORM="$os/$arch"; GSJ_WORK=$(mktemp -d "${TMPDIR:-/tmp}/gsj-install.XXXXXXXX")
+ # The exit trap removes this directory, so it goes in the moment the
+ # directory exists: the unpack and the client fetches below can stop the
+ # run, and a trap installed after bootstrap returned left it behind.
+ install_exit_traps
  GSJ_PAYLOAD="$GSJ_WORK/payload"; GSJ_PRIVATE_BIN="$GSJ_WORK/bin"; mkdir -p "$GSJ_PAYLOAD" "$GSJ_PRIVATE_BIN"
  marker=$(awk '/^__GSJ_PAYLOAD_BELOW__$/ {print NR+1; exit}' "$0"); [[ -n $marker ]] || fail 'installer payload missing'
  tail -n "+$marker" "$0" | base64 --decode | tar -xz -C "$GSJ_PAYLOAD"
@@ -1510,7 +1515,7 @@ cleanup_exit() {
  # Failure retains the lease and durable operation identity for named recovery.
  if (( rc == 0 )) && [[ -n ${OPERATION:-} ]]; then release_operation; fi
  # A terminal stage names its own recovery; resuming it would only repeat it.
- if (( rc != 0 )) && [[ ${LEASE_ACQUIRED:-false} == true ]]; then log "Operation $OPERATION incomplete; retained state at $STATE_DIR. Use ${RECOVERY_HINT:-resume --operation $OPERATION}."; fi
+ if (( rc != 0 )) && [[ ${LEASE_ACQUIRED:-false} == true ]]; then log "Operation ${OPERATION:-} incomplete; retained state at ${STATE_DIR:-}. Use ${RECOVERY_HINT:-resume --operation ${OPERATION:-}}."; fi
  [[ -n ${GSJ_WORK:-} ]] && rm -rf "$GSJ_WORK"
  exit "$rc"
 }
@@ -6197,10 +6202,11 @@ main() {
  [[ $COMMAND != upgrade || -n $TO || -n $EXPECTED_VERSION ]] || $INTERACTIVE || fail 'non-interactive upgrade requires --to VERSION; repeat the installed release with --to <installed version>'
  # init reports on the clients this machine has and downloads nothing but its own release's files, under every --fetch-tools form.
  [[ $COMMAND != init ]] || ! $FETCH_TOOLS || fail 'init reports on the clients this machine has and downloads nothing but its own release; run it without --fetch-tools'
- # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal); init sets
- # none, and an operator's exported leftovers must not reach a cluster through init's exit trap.
- [[ $COMMAND != init ]] || unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT
- bootstrap; install_exit_traps
+ # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal); every verb
+ # sets its own after bootstrap installs the exit trap, and an operator's exported leftovers must reach neither a
+ # cluster nor a process: an exported HELM_PID made inspect's exit signal a process group it never started.
+ unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT
+ bootstrap
  source "$GSJ_PAYLOAD/helpers/verification-cleanup.sh"
  source "$GSJ_PAYLOAD/helpers/startup-recovery.sh"
  # Startup proof inputs are separately inventoried signed helpers.
