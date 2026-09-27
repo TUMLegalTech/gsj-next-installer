@@ -2618,12 +2618,18 @@ URL_SINKS = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still
 URL_DERIVES = re.compile(r"\|\s*(cut|tr|sha256sum|shasum|md5sum|openssl|base64|wc|sort|uniq|od|xxd|fold|rev|atomic|immutable_file)\b")
 # head, tail, sed, awk, grep and jq hand their input on (`| head -n 1`, `| sed -n p`,
 # `| jq -R .` print the URL itself); only these forms of them extract: a sed
-# under -n whose substitution replaces with one captured group and prints with
-# the p flag, where no group opens on .* or .+, and a grep that counts or only
-# tests. Without -n a line the pattern misses is printed whole, and a group of
-# everything keeps the URL. Matched on the raw text, where the quoted sed
-# program still is.
-URL_EXTRACTS = re.compile(r"\|\s*(sed\s+(?=(?:-[nE]+\s+)*-E*n)(?:-[nE]+\s+)+'s([#/|,])(?:(?!\(\.[*+])[^'])*?\2\\[1-9]\2p'"
+# under -n whose substitution has ONE group, replaces with it and prints with
+# the p flag, where that group is a bracket expression that excludes '@', '/',
+# '?' and '#' -- it stops before a userinfo's '@', the path, the query and the
+# fragment -- or digits alone (a port), and no '@' follows it in the pattern (a
+# group before an '@' is the userinfo); and a grep that counts or only tests.
+# Without -n a line the pattern misses is printed whole, and every other group
+# -- `(.*)`, `([^ ]+)`, `([^/:]*@)`, `([^/:@]+)` -- keeps a whole URL, a
+# userinfo or a query. In a program delimited by '#' the class writes it `\#`.
+# Matched on the raw text, where the quoted sed program still is.
+URL_SED_GROUP = r"\((?:\[\^(?=[^\]]*@)(?=[^\]]*/)(?=[^\]]*\?)(?=[^\]]*#)[^\]]*\]|\[0-9\])(?:[*+]|\{[0-9,]+\})\)"
+URL_EXTRACTS = re.compile(r"\|\s*(sed\s+(?=(?:-[nE]+\s+)*-E*n)(?:-[nE]+\s+)+'s([#/|,])(?:\\.|(?!\2)[^'\\(])*"
+                          + URL_SED_GROUP + r"(?:\\[^@]|(?!\2)[^'\\(@])*\2\\1\2p'"
                           r"|grep\s+-[A-Za-z]*[cq])")
 URL_ASSIGN = re.compile(r"(?:^|[;&|({]\s*|\bthen\s+|\belse\s+|\bdo\s+|\blocal\s+(?:-[A-Za-z]+\s+)*|\bexport\s+|\bdeclare\s+(?:-[A-Za-z]+\s+)*|\s)([A-Za-z_][A-Za-z0-9_]*)=")
 URL_FUNCTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{")
@@ -2738,8 +2744,9 @@ def _printed_urls(directory):
     everywhere in the file otherwise. A backslash-continued line and a quoted
     string that spans lines are scanned whole. A printf piped into a filter
     that derives (cut, tr, a digest...) does not print, nor one piped into a
-    sed -n that prints one captured group narrower than the line with p, or
-    a grep that counts or tests; one piped into anything else (cat, tee,
+    sed -n that prints with p its one group, a class that stops before an
+    '@', '/', '?' and '#' or digits alone (URL_EXTRACTS says which), or a
+    grep that counts or tests; one piped into anything else (cat, tee,
     less, a function, head, tail, awk, grep or jq, and sed in any other form)
     does. Nothing expands inside single
     quotes, so text there is not a URL."""
@@ -2830,17 +2837,25 @@ URL_SCAN_MUTANTS = {
     "a printf piped into a sed that keeps the whole line": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -E \'s#(.*)#\\1#\'\n}\n',
     "a printf piped into sed -n and a group of the whole line": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^(.*)$#\\1#p\'\n}\n',
     "a site field through sed -n and a group of all after the scheme": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#https://(.+)#\\1#p\')\n log "at $where"\n}\n',
+    # a group narrower than the line still prints what url_origin_only drops
+    # unless its class excludes '@', '/', '?' and '#': every non-space is the
+    # whole URL, a group that ends on an '@' or stands before one is the
+    # userinfo, and a class that admits '?' keeps a query after the host
+    "a printf piped into sed -n and a group of every non-space": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^([^ ]+)$#\\1#p\'\n}\n',
+    "a site field through sed -n and a group of the userinfo and its @": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:]*@)?.*#\\1#p\')\n log "at $where"\n}\n',
+    "a site field through sed -n and a group before an @": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:@?\\#]+)@.*#\\1#p\')\n log "at $where"\n}\n',
+    "a printf piped into sed -n and a group that keeps the query": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^https://([^/:@]+).*#\\1#p\'\n}\n',
 }
 URL_SCAN_CLEAN = {
     "the origin": 'clean() {\n local url=$1\n log "could not be acquired from $(url_origin_only "$url")"\n}\n',
     "an alias of the origin": 'clean() {\n local url=$1 origin\n origin=$(url_origin_only "$url")\n fail "cannot reach $origin"\n}\n',
-    "a derivation": 'clean() {\n local url=$1 host\n host=$(printf \'%s\' "$url" | sed -nE \'s#^https://([^/:]+).*#\\1#p\')\n log "host $host"\n}\n',
+    "a derivation": 'clean() {\n local url=$1 host\n host=$(printf \'%s\' "$url" | sed -nE \'s#^https://([^/:@?\\#]+).*#\\1#p\')\n log "host $host"\n}\n',
     "a printf piped into a digest": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sha256sum\n}\n',
     "a single-quoted literal": "clean() {\n log 'set corpus.vectors_url in the site file'\n}\n",
     "a URL passed to a command": 'clean() {\n local url=$1 code\n code=$(curl --silent --output /dev/null --write-out \'%{http_code}\' "$url" || true)\n log "answered HTTP $code"\n}\n',
     "a local of the same name in another function": 'other() {\n local where=$1\n where="registry.base ($(url_origin_only "$where"))"\n}\nclean() {\n local where=$1\n log "$where is not a plain file"\n}\n',
-    "a printf piped into sed -n and a capture": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sed -nE \'s#^https://([^/:]+).*#\\1#p\'\n}\n',
-    "a site field through sed -E -n and a capture": 'clean() {\n local host\n host=$(j .public_url | sed -E -n \'s#^https://([^/:]+).*#\\1#p\')\n log "host $host"\n}\n',
+    "a printf piped into sed -n and a capture": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sed -nE \'s#^https://([^/:@?\\#]+).*#\\1#p\'\n}\n',
+    "a site field through sed -E -n and a capture": 'clean() {\n local host\n host=$(j .public_url | sed -E -n \'s#^https://([^/:@?\\#]+).*#\\1#p\')\n log "host $host"\n}\n',
     "a port through sed -n and a capture": 'clean() {\n local url=$1 port\n port=$(printf \'%s\' "$url" | sed -nE \'s#https://[^/:]+:([0-9]+).*#\\1#p\')\n log "port $port"\n}\n',
     "a count through grep": 'clean() {\n local url=$1 slashes\n slashes=$(printf \'%s\' "$url" | grep -c /)\n log "$slashes slashes"\n}\n',
 }
