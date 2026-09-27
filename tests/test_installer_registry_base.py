@@ -404,18 +404,6 @@ def test_a_registry_that_stumbles_once_is_not_refused(runtime, tmp_path):
     assert "All 6 images pulled" in result.stderr
 
 
-def test_a_pod_that_never_settles_stops_at_the_dependency_deadline_with_its_conditions(runtime, tmp_path):
-    run, _, work = runtime
-    (work / "status.json").write_text(json.dumps({"status": {"conditions": [
-        {"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector"}]}}))
-    _, result = _probe(run, work, tmp_path)
-    assert result.returncode != 0
-    assert "deadlines.dependencies_seconds" in result.stderr
-    # a review finding: the condition's REASON is named; the scheduler's message is kept, never repeated
-    assert "PodScheduled: Unschedulable" in result.stderr and "didn't match Pod's node affinity/selector" not in result.stderr
-    assert "didn't match Pod's node affinity/selector" in (work / "pull-probe-status.json").read_text()
-
-
 # --- the audit of the fix: each finding, pinned -------------------------------
 
 def _installed(work, base):
@@ -723,16 +711,19 @@ def test_a_probe_pod_kubectl_could_not_create_is_named_without_kubectl_s_words(r
 
 
 def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(runtime, tmp_path):
-    """a review finding: the deadline refusal joined every False condition's
-    MESSAGE -- the scheduler's free text (a taint's key and value, a node's
-    name). It now names the conditions' reasons (the API's enum words) and
-    keeps the Pod's status in the state directory."""
+    """The deadline refusal joined every False condition's MESSAGE -- free
+    text the kubelet and the scheduler compose (a container's name, a taint's
+    key and value, a node's name). It names the conditions' reasons (the
+    API's enum words) and keeps the Pod's status in the state directory. The
+    Pod here is placed and pulling; one the scheduler cannot place has its
+    own refusal, pinned below."""
     run, _, work = runtime
     marker = "ZZSECRET-CANARY"
     waiting = {"waiting": {"reason": "ContainerCreating"}}
     status = json.loads(_statuses([waiting] * 6))
-    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable",
-                                       "message": "0/3 nodes are available: taint team=" + marker}]
+    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "True"},
+                                      {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady",
+                                       "message": "containers with unready status: [pull-web] " + marker}]
     (work / "status.json").write_text(json.dumps(status))
     release = _public_release(); payload = _payload(tmp_path, release); site = _site()
     site["registry"].update(base=BASE, pull_secret="corp-pull"); site.setdefault("deadlines", {})["dependencies_seconds"] = 10
@@ -741,22 +732,23 @@ def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(run
     result = run(PROBE_PRELUDE.format(payload=payload) + "relocated_images_probe")
     assert result.returncode != 0
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
-    assert "did not finish pulling" in line and "PodScheduled: Unschedulable" in line and "pull-probe-status.json" in line
+    assert "did not finish pulling" in line and "ContainersReady: ContainersNotReady" in line and "pull-probe-status.json" in line
+    assert "PodScheduled" not in line, "a condition that is True is not a reason the pull did not finish"
     assert marker not in result.stdout + result.stderr
     assert marker in (work / "pull-probe-status.json").read_text()
 
 
 def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, tmp_path):
-    """a review finding: the deadline refusal joined every False condition's
-    MESSAGE -- the scheduler's free text (a taint's key and value, a node's
-    name). It now names the conditions' reasons (the API's enum words) and
-    keeps the Pod's status in the state directory."""
+    """The API does not constrain a reason string: one this installer does
+    not know is named by the word "other", and its message is kept, never
+    repeated."""
     run, _, work = runtime
     marker = "ZZSECRET-CANARY"
     waiting = {"waiting": {"reason": "ContainerCreating"}}
     status = json.loads(_statuses([waiting] * 6))
-    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable" + "ZZSECRETCANARY",
-                                       "message": "0/3 nodes are available: taint team=" + marker}]
+    status["status"]["conditions"] = [{"type": "PodScheduled", "status": "True"},
+                                      {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady" + "ZZSECRETCANARY",
+                                       "message": "containers with unready status: [pull-web] " + marker}]
     (work / "status.json").write_text(json.dumps(status))
     release = _public_release(); payload = _payload(tmp_path, release); site = _site()
     site["registry"].update(base=BASE, pull_secret="corp-pull"); site.setdefault("deadlines", {})["dependencies_seconds"] = 10
@@ -765,7 +757,7 @@ def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, t
     result = run(PROBE_PRELUDE.format(payload=payload) + "relocated_images_probe")
     assert result.returncode != 0
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
-    assert "did not finish pulling" in line and "PodScheduled: other" in line and "ZZSECRETCANARY" not in result.stderr and "pull-probe-status.json" in line
+    assert "did not finish pulling" in line and "ContainersReady: other" in line and "ZZSECRETCANARY" not in result.stderr and "pull-probe-status.json" in line
     assert marker not in result.stdout + result.stderr
     assert marker in (work / "pull-probe-status.json").read_text()
 
@@ -775,13 +767,14 @@ def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, t
 CREATING = {"waiting": {"reason": "ContainerCreating"}}
 
 
-def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix="", states=None):
+def _slow(run, work, tmp_path, base, pulled_at=None, recorded=None, dependencies=10, initialization=20, operation=None, prefix="", states=None, status=None):
     """The probe over containers that are still pulling (no failure reported,
-    unless states says otherwise): each poll is 5 s, so poll n sees
-    spent = 5*(n-1). pulled_at: the poll whose status has all six pulled;
-    None: they never finish. recorded: the base the installed deployment was
-    recorded with (None: no installed record)."""
-    (work / "status.json").write_text(_statuses(states or [CREATING] * 6))
+    unless states says otherwise; status: the Pod's whole status instead):
+    each poll is 5 s, so poll n sees spent = 5*(n-1). pulled_at: the poll
+    whose status has all six pulled; None: they never finish. recorded: the
+    base the installed deployment was recorded with (None: no installed
+    record)."""
+    (work / "status.json").write_text(status or _statuses(states or [CREATING] * 6))
     if pulled_at:
         (work / f"status-after-{pulled_at}.json").write_text(_statuses([PULLED] * 6))
     if recorded is not None:
@@ -853,16 +846,17 @@ def test_a_pull_failure_a_retry_can_clear_is_waited_out_on_a_plain_site_and_said
     the kubelet retried, so on a slow link one timed-out pull of a large image
     was refused while its retry was still pulling. A connection, a rate limit
     or words this installer does not classify can clear on a retry: said once,
-    and waited out to the bound."""
+    and waited out for deadlines.dependencies_seconds from its first report."""
     run, _, work = runtime
     result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [TIMEOUT], pulled_at=31,       # 150 s in
-                   dependencies=100, initialization=200)
+                   dependencies=200, initialization=200)
     assert result.returncode == 0, result.stderr
     assert "All 6 images pulled" in result.stderr
     retried = [l for l in result.stderr.splitlines() if "is failing and being retried" in l]
     assert len(retried) == 1, result.stderr
     assert "could not connect to the registry" in retried[0] and "a retry can clear" in retried[0], retried[0]
-    assert "deadlines.dependencies_seconds plus deadlines.initialization_seconds (300 s)" in retried[0], retried[0]
+    assert "up to deadlines.dependencies_seconds (200 s) after it was first reported" in retried[0], retried[0]
+    assert "initialization_seconds" not in retried[0], "a failure is never given the long bound of a pull in progress"
     assert "i/o timeout" not in result.stderr, "the runtime's words are classified, never repeated"
 
 
@@ -899,23 +893,77 @@ def test_a_definitive_failure_of_one_image_is_not_masked_by_a_retried_failure_of
     assert "could not connect" not in line
 
 
-@pytest.mark.parametrize("base, polls, within", [
-    ("", 61, "deadlines.dependencies_seconds plus deadlines.initialization_seconds (300 s)"),
-    (BASE, 21, "deadlines.dependencies_seconds (100 s)"),
+@pytest.mark.parametrize("base, still", [
+    ("", "still failing deadlines.dependencies_seconds (100 s) after it was first reported"),
+    (BASE, "still failing at the end of deadlines.dependencies_seconds (100 s)"),
 ], ids=["plain", "relocated"])
-def test_a_retried_pull_failure_still_failing_at_the_bound_is_refused_by_its_class(runtime, tmp_path, base, polls, within):
-    """At the bound a failure the kubelet kept retrying is refused as a failure,
-    named by its class and by the deadline it outlived -- never as a pull that
-    did not finish."""
+def test_a_retried_pull_failure_still_failing_at_the_dependency_deadline_is_refused_by_its_class(runtime, tmp_path, base, still):
+    """A failure the kubelet kept retrying for deadlines.dependencies_seconds
+    is refused there as a failure, named by its class and by the deadline it
+    outlived -- never as a pull that did not finish, and on a plain site
+    never waited out to the long bound, which is a pull in progress's
+    alone."""
     run, _, work = runtime
     result = _slow(run, work, tmp_path, base=base, states=[PULLED] * 5 + [TIMEOUT], dependencies=100, initialization=200)
     assert result.returncode != 0
-    assert _polls(work) == polls, "refused at the bound, not at 90 s"
+    assert _polls(work) == 21, "refused at deadlines.dependencies_seconds (100 s), not at 90 s nor at the 300 s bound"
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "cannot pull this release" in line and "1 of 6 images" in line, line
-    assert "the node could not connect to the registry" in line and "still failing at the end of " + within in line, line
+    assert "the node could not connect to the registry" in line and still in line, line
     assert "did not finish pulling" not in line and "i/o timeout" not in result.stderr
     assert result.stderr.count("is failing and being retried") == 1
+
+
+DNS = {"waiting": {"reason": "ErrImagePull", "message": "dial tcp: lookup registry.company.com: no such host"}}
+UNTRUSTED = {"waiting": {"reason": "ErrImagePull", "message": "tls: failed to verify certificate: x509: certificate signed by unknown authority"}}
+RATE_LIMITED = {"waiting": {"reason": "ErrImagePull", "message": "429 Too Many Requests: toomanyrequests: rate limit exceeded"}}
+DISK_FULL = {"waiting": {"reason": "ErrImagePull", "message": "failed to extract layer: write /var/lib/containerd/x: no space left on device"}}
+UNCLASSIFIED = {"waiting": {"reason": "ErrImagePull", "message": "something this installer has never seen"}}
+
+
+@pytest.mark.parametrize("waiting, condition", [
+    (TIMEOUT, "the node could not connect to the registry"),
+    (DNS, "the node could not connect to the registry"),
+    (UNTRUSTED, "the node does not trust the registry's certificate"),
+    (RATE_LIMITED, "the registry rate-limited the pull"),
+    (DISK_FULL, "the node's disk is full"),
+    (UNCLASSIFIED, "a condition this installer does not classify"),
+], ids=["timeout", "dns", "x509", "rate-limit", "disk", "unclassified"])
+def test_a_failure_a_retry_could_clear_that_persists_to_the_dependency_deadline_is_refused_there_by_class_and_image(runtime, tmp_path, waiting, condition):
+    """On a site without registry.base a failure of any class but the
+    definitive three was waited out to deadlines.dependencies_seconds plus
+    deadlines.initialization_seconds, 24 hours and a quarter by default. The
+    previous release gave its Forgejo image deadlines.dependencies_seconds,
+    the provisioning hook's timeout. A failure reported that long is refused
+    there, by its class and the failing image's reference: not at 90 s, the
+    definitive classes' bound, and not at the long bound, which is a pull
+    in progress's alone."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [waiting], dependencies=100, initialization=200)
+    assert result.returncode != 0
+    assert _polls(work) == 21, "refused at 100 s: not at 90 s (poll 19), not at the 300 s bound (poll 61)"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    corpus = _public_release()["images"]["decisionsData"]
+    assert "cannot pull this release from the release's own repositories: 1 of 6 images: " + corpus["repository"] + "@" + corpus["digest"] + ". " in line, line
+    assert condition in line and "still failing deadlines.dependencies_seconds (100 s) after it was first reported" in line, line
+    assert waiting["waiting"]["message"] not in result.stderr, "the runtime's words are classified, never repeated"
+    assert result.stderr.count("is failing and being retried") == 1
+
+
+def test_a_failure_first_reported_past_the_dependency_deadline_is_given_that_deadline_from_its_report(runtime, tmp_path):
+    """A slow link's pull can time out long after deadlines.dependencies_seconds
+    and pull on the kubelet's next attempt. The bound is how long the failure
+    has been reported, not how long the pull has taken: refused
+    deadlines.dependencies_seconds after its first report, and the slow link
+    said once, at the deadline, while the containers were still pulling."""
+    run, _, work = runtime
+    (work / "status-after-31.json").write_text(_statuses([PULLED] * 5 + [TIMEOUT]))     # first reported 150 s in
+    result = _slow(run, work, tmp_path, base="", states=[PULLED] * 5 + [CREATING], dependencies=100, initialization=400)
+    assert result.returncode != 0
+    assert _polls(work) == 51, "150 s + 100 s; not on the first sighting past the deadline, not at the 500 s bound"
+    assert result.stderr.count("still pulling") == 1
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "could not connect to the registry" in line and "still failing deadlines.dependencies_seconds (100 s) after it was first reported" in line, line
 
 
 @pytest.mark.parametrize("status, verb, absent", [
@@ -964,20 +1012,28 @@ def test_the_pull_deadline_over_an_installed_source_names_repair_after_raising_i
 
 # --- the probe Pod's resources, and a LimitRange or ResourceQuota that refuses it ---
 
-def test_every_probe_container_requests_what_the_storage_check_does_with_both_limits_equal_to_the_request(runtime, tmp_path):
+def test_every_probe_container_asks_50m_and_64Mi_with_both_limits_equal_so_six_fit_beside_a_running_deployment(runtime, tmp_path):
     """10m CPU and 16Mi memory under a memory limit alone: a LimitRange minimum
-    between those and the 100m and 128Mi the storage check asks for admitted
-    the previous release's deployment and refused the probe, and the CPU limit
-    a LimitRange injects where none is set made a limit-to-request ratio of 100.
-    100m and 128Mi, with both limits equal to them (ratio 1): six are 600m and
-    768Mi beside a running deployment."""
+    of 32Mi refused the probe, and the CPU limit a LimitRange injects where
+    none is set made a limit-to-request ratio of 100. The storage check's
+    100m and 128Mi then made six 600m and 768Mi, asked before the backup,
+    beside the running deployment's reservations: on a node sized to the
+    guide's figures -- 9 GiB, the deployment reserving 8.25 GiB -- that is
+    the whole remainder, before the kubelet's own reservation and the system
+    Pods, and the scheduler could not place it. 50m and 64Mi, both limits
+    equal (ratio 1, nothing injected): six are 300m and 384Mi, half that
+    remainder, and still above the LimitRange minimum."""
     run, _, work = runtime
     (work / "status.json").write_text(_statuses([PULLED] * 6))
     _, result = _probe(run, work, tmp_path)
     assert result.returncode == 0, result.stderr
     pod = json.loads((work / "probe-pod.json").read_text())
     assert [c["resources"] for c in pod["spec"]["containers"]] == [
-        {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}}] * 6
+        {"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"cpu": "50m", "memory": "64Mi"}}] * 6
+    memory = sum(int(c["resources"]["requests"]["memory"][:-2]) for c in pod["spec"]["containers"])
+    cpu = sum(int(c["resources"]["requests"]["cpu"][:-1]) for c in pod["spec"]["containers"])
+    assert (cpu, memory) == (300, 384)
+    assert memory <= (9 * 1024 - 8.25 * 1024) / 2, "at most half of what the guide's node leaves beside the deployment"
 
 
 # A namespace LimitRange that admits every Pod the previous release created: a
@@ -1035,4 +1091,141 @@ def test_a_limit_range_or_quota_that_refuses_the_probe_is_not_blamed_on_permissi
     line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
     assert "an admission policy (LimitRange or ResourceQuota) refused the Pod" in line, line
     assert "permissions" not in line and "32Mi" not in line and "exceeded" not in line
-    assert "cpu 100m and memory 128Mi, with limits equal to those requests" in line and "LimitRange" in line and "ResourceQuota" in line
+    assert "cpu 50m and memory 64Mi, with limits equal to those requests" in line and "LimitRange" in line and "ResourceQuota" in line
+
+
+# --- a probe Pod the scheduler cannot place --------------------------------------
+
+UNPLACED_WORDS = "0/1 nodes are available: 1 Insufficient memory, taint team=ZZSECRET-CANARY"
+
+
+def _unscheduled(reason="Unschedulable"):
+    """What the API reports for a Pod the scheduler cannot place: no container
+    statuses at all, and PodScheduled False with the scheduler's own words."""
+    return json.dumps({"status": {"phase": "Pending", "conditions": [
+        {"type": "PodScheduled", "status": "False", "reason": reason, "message": UNPLACED_WORDS}]}})
+
+
+@pytest.mark.parametrize("base", ["", BASE], ids=["plain", "relocated"])
+def test_a_probe_pod_the_scheduler_cannot_place_is_refused_after_300_s_by_name(runtime, tmp_path, base):
+    """The probe runs before the backup, beside the running deployment's
+    reservations. A Pod the scheduler could not place reported no container
+    status, was logged as a slow link at deadlines.dependencies_seconds and,
+    on a site without registry.base, refused a day later as a pull that did
+    not finish. Unscheduled for 300 s -- the storage check's bound and the
+    capacity reader's -- it is refused by what it is: storage.node, what the
+    Pod asks for in all, and the condition's reason; the scheduler's words
+    are kept, never repeated."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=base, status=_unscheduled(), dependencies=600, initialization=1200)
+    assert result.returncode != 0
+    assert _polls(work) == 61, "refused at 300 s, not at deadlines.dependencies_seconds nor at the long bound"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "the image pull probe's Pod was not scheduled (PodScheduled: Unschedulable) within 300 s" in line, line
+    assert "storage.node (synthetic-node) has no room for" in line and "cpu 300m and memory 384Mi" in line, line
+    assert "pull-probe-status.json" in line and "Helm has applied nothing in this run" in line, line
+    assert "did not finish pulling" not in line and "cannot pull" not in line, "the registry is not blamed"
+    assert "still pulling" not in result.stderr, "a Pod the scheduler has not placed is not pulling on a slow link"
+    assert "ZZSECRET-CANARY" not in result.stdout + result.stderr
+    assert UNPLACED_WORDS in (work / "pull-probe-status.json").read_text()
+
+
+@pytest.mark.parametrize("reason, word", [("SchedulerError", "SchedulerError"), ("Unschedulable" + "ZZSECRETCANARY", "other")],
+                         ids=["scheduler-error", "crafted"])
+def test_a_dependency_deadline_shorter_than_300_s_refuses_an_unplaced_pod_by_name_at_its_end(runtime, tmp_path, reason, word):
+    """deadlines.dependencies_seconds may be 60 on a site with registry.base:
+    its end arrives first, and the refusal still names the scheduler, not a
+    pull that did not finish. A reason this installer does not know is the
+    word "other"."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base=BASE, status=_unscheduled(reason), dependencies=60)
+    assert result.returncode != 0
+    assert _polls(work) == 13
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert "was not scheduled (PodScheduled: " + word + ") within deadlines.dependencies_seconds (60 s)" in line, line
+    assert "ZZSECRETCANARY" not in result.stderr and "did not finish pulling" not in line
+
+
+def test_a_probe_pod_placed_within_300_s_is_not_refused(runtime, tmp_path):
+    """Room freed beside it -- a Pod finishing, a node added -- places the Pod
+    within minutes; the grace is not held against it once placed."""
+    run, _, work = runtime
+    (work / "status-after-60.json").write_text(_statuses([CREATING] * 6))       # placed and pulling 295 s in
+    result = _slow(run, work, tmp_path, base="", status=_unscheduled(), pulled_at=70, dependencies=600, initialization=1200)
+    assert result.returncode == 0, result.stderr
+    assert "All 6 images pulled" in result.stderr and "was not scheduled" not in result.stderr
+
+
+def test_the_slow_link_line_is_said_only_while_the_containers_report_a_pull(runtime, tmp_path):
+    """A Pod placed on a node whose kubelet reports no container status is
+    not a pull on a slow link: the line waits for a pull to be reported."""
+    run, _, work = runtime
+    placed = json.dumps({"status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "True"}]}})
+    result = _slow(run, work, tmp_path, base="", status=placed, dependencies=100, initialization=200)
+    assert result.returncode != 0 and _polls(work) == 61
+    assert "still pulling" not in result.stderr
+    assert "did not finish pulling" in [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+
+
+@pytest.mark.parametrize("operation, installed, starts, present, absent", [
+    ({"kind": "install", "status": "owned"}, False, "abandon --operation aaaaaaaaaaaabbbbbbbbbbbb",
+     ("install again from the corrected file with another storage.node", "(a repair would complete this first install without the storage check)",
+      "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once room is freed on node synthetic-node for the probe Pod's cpu 300m and memory 384Mi"),
+     (" repair --operation", "after raising")),
+    ({"kind": "upgrade", "status": "owned"}, True, "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once room is freed on node synthetic-node",
+     ("a changed storage.node is refused for an installed release, whose claims stay where they are",),
+     ("repair --operation", "abandon", "install again", "after raising")),
+    ({"kind": "upgrade", "status": "backup-verified"}, True, "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once room is freed on node synthetic-node",
+     ("a changed storage.node is refused for an installed release",), ("repair --operation", "abandon")),
+    ({"kind": "restore", "status": "restoring-resources"}, False, "restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact saved target once room is freed",
+     ("a changed storage.node cannot continue this restore",), ("resume --operation", " repair --operation")),
+    ({"kind": "restore", "status": "restore-files-verified"}, False, "resume --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact source installer once room is freed",
+     ("a changed storage.node cannot continue this restore",), ("restore-repair",)),
+    ({"kind": "restore", "status": "applying"}, False, "repair --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact saved target once room is freed",
+     ("a changed storage.node cannot continue this restore",), ("restore-repair", "resume --operation")),
+], ids=["first-install", "upgrade-before-backup", "upgrade-after-backup", "restoring-resources", "restore-files-verified", "restore-applying"])
+def test_an_unplaced_probe_pod_names_the_verb_the_operation_s_state_accepts(runtime, tmp_path, operation, installed, starts, present, absent):
+    """Room freed on the node continues every operation with its own site: a
+    first install may also start again from a file naming another node, an
+    installed release's claims stay where they are, and a restore keeps its
+    site byte for byte and is continued by the verb its phase accepts."""
+    run, _, work = runtime
+    if installed:
+        (work / "installed.json").write_text(json.dumps({"status": "complete"}))
+    result = _slow(run, work, tmp_path, base=BASE, status=_unscheduled(), dependencies=400, operation=operation, prefix='STATE_DIR="$TEST_WORK"; ')
+    assert result.returncode != 0 and "was not scheduled" in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith(starts), hint
+    for words in present:
+        assert words in hint, (words, hint)
+    for words in absent:
+        assert words not in hint, (words, hint)
+
+
+# --- a probe Pod that could not be created, during a restore ----------------------
+
+@pytest.mark.parametrize("status, program, verb", [
+    ("restoring-resources", False, "restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact saved target"),
+    ("restore-files-verified", False, "resume --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact source installer"),
+    ("applying", False, "repair --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact saved target"),
+    ("restore-files-verified", True, "restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb with this corrected installer"),
+], ids=["restoring-resources", "restore-files-verified", "applying", "corrected-program"])
+def test_a_probe_pod_a_restore_could_not_create_names_the_verb_its_state_accepts(runtime, tmp_path, status, program, verb):
+    """The closing line fell back to resume, which refuses a restore stopped in
+    restoring-resources and one a corrected program continues: the verb is
+    the one the restore's phase accepts, once the namespace admits the Pod."""
+    run, _, work = runtime
+    (work / "operation.json").write_text(json.dumps({"operation": "aaaaaaaaaaaabbbbbbbbbbbb", "kind": "restore", "status": status}))
+    release = _public_release(); payload = _payload(tmp_path, release); site = _site()
+    site["registry"].update(base=BASE, pull_secret="corp-pull")
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({"image": {"pullSecrets": ["corp-pull"]}}))
+    words = 'Error from server (Forbidden): error when creating "STDIN": pods "gsj-pull-aaaaaaaaaaaa" is forbidden: exceeded quota: compute'
+    result = run(PROBE_PRELUDE.format(payload=payload) + ("RESTORE_PROGRAM_ACTIVE=true; " if program else "")
+                 + "k() { if [[ $1 == create ]]; then echo " + json.dumps(words) + " >&2; return 1; fi; command kubectl \"$@\"; }\nrelocated_images_probe")
+    assert result.returncode != 0 and "could not be created" in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith(verb), hint
+    assert "once the namespace admits the probe Pod (wait 180 s first" in hint, hint
+    if status == "restoring-resources" or program:
+        assert "resume --operation" not in hint
