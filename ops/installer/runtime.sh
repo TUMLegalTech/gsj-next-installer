@@ -3232,6 +3232,16 @@ maintenance_pod() {
  # transfer directory cleanup_exit must hand back when the operation stops.
  TRANSFER_HANDBACK_POD=$name
  k wait --for=condition=Ready "pod/$name" --timeout=300s
+ # A hostPath the kubelet creates (DirectoryOrCreate) is root's with mode 0755:
+ # every account on the node could read the plaintext this Pod is about to
+ # stage there. Private before the first byte; the handback later gives it to
+ # the operator as it is. An emptyDir lives inside the Pod's own kubelet
+ # directory and needs nothing. A refused chmod never fails the operation: the
+ # log names the directory, which stays as every earlier release left it.
+ if [[ -n $(j '.storage.transfer_path // ""') ]]; then
+   k exec "$name" -- chmod 700 /transfer >/dev/null 2>"$STATE_DIR/transfer-private.err" ||
+     log "The transfer directory $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node) could not be made private (mode 0700), so other accounts on that node may read what this operation stages there; kubectl's own words are kept in $STATE_DIR/transfer-private.err"
+ fi
 }
 immutable_file() {
  # Publish stdin on the destination filesystem without replacing any entry.
@@ -3774,6 +3784,17 @@ backup_complete() {
  object=$(k get pod "$pod" -o json --ignore-not-found)
  if [[ -n $object ]]; then
    jq -e --arg owner "$pod" '.metadata.labels["gsj.io/operation"]==$owner' <<< "$object" >/dev/null || fail 'backup maintenance pod belongs to another operation'
+   # The encrypted archive is verified: the two plaintext copies of all three
+   # volumes the Pod staged -- the snapshot it encrypted and the round trip it
+   # verified, 13 G measured per backup -- are nobody's recovery point now, and
+   # a hostPath kept them for good. Removed HERE and nowhere else: backup-repair
+   # and restore-repair read a stopped Pod's /transfer, so no failure path
+   # removes anything. A refused removal never fails the operation it is
+   # closing; the log names the directory to clean by hand. An emptyDir goes
+   # with the Pod below either way.
+   if ! k exec "$pod" -- rm -f /transfer/snapshot.tar.gz /transfer/roundtrip.tar.gz >/dev/null 2>"$STATE_DIR/transfer-remove.err" && [[ -n $(j '.storage.transfer_path // ""') ]]; then
+     log "The plaintext copies this backup staged, snapshot.tar.gz and roundtrip.tar.gz, could not be removed from $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node); the encrypted archive is verified, so remove them there by hand. kubectl's own words are kept in $STATE_DIR/transfer-remove.err"
+   fi
    transfer_handback "$pod"
    k delete pod "$pod" --wait=true >/dev/null
  fi
@@ -3839,7 +3860,7 @@ backup() {
  rm "$archive.resources.enc.partial"
  sha_file "$archive.resources.enc" | immutable_file "$archive.resources.enc.sha256"
  # Verify transport/decryption bytes with the pod's public archive verifier.
- openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass "file:$BACKUP_PASSWORD" -in "$archive" | k exec -i "$pod" -- sh -c 'cat > /transfer/roundtrip.tar.gz'
+ openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass "file:$BACKUP_PASSWORD" -in "$archive" | k exec -i "$pod" -- sh -c 'umask 077; cat > /transfer/roundtrip.tar.gz'
  k exec "$pod" -- python -m gsj_deploy.backup verify --archive /transfer/roundtrip.tar.gz
  validate_backup_closure "$snapshot"
  # Bind retries to the recovery key without storing it or decrypting customer
@@ -4971,6 +4992,11 @@ restore_files() {
  restore_resource "$GSJ_WORK/restore-pod.json"
  TRANSFER_HANDBACK_POD=$pod
  k wait --for=condition=Ready "pod/$pod" --timeout=300s
+ # Private before the decrypted archive arrives, as in maintenance_pod.
+ if [[ -n $(j '.storage.transfer_path // ""') ]]; then
+   k exec "$pod" -- chmod 700 /transfer >/dev/null 2>"$STATE_DIR/transfer-private.err" ||
+     log "The transfer directory $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node) could not be made private (mode 0700), so other accounts on that node may read the decrypted archive this restore stages there; kubectl's own words are kept in $STATE_DIR/transfer-private.err"
+ fi
  restore_no_writers "$pod"; restore_bindings; assert_owner
  log 'Transferring and verifying the immutable restore archive; existing partial data remains owned by this operation'
  local remote="/transfer/snapshot-$(jq -r .archive_sha256 "$STATE_DIR/restoration.json").tar.gz"
@@ -5037,7 +5063,7 @@ restore_validate_result() {
  ' "$result" >/dev/null || fail 'restore file completion does not match the exact archive and target binding'
 }
 restore_finish_pod() {
- local pod uid object saved="$STATE_DIR/restore-$OPERATION"
+ local pod uid object remote saved="$STATE_DIR/restore-$OPERATION"
  pod=$(jq -er .pod "$STATE_DIR/restoration.json")
  [[ $(k get namespace "$NAMESPACE" -o json | jq -er .metadata.uid) == $(jq -er .target_namespace_uid "$STATE_DIR/restoration.json") ]] || fail 'restore target namespace identity changed'
  restore_validate_result "$saved/files-result.json"
@@ -5047,6 +5073,13 @@ restore_finish_pod() {
  if [[ -z $object ]]; then return; fi
  [[ $(jq -r .metadata.uid <<< "$object") == "$uid" ]] || fail 'restore Pod identity changed before cleanup'
  jq -n --arg uid "$uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$GSJ_WORK/restore-pod-delete.json"
+ # The restored files are proven (above): the decrypted archive they came from
+ # is plaintext of every volume, and a hostPath kept it for good. As in
+ # backup_complete, a refused removal is logged, never a failure.
+ remote="/transfer/snapshot-$(jq -r .archive_sha256 "$STATE_DIR/restoration.json").tar.gz"
+ if ! k exec "$pod" -- rm -f "$remote" >/dev/null 2>"$STATE_DIR/transfer-remove.err" && [[ -n $(j '.storage.transfer_path // ""') ]]; then
+   log "The decrypted restore archive $(basename "$remote") could not be removed from $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node); the restored files are verified, so remove it there by hand. kubectl's own words are kept in $STATE_DIR/transfer-remove.err"
+ fi
  transfer_handback "$pod"
  k delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$pod" -f "$GSJ_WORK/restore-pod-delete.json" >/dev/null
  k wait --for=delete "pod/$pod" --timeout=300s >/dev/null
