@@ -5017,8 +5017,9 @@ finish_repair_transition() {
  # (--interactive is a different route: the wizard writes a complete file.)
  # The trade, stated: the file now follows a LATER release's defaults, exactly
  # as a site that never ran a repair does -- including where that refuses. An
- # upgrade compares .site.storage whole, so a release that changes a storage
- # default refuses both; the complete write had made a repaired site immune.
+ # upgrade compares .site.storage whole except transfer_path and
+ # minimum_free_bytes, so a release that changes another storage default
+ # refuses both; the complete write had made a repaired site immune.
  config_after="$GSJ_WORK/repair-config-complete.json"
  jq '.site_after' "$intent" > "$config_after"
  if jq --slurpfile intent "$intent" '.corpus.repair_generation=$intent[0].site_after.corpus.repair_generation' "$CONFIG" > "$GSJ_WORK/repair-config-narrow.json" 2>/dev/null &&
