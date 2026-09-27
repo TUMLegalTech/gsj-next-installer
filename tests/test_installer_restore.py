@@ -3,6 +3,7 @@
 These tests exercise the shipped Bash ownership/phase protocol. Actual archive
 extraction and killed file writers are tested separately by restore-files.
 """
+import ast
 import json
 import hashlib
 import os
@@ -515,11 +516,42 @@ def test_the_refusal_names_the_floor_that_decided_the_margin(runtime, tmp_path, 
 
 
 def test_the_measurement_reads_the_filesystem_size_and_the_volumes_filesystem_ids(runtime, tmp_path):
+    """The filesystem measured is the one /transfer is on: the free bytes, the
+    size and the filesystem id the three volumes' ids are compared with all
+    come from one os.statvfs("/transfer"). The words alone were held before:
+    a program that measured "/" instead, or compared the volumes' ids with
+    another filesystem's, printed three numbers and passed."""
     result, calls = _staging(runtime, tmp_path, "", free=GIB, total=2 * GIB)
-    command = " ".join(next(c for c in calls if c[:1] == ["exec"] and "statvfs" in " ".join(c)))
+    call = next(c for c in calls if c[:1] == ["exec"] and "statvfs" in " ".join(c))
+    command = " ".join(call)
     assert "f_blocks" in command and "f_fsid" in command, command
     for mount in ("/volumes/gsj", "/volumes/forgejo", "/volumes/chroma"):
         assert mount in command, command
+    program = ast.parse(call[call.index("-c") + 1])
+
+    def statvfs_of(node):
+        return (isinstance(node, ast.Call) and ast.unparse(node.func) == "os.statvfs"
+                and len(node.args) == 1 and not node.keywords and node.args[0])
+    measured = [node.targets[0].id for node in ast.walk(program)
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and isinstance(statvfs_of(node.value), ast.Constant) and statvfs_of(node.value).value == "/transfer"]
+    assert len(measured) == 1, ast.unparse(program)
+    t = measured[0]
+    printed = [node for node in ast.walk(program) if isinstance(node, ast.Call) and ast.unparse(node.func) == "print"]
+    assert len(printed) == 1 and len(printed[0].args) == 3, ast.unparse(program)
+    free, total, shared = (ast.unparse(arg) for arg in printed[0].args)
+    assert free == f"{t}.f_bavail * {t}.f_frsize" and total == f"{t}.f_blocks * {t}.f_frsize", (free, total)
+    # the one comparison: a volume's filesystem id with the id of that same measurement
+    compared = [node for node in ast.walk(printed[0].args[2]) if isinstance(node, ast.Compare)]
+    assert len(compared) == 1 and [type(op) for op in compared[0].ops] == [ast.Eq], shared
+    left, right = compared[0].left, compared[0].comparators[0]
+    volume = right if ast.unparse(left) == f"{t}.f_fsid" else left
+    assert f"{t}.f_fsid" in (ast.unparse(left), ast.unparse(right)), shared
+    assert isinstance(volume, ast.Attribute) and volume.attr == "f_fsid", shared
+    assert isinstance(statvfs_of(volume.value), ast.Name), shared
+    loop = next(node for node in ast.walk(printed[0].args[2]) if isinstance(node, ast.comprehension))
+    assert ast.unparse(loop.target) == statvfs_of(volume.value).id, shared
+    assert ast.literal_eval(loop.iter) == ("/volumes/gsj", "/volumes/forgejo", "/volumes/chroma"), shared
 
 
 
