@@ -1237,7 +1237,8 @@ it, some of them hours in:
   `public_url`'s host, or one that has expired
   ([A certificate you already issue](#a-certificate-you-already-issue-tlsprofileexisting));
 - under `ingress.profile=reuse`, an `ingress.namespace` that does not exist or
-  holds no running ingress controller Pod;
+  holds no running ingress controller Pod; under `managed-traefik`, one that is
+  the deployment's own namespace, since Traefik gets a namespace of its own;
 - another Ingress on the cluster that already serves `public_url`'s host,
   naming it;
 - an operator Secret already in the namespace whose password differs from

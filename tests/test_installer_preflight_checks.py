@@ -220,6 +220,32 @@ def test_a_certificate_that_fails_strict_verification_is_warned_about_not_refuse
         assert "origin-tls-failed" in result.stderr and "strict" in result.stderr, result.stderr
 
 
+def _chain(tmp_path):
+    """tls.crt as a controller serves it: the leaf for HOST first, then the
+    certificate that issued it."""
+    ca_crt, ca_key = _authority(tmp_path, "chain-ca")
+    crt, key = _issued(tmp_path, ca_crt, ca_key)
+    chain = tmp_path / "chain.crt"
+    chain.write_bytes(crt.read_bytes() + ca_crt.read_bytes())
+    return chain, key, ca_crt
+
+
+@pytest.mark.parametrize("profile", ["existing", "files"])
+def test_a_certificate_followed_by_its_chain_is_judged_by_its_leaf(runtime, tmp_path, profile):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    chain, key, ca_crt = _chain(tmp_path)
+    if profile == "files":
+        _files_site(work, chain, key)
+        _cluster(state, CONTROLLER)
+    else:
+        _cluster(state, _tls_secret(chain, key), CONTROLLER)
+    _site(work, lambda s: s["verification"].update(ca_file=str(ca_crt)))
+    result = _checks(run)
+    _admitted(result, state)
+    assert "origin-tls-failed" not in result.stderr, result.stderr
+
+
 # --- tls.profile files: the file, its host, an existing Secret ------------------------
 
 def _files_site(work, crt, key):
@@ -294,6 +320,26 @@ def test_an_ingress_namespace_without_a_running_controller_is_refused_by_counts(
              "NetworkPolicy")
 
 
+def test_a_reused_controller_in_the_target_namespace_itself_is_checked_there(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _site(work, lambda s: s["ingress"].update(namespace="synthetic-namespace"))
+    _admitted(_checks(run), state)
+    calls = json.loads(state.read_text())["calls"]
+    assert ["get", "namespace", "synthetic-namespace", "-o", "name", "--ignore-not-found"] in calls, calls
+
+
+def test_managed_traefik_in_the_target_namespace_is_refused_before_the_lease(runtime, tmp_path):
+    """managed_helm_addon installs an add-on only in a namespace of its own and
+    refused this one after the Lease."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _site(work, lambda s: s["ingress"].update(profile="managed-traefik", namespace="synthetic-namespace"))
+    _refusal(_checks(run, before=_addon_reads({"items": []}, {"items": []}, {"items": []})), state,
+             "ingress.namespace synthetic-namespace", "managed-traefik", "a namespace of its own",
+             "run the same command again")
+
+
 @pytest.mark.parametrize("unreadable", ["namespace", "pods"])
 def test_an_ingress_namespace_this_credential_cannot_read_is_logged_and_passed(runtime, tmp_path, unreadable):
     run, state, work = runtime
@@ -323,6 +369,26 @@ def test_an_ingress_list_this_credential_may_not_read_is_logged_and_passed(runti
                                  ' *) command kubectl "$@";; esac; }\n')
     _admitted(result, state)
     assert "was not checked" in result.stderr and "crafted text" not in result.stderr, result.stderr
+
+
+def test_a_public_url_with_a_port_is_checked_by_its_host_alone(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
+    _site(work, lambda s: s.update(public_url=f"https://{HOST}:30443/"))
+    line = _refusal(_checks(run), state, f"public_url's host {HOST} is already served by Ingress other-namespace/other-web")
+    assert "30443" not in line
+
+
+def test_ingresses_without_rules_or_hosts_are_passed_over(runtime, tmp_path):
+    run, state, work = runtime
+    bare = {"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": "bare", "namespace": "third"}}
+    backend = {**bare, "metadata": {"name": "backend", "namespace": "third"}, "spec": {"defaultBackend": {"service": {"name": "x"}}}}
+    hostless = {**bare, "metadata": {"name": "hostless", "namespace": "third"}, "spec": {"rules": [{"http": {"paths": []}}]}}
+    _baseline(tmp_path, state, work, bare, backend, hostless)
+    _admitted(_checks(run), state)
+    _baseline(tmp_path, state, work, bare, backend, hostless, _ingress("other-namespace", "other-web", HOST))
+    line = _refusal(_checks(run), state, "is already served by Ingress other-namespace/other-web")
+    assert "third/" not in line, line
 
 
 # --- the operator Secret -------------------------------------------------------------
@@ -477,6 +543,20 @@ def test_this_machine_s_kubectl_more_than_one_minor_from_the_server_is_warned_ab
     result = _checks(run, SKEWED, before=f'FETCH_SET="{fetched}"\n' if fetched else "unset FETCH_SET\n")
     _admitted(result, state)
     assert "kubectl 1.30.2" in result.stderr and "1.33.6" in result.stderr and "within one minor" in result.stderr
+
+
+@pytest.mark.parametrize("client, skewed", [("v1.30.2-eks-4f4795d", True), ("v1.34.0-dirty", False), ("v1.33.1+k3s1", False)])
+def test_a_kubectl_version_with_a_build_suffix_is_compared_by_its_numbers(runtime, tmp_path, client, skewed):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    versions = {"clientVersion": {"gitVersion": client}, "serverVersion": {"gitVersion": "v1.33.6-gke.1024000"}}
+    result = _checks(run, versions, before='FETCH_SET="kubectl"\n')
+    if skewed:
+        line = _refusal(result, state, "1.30.2", "1.33.6")
+        assert "eks" not in line and "gke" not in line, line
+    else:
+        _admitted(result, state)
+        assert "minor" not in result.stderr, result.stderr
 
 
 def test_a_fetched_kubectl_within_one_minor_passes_silently(runtime, tmp_path):

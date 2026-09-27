@@ -1381,6 +1381,9 @@ preflight_site_checks() {
    existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-tls-secret.err") || fail "TLS Secret $secret in namespace $NAMESPACE could not be read ($(kubectl_failure_condition "$STATE_DIR/preflight-tls-secret.err")). kubectl's output is kept in $STATE_DIR/preflight-tls-secret.err; correct the access and run the same command again"
    [[ -z $existing ]] || jq -e --rawfile crt "$crt" --rawfile key "$key" '.data["tls.crt"]==($crt|@base64) and .data["tls.key"]==($key|@base64)' <<< "$existing" >/dev/null || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite";;
  esac
+ # ingress.profile managed-traefik: managed_helm_addon installs Traefik only
+ # in a namespace of its own, and refused this one after the Lease.
+ [[ $(j '.ingress.profile // ""') != managed-traefik || $(j .ingress.namespace) != "$NAMESPACE" ]] || fail "ingress.namespace $NAMESPACE is the namespace this deployment is installed in (target.namespace), and ingress.profile managed-traefik installs Traefik in a namespace of its own, which it creates. Set ingress.namespace to another name (gsj-ingress is the default), or select ingress.profile reuse for a controller that already runs, then run the same command again"
  # ingress.profile reuse: the application's NetworkPolicy admits
  # ingress.namespace, and that namespace alone, to its web port, so a
  # namespace without a controller is a site that never answers -- met at
