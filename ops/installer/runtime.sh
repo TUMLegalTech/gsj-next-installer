@@ -1269,8 +1269,8 @@ resolve_endpoint() { # site key, URL, strict (1: refuse what cannot be resolved;
  log "$shown names a host this machine cannot resolve; the gsj pod gets no outbound rule for it"
 }
 egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --argjson egress_endpoints
- local site=$1 recorded="$STATE_DIR/values.pending.json" strict=0 urls key url
- case $COMMAND in install|upgrade|restore) strict=1;; esac
+ local site=$1 recorded="${STATE_DIR:-}/values.pending.json" strict=0 urls key url
+ case ${COMMAND:-} in install|upgrade|restore) strict=1;; esac
  if (( ! strict )) && [[ -f $recorded && ! -L $recorded ]] && jq -e '.networkPolicy.egress.endpoints|type=="array"' "$recorded" >/dev/null 2>&1; then
    jq -c '.networkPolicy.egress.endpoints' "$recorded"; return 0
  fi
