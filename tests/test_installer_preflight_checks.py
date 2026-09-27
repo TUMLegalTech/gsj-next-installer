@@ -220,14 +220,20 @@ def test_a_site_that_matches_its_cluster_passes_every_check_without_a_write(runt
 
 # --- tls.profile existing: the Secret, its host, its expiry ---------------------------
 
-def test_a_missing_tls_secret_is_refused_with_the_way_to_create_it(runtime, tmp_path):
+@pytest.mark.parametrize("secret", ["gsj-tls", "public-certificate"])
+def test_a_missing_tls_secret_is_refused_with_the_way_to_create_it(runtime, tmp_path, secret):
+    """The copy recipe reads a Secret of any name in another namespace and
+    creates it under tls.secret here."""
     run, state, work = runtime
     _baseline(tmp_path, state, work)
+    _site(work, lambda s: s["tls"].update(secret=secret))
     _cluster(state, CONTROLLER)
-    line = _refusal(_checks(run), state, "TLS Secret is unavailable", "gsj-tls", "synthetic-namespace",
+    line = _refusal(_checks(run), state, "TLS Secret is unavailable", secret, "synthetic-namespace",
                     "kubectl create namespace synthetic-namespace",
-                    "jq '{apiVersion,kind,type,data,metadata:{name:.metadata.name}}' | kubectl -n synthetic-namespace create -f -")
+                    f"kubectl -n OTHER get secret NAME -o json | jq '{{apiVersion,kind,type,data,metadata:{{name:\"{secret}\"}}}}'"
+                    " | kubectl -n synthetic-namespace create -f -")
     assert line.index("TLS Secret is unavailable") == len("GSJ: ")
+    assert "name:.metadata.name" not in line, "the copy is made under tls.secret whatever the source Secret is named"
 
 
 @pytest.mark.parametrize("change", ["type", "key", "crt"])
