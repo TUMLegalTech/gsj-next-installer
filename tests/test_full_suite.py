@@ -109,7 +109,7 @@ def _fake_helm(tmp_path, version):
 
 
 def test_the_gate_refuses_any_helm_but_the_engineered_client(tmp_path, monkeypatch):
-    """Review finding B3: the gate checked only that `helm` was on
+    """The gate checked only that `helm` was on
     PATH -- it accepted Helm 3.22 and a fake client reporting v0.0.1, and
     under Helm 3 two modules gave 27 failures (Helm 3 attempts cluster
     discovery for the offline render Helm 4.2.2 performs without a cluster).

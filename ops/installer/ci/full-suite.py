@@ -98,7 +98,7 @@ def missing_prerequisites():
     for tool in TOOLS:
         if shutil.which(tool) is None:
             missing.append(f"`{tool}` is not on PATH")
-    # review finding B3: the gate admitted any helm -- Helm 3.22, a fake reporting
+    # The gate once admitted any helm -- Helm 3.22, a fake reporting
     # v0.0.1 -- and under Helm 3 two modules failed on the offline render
     # only Helm 4 performs. The client is the catalog's exact version, named
     # beside what was found.

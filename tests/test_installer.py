@@ -2013,8 +2013,8 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         assert f"answered HTTP {status}" in line, line
         for w in words: assert w in line, (status, w, line)
         for w in absent: assert w not in line, (status, w, line)
-    # an OCR endpoint that gave no HTTP answer at all: unreachable -- and nothing else (review finding M5:
-    # an HTTP or schema failure is never "unreachable")
+    # an OCR endpoint that gave no HTTP answer at all: unreachable -- and nothing else (an HTTP
+    # or schema failure is never "unreachable")
     line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "unreachable"}, [
         {"name": "operator-login", "status": "passed"},
         {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-unreachable"},
@@ -2246,6 +2246,11 @@ def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path
 # they reach no one's machine (unspecified, loopback, the private RFC 1918 and
 # the documentation RFC 5737 ranges), or four number groups, dotted or dashed,
 # that open a host name: a wildcard-DNS host, whatever address it carries.
+# A review's finding ids are an uppercase letter and digits: a bracketed
+# review note that ends in one, a finding or a sweep named by one, a bracketed
+# ruling number or range, and, only inside brackets, a letter-digits-dash-
+# digits id; the letter is case-sensitive, so a version or an architecture in
+# brackets is not an id.
 # Every alternative is spelled apart by concatenation or by escaped dots, so
 # this file never matches itself; the three scans below import this one list.
 INTERNAL_LABEL = re.compile(
@@ -2255,7 +2260,9 @@ INTERNAL_LABEL = re.compile(
                        r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b",
                        r"\b[0-9]{1,3}(?:[.-][0-9]{1,3}){3}\.[a-z]"]) + ")|"
     + "|".join([r"\bPROMO" + r"TION\b", r"\bWEB" + r"NEXT\b", r"\bINIT" + r"-VERB\b", r"\bPILOT" + r"-MOVE\b",
-                r"\bRELEASE" + "-BETA", r"\bBETA" + "[0-9]", r"\bQA" + r"D\b", r"\bPATCH" + "-?[0-9]"]))
+                r"\bRELEASE" + "-BETA", r"\bBETA" + "[0-9]", r"\bQA" + r"D\b", r"\bPATCH" + "-?[0-9]",
+                r"\[(?i:rev" + r"iew)(?:[ ,]+[A-Za-z]+)*[ ,]+[A-Z][0-9]+\b", r"\b(?i:rev" + r"iew (?:finding|sweep)) [A-Z][0-9]+\b",
+                r"\[R" + r"[0-9]+(?:-[0-9]+)?\]", r"\[[^\]]*\b[A-Z]" + r"[0-9]+-[0-9]+\b[^\]]*\]"]))
 
 
 def internal_labels(name, text):
@@ -2275,6 +2282,20 @@ def test_the_label_guard_finds_an_address_and_a_host_built_on_one():
         assert internal_labels("line", text) == ["line:1"], text
 
 
+def test_the_label_guard_finds_a_review_s_finding_ids():
+    """A review's finding ids reach comments and docstrings in four shapes: a
+    bracketed review note that ends in an id, a finding or a sweep named by
+    its id, a bracketed ruling number or range, and a bracketed id of a
+    letter, digits, a dash and digits. Each is found. The ids are joined at
+    run time so this file stays clean."""
+    review = "rev" + "iew"
+    for text in (f"its words are kept, never repeated [{review} B2]", f"the fixed word [{review} sweep B2,",
+                 f"a pre-release is not the release ({review} finding B3)", f"{review.capitalize()} sweep N2: three reads",
+                 "the owner record is immutable [" + "R" + "18]", "one Lease per target [" + "R" + "1-6]",
+                 "a stop after the apply [" + "M" + "5-4]", "the claims stay [see " + "W" + "11-2]"):
+        assert internal_labels("line", text) == ["line:1"], text
+
+
 # the negative control: the words the guide uses for its own work, and the
 # addresses an example may use, are not labels
 GUIDE_PROSE = [
@@ -2287,6 +2308,9 @@ GUIDE_PROSE = [
     '"NO_PROXY": "llm.internal.example.org,10.20.0.9"',
     '{"verification": {"connect_host": "192.0.2.7", "connect_port": 8443}}',
     "example addresses: 172.20.0.4, 192.168.1.20, 198.51.100.7, 203.0.113.9",
+    "[Review the saved settings](#upgrade-and-recover-a-named-operation) before a repair; a review finding is not a refusal.",
+    "the documentation ranges [TEST-NET-1, TEST-NET-3] and a kubectl within [v1.30-1.32] on x86-64",
+    '[[ $holder =~ ^[a-f0-9]{24}$ ]] || shown="[R]"',
 ]
 
 
@@ -2319,7 +2343,7 @@ def test_the_pinned_chart_carries_no_internal_review_labels():
     assert not hits, hits
 
 
-# --- review finding B3: the Helm 4 verbs are refused in the first seconds, before the Lease ---
+# --- the Helm 4 verbs are refused in the first seconds, before the Lease ---
 
 def _fake_helm_on_path(work, version):
     fake = work.parent / "bin" / "helm"
@@ -2336,7 +2360,7 @@ def _fake_helm_on_path(work, version):
     ("restore", None, False), ("restore-repair", None, False), ("sweep", None, False), ("abandon", None, False),
 ])
 def test_a_verb_that_needs_helm_4_is_refused_in_the_first_seconds_before_the_lease(runtime, command, kind, refused):
-    """Review finding B3: two paths serialize a release with no
+    """Two paths serialize a release with no
     cluster at all (`KUBECONFIG=/dev/null helm install --dry-run=client`),
     which only Helm 4 does: the managed add-on repair (addon-repair) and the
     repair of a restore stopped at its application Helm revision. A Helm 3
@@ -2444,7 +2468,7 @@ def test_the_verb_preflight_runs_before_the_cluster_is_read_and_before_the_lease
     assert load < first < preflight < acquire
 
 
-# --- review finding B2: a refusal names the condition and the field, never the payload ---
+# --- a refusal names the condition and the field, never the payload ---
 
 def test_a_site_file_that_is_not_an_object_is_refused_without_repeating_its_contents(runtime, tmp_path):
     """the review's canary `site-merge-echo`: a site file whose whole JSON value
@@ -2582,7 +2606,7 @@ def test_the_summary_keeps_and_prints_only_the_origin_of_every_site_url(runtime)
     assert "@" not in origins.replace("[^/@?#:", "").replace("[^/@?#", "") and origins.endswith("*$(?![\\s\\S])")
 
 
-# --- the URL scan [review B2; review B2: the three shapes the review proved] ---
+# --- the URL scan, and the three shapes a review proved past its previous form ---
 
 URLISH = (r"\$\(j '?\.?[a-z_.]*(url|base_url|acme_server|offbox_url|vectors_url)\b"
           r"|\$\(jq [^)]*\.(public_url|base_url|url|acme_server|vectors_url|offbox_url)\b"
@@ -2766,11 +2790,11 @@ def _printed_urls(directory):
 
 
 def test_no_printed_url_bypasses_url_origin_only():
-    """The bypass test [review B2]: in every shell file of the installer, the
+    """The bypass test: in every shell file of the installer, the
     text a line prints or records that names a URL must wrap it in
     url_origin_only, immediately -- see _printed_urls for what prints, what
     is a URL, and the three shapes the pre-release review proved past the
-    previous scan [review B2]: a quoted string continued on the next
+    previous scan: a quoted string continued on the next
     line, an aliased URL under another name, and a printf piped into `cat`.
     A new print that bypasses the function fails here by file and line; the
     summary's jq is held by the canary test above to its six --arg origins."""
@@ -2846,7 +2870,7 @@ def test_the_url_scan_passes_the_forms_the_code_uses(tmp_path, shape):
     assert _printed_urls(tmp_path) == []
 
 
-# --- review finding M7: the guide names the key file the release carries ---
+# --- the guide names the key file the release carries ---
 
 def test_the_guide_names_the_key_file_the_release_carries():
     """the review's `guide-key-path` probe: three guide commands verified with
@@ -2865,7 +2889,7 @@ def test_the_guide_names_the_key_file_the_release_carries():
 
 
 def test_the_closing_line_knows_every_skip_reason_the_verifier_can_record():
-    """review finding M5: the skip reasons are a CONTRACT between the product's
+    """The skip reasons are a CONTRACT between the product's
     verifier (gsj_deploy.verify.SKIP_REASONS) and this installer's closing
     line (installation_summary): the words the line branches on are exactly
     the words the verifier can record, and each states only what the probe
