@@ -271,17 +271,22 @@ client_preflight() {
  # A missing or too-old client is a TEN-SECOND refusal, here — before the
  # payload is even unpacked, before the site is read, before the Lease, before
  # the first cluster object exists. It names the tool, the floor, and what was
- # actually found, and it names the escape hatch.
+ # actually found, and it names the escape hatch: the single-client fetch of
+ # exactly that tool.
+ # A client this run fetches (FETCH_SET) is the release's checksum-pinned one,
+ # never judged by this box's copy; every other one still is, so
+ # --fetch-tools=helm refuses a too-old kubectl or jq here, by name.
  local tool floor found
  for tool in jq kubectl helm; do
+   [[ " ${FETCH_SET:-} " != *" $tool "* ]] || continue
    case "$tool" in jq) floor=$GSJ_JQ_FLOOR;; kubectl) floor=$GSJ_KUBECTL_FLOOR;; helm) floor=$GSJ_HELM_FLOOR;; esac
    command -v "$tool" >/dev/null \
-     || fail "requires $tool >= $floor, found none on PATH. Install $tool, or re-run with --fetch-tools to download this release's pinned clients for this run only."
+     || fail "requires $tool >= $floor, found none on PATH. Install $tool, or re-run with --fetch-tools=$tool to download this release's pinned $tool for this run only."
    found=$(client_version "$tool")
    [[ -n $found ]] \
-     || fail "requires $tool >= $floor, but $(command -v "$tool") did not report a version. Check the binary, or re-run with --fetch-tools."
+     || fail "requires $tool >= $floor, but $(command -v "$tool") did not report a version. Check the binary, or re-run with --fetch-tools=$tool."
    version_at_least "$found" "$floor" \
-     || fail "requires $tool >= $floor, found $found ($(command -v "$tool")). Upgrade $tool, or re-run with --fetch-tools to download this release's pinned clients for this run only."
+     || fail "requires $tool >= $floor, found $found ($(command -v "$tool")). Upgrade $tool, or re-run with --fetch-tools=$tool to download this release's pinned $tool for this run only."
  done
 }
 helm_dialect() {
@@ -336,12 +341,13 @@ require_offline_render() {
  (( HELM_MAJOR > 0 )) || helm_dialect
  # Refuse only on a POSITIVELY KNOWN Helm 3. A zero here means no helm reported
  # a version at all, and that cannot happen on a real run: client_preflight is
- # fail-CLOSED on exactly that case at startup, and --fetch-tools installs a
- # known Helm 4. The two checks are one design -- the strict one runs early,
- # where it can still be acted on, so refusing an unknown a second time here
- # would add no safety and would instead break every caller that legitimately
- # never had a helm binary to model.
- (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "this step serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools."
+ # fail-CLOSED on exactly that case at startup for a helm the run does not
+ # fetch, and --fetch-tools (bare or =helm) installs a known Helm 4. The two
+ # checks are one design -- the strict one runs early, where it can still be
+ # acted on, so refusing an unknown a second time here would add no safety and
+ # would instead break every caller that legitimately never had a helm binary
+ # to model.
+ (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "this step serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools=helm (this release's pinned Helm 4 for this run only, beside your own kubectl and jq)."
 }
 helm_verb_preflight() {
  # THE HELM 4 VERBS, refused in the first seconds [review B3] -- after the
@@ -402,7 +408,7 @@ helm_verb_preflight() {
  esac
  [[ -n $verb ]] || return 0
  (( HELM_MAJOR > 0 )) || helm_dialect
- (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "$verb serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm) at $(command -v helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools (this release's pinned Helm 4 for this run only); every other command runs on Helm >= $GSJ_HELM_FLOOR"
+ (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "$verb serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm) at $(command -v helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools=helm (this release's pinned Helm 4 for this run only, beside your own kubectl and jq); every other command runs on Helm >= $GSJ_HELM_FLOOR"
 }
 bootstrap() {
  for utility in bash curl tar gzip base64 openssl awk cut uname mktemp date sync; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
@@ -411,9 +417,13 @@ bootstrap() {
  openssl_preflight
  # ${FETCH_TOOLS:-false}: main sets it while parsing arguments, but bootstrap
  # must not abort with an unbound variable if it is ever reached without that.
+ # FETCH_SET names the clients this run downloads (main sets it beside
+ # FETCH_TOOLS); the flag without a set means all three, as the bare flag does.
+ if ${FETCH_TOOLS:-false}; then FETCH_SET=${FETCH_SET-jq kubectl helm}; else FETCH_SET=''; fi
  # init reports every missing or too-old client at once instead of stopping
- # at the first; every other verb keeps the ten-second refusal.
- ${FETCH_TOOLS:-false} || [[ ${COMMAND:-} == init ]] || client_preflight
+ # at the first; every other verb keeps the ten-second refusal for each client
+ # it does not fetch.
+ [[ ${COMMAND:-} == init ]] || client_preflight
  DOWNLOAD_AUTH_FILE=''
  local os arch tool info url checksum packed marker
  os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m)
@@ -424,9 +434,12 @@ bootstrap() {
  tail -n "+$marker" "$0" | base64 --decode | tar -xz -C "$GSJ_PAYLOAD"
  (cd "$GSJ_PAYLOAD"; if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS >/dev/null; else shasum -a 256 -c SHA256SUMS >/dev/null; fi) || fail 'embedded payload integrity failed'
  # The download path is KEPT, intact and checksum-pinned, for an
- # air-gapped or under-provisioned box — but it is now opt-in.
+ # air-gapped or under-provisioned box — but it is now opt-in, and per client:
+ # only what FETCH_SET names goes into the private directory, so every other
+ # client on PATH stays this box's own (the one the preflight admitted).
  if ${FETCH_TOOLS:-false}; then
    for tool in jq kubectl helm; do
+     [[ " $FETCH_SET " == *" $tool "* ]] || continue
      info=$(gsj_client_info "$tool" "$GSJ_PLATFORM") || fail "unqualified client platform: $GSJ_PLATFORM/$tool"
      IFS=$'\t' read -r url checksum <<< "$info"
      packed="${XDG_CACHE_HOME:-$HOME/.cache}/gsj-install/$tool/$GSJ_PLATFORM/$checksum"; mkdir -p "$(dirname "$packed")"; chmod 700 "$(dirname "$packed")"; fetch "$url" "$packed" "$checksum"
@@ -6123,6 +6136,7 @@ configure_interaction() {
 }
 main() {
  COMMAND=${1:-help}; [[ $# == 0 ]] || shift
+ local fetch_list='' fetch_rest fetch_name
  CONFIG=site.json; CONTEXT_ARG=''; TO=''; EXPECTED_VERSION=''; RESUME_ID=''; ARCHIVE=''; ADDON=''; REVISION=''; GENERATION=''; BACKUP_ROUND=''; SOURCE_INSTALLER=''; CONTINUE_HELM_INSTALLER=''; ABANDON_REASON=''; CONTINUE_FROM_PROGRAM=''; INTERACTIVE=false; NON_INTERACTIVE=false; FETCH_TOOLS=false
  while (( $# )); do
    case "$1" in
@@ -6136,12 +6150,25 @@ main() {
      --continue-from-program) CONTINUE_FROM_PROGRAM=$2; shift 2;;
      --reason) ABANDON_REASON=$2; shift 2;;
      --interactive) INTERACTIVE=true; shift;; --non-interactive) NON_INTERACTIVE=true; shift;;
-     --fetch-tools) FETCH_TOOLS=true; shift;;
+     # Bare: the three pinned clients. =TOOL[,TOOL]: those alone, and this
+     # box's others stay in use and in the preflight. The pinned kubectl is
+     # pinned for the release, not for this server's one-minor window, while
+     # only the four offline-render recovery paths need Helm 4: =helm brings
+     # that one without the other two.
+     --fetch-tools|--fetch-tools=*)
+       FETCH_TOOLS=true; fetch_rest=jq,kubectl,helm; [[ $1 != *=* ]] || fetch_rest=${1#*=}; fetch_list+=",$fetch_rest"; fetch_rest+=,
+       while [[ -n $fetch_rest ]]; do
+         fetch_name=${fetch_rest%%,*}; fetch_rest=${fetch_rest#*,}
+         case $fetch_name in jq|kubectl|helm) ;; *) fail "unknown --fetch-tools client: ${fetch_name:-an empty name}. It fetches helm, kubectl and jq: name the ones this run needs, comma-separated (--fetch-tools=helm), or give --fetch-tools alone for all three";; esac
+       done; shift;;
      *) fail "unknown argument: $1";;
    esac
  done
+ # FETCH_SET: the clients this run downloads, space-separated in bootstrap's
+ # order, '' when none; FETCH_TOOLS is true exactly when it is not empty.
+ FETCH_SET=''; for fetch_name in jq kubectl helm; do [[ ,$fetch_list, != *,$fetch_name,* ]] || FETCH_SET+="${FETCH_SET:+ }$fetch_name"; done
  if [[ $COMMAND == help || $COMMAND == --help ]]; then
-   printf '%s\n' 'gsj-install.sh init [--context NAME]' 'gsj-install.sh inspect [--context NAME]' 'any command but init also accepts --fetch-tools (download this release'"'"'s pinned helm/kubectl/jq instead of using the ones installed here)' 'gsj-install.sh install --interactive [--config site.json]' 'gsj-install.sh install --config site.json --non-interactive' 'gsj-install.sh upgrade --to VERSION --config site.json [--interactive|--non-interactive]' 'gsj-install.sh resume --operation ID --config site.json --non-interactive' 'gsj-install.sh repair --operation ID [--to VERSION] [--backup-round N | --source-installer PATH | --continue-helm-installer PATH [--continue-from-program PATH]] --config site.json --non-interactive' 'gsj-install.sh credential-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh tls-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh lease-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh abandon --operation ID --reason TEXT --config site.json --non-interactive' 'gsj-install.sh sweep --config site.json --reason "why" --non-interactive' 'gsj-install.sh addon-repair --operation ID --addon traefik|certManager --revision N --config site.json --non-interactive' 'gsj-install.sh backup --config site.json [--interactive|--non-interactive]' 'gsj-install.sh backup-repair --operation ID --generation N --config site.json --non-interactive' 'gsj-install.sh restore --archive BACKUP.tar.gz.enc --config site.json --non-interactive' 'gsj-install.sh restore-repair --operation ID [--source-installer PATH] --config site.json --non-interactive'
+   printf '%s\n' 'gsj-install.sh init [--context NAME]' 'gsj-install.sh inspect [--context NAME]' 'any command but init also accepts --fetch-tools (download this release'"'"'s pinned helm/kubectl/jq instead of using the ones installed here) or --fetch-tools=TOOL[,TOOL] (only those; --fetch-tools=helm fetches the Helm 4 that four recovery paths need and keeps your own kubectl and jq)' 'gsj-install.sh install --interactive [--config site.json]' 'gsj-install.sh install --config site.json --non-interactive' 'gsj-install.sh upgrade --to VERSION --config site.json [--interactive|--non-interactive]' 'gsj-install.sh resume --operation ID --config site.json --non-interactive' 'gsj-install.sh repair --operation ID [--to VERSION] [--backup-round N | --source-installer PATH | --continue-helm-installer PATH [--continue-from-program PATH]] --config site.json --non-interactive' 'gsj-install.sh credential-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh tls-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh lease-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh abandon --operation ID --reason TEXT --config site.json --non-interactive' 'gsj-install.sh sweep --config site.json --reason "why" --non-interactive' 'gsj-install.sh addon-repair --operation ID --addon traefik|certManager --revision N --config site.json --non-interactive' 'gsj-install.sh backup --config site.json [--interactive|--non-interactive]' 'gsj-install.sh backup-repair --operation ID --generation N --config site.json --non-interactive' 'gsj-install.sh restore --archive BACKUP.tar.gz.enc --config site.json --non-interactive' 'gsj-install.sh restore-repair --operation ID [--source-installer PATH] --config site.json --non-interactive'
    return
  fi
  [[ -z $BACKUP_ROUND || ( $COMMAND == repair && $BACKUP_ROUND =~ ^[1-9][0-9]{0,5}$ ) ]] || fail '--backup-round requires repair and a positive bounded round number'
@@ -6151,7 +6178,7 @@ main() {
  [[ -z $GENERATION || ( $COMMAND == backup-repair && $GENERATION =~ ^[1-9][0-9]{0,5}$ ) ]] || fail '--generation requires backup-repair and a positive bounded generation number'
  # The verified child of --to receives --expected-version; interactive mode prompts.
  [[ $COMMAND != upgrade || -n $TO || -n $EXPECTED_VERSION ]] || $INTERACTIVE || fail 'non-interactive upgrade requires --to VERSION; repeat the installed release with --to <installed version>'
- # init reports on the clients this machine has and downloads nothing but its own release's files.
+ # init reports on the clients this machine has and downloads nothing but its own release's files, under every --fetch-tools form.
  [[ $COMMAND != init ]] || ! $FETCH_TOOLS || fail 'init reports on the clients this machine has and downloads nothing but its own release; run it without --fetch-tools'
  # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal); init sets
  # none, and an operator's exported leftovers must not reach a cluster through init's exit trap.

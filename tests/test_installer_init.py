@@ -597,9 +597,12 @@ def test_bootstrap_skips_only_the_client_refusal_for_init(runtime, tmp_path):
     assert "REACHED" not in reached.stdout
 
 
-def test_init_refuses_fetch_tools_by_name_before_bootstrap_downloads_anything(tmp_path, keypair):
+@pytest.mark.parametrize("flag", ["--fetch-tools", "--fetch-tools=helm", "--fetch-tools=kubectl,jq"])
+def test_init_refuses_fetch_tools_by_name_before_bootstrap_downloads_anything(tmp_path, keypair, flag):
+    """init reports on the clients this machine has: the single-client form
+    downloads a client just as the bare flag does, and is refused the same."""
     box = Box(tmp_path, keypair, helm=None)
-    result = box.run("--fetch-tools")
+    result = box.run(flag)
     _stop(result, "run it without --fetch-tools")
     assert box.curl_calls() == [] and box.kube_calls() == []
     assert not (box.home / "gsj-operator").exists()

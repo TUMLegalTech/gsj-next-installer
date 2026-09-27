@@ -13,10 +13,16 @@ the measurements.
 No cluster, no network, no real helm/kubectl/jq: the tools are shell scripts
 that print a chosen version, put on PATH through the fixture's env override.
 """
+import base64
+import hashlib
+import io
 import json
 import os
+from pathlib import Path
+import platform
 import shutil
 import subprocess
+import tarfile
 
 import pytest
 
@@ -29,7 +35,7 @@ from tests.test_installer import INSTALLER, runtime  # noqa: F401
 # and nothing else is reachable.
 _UTILITIES = ("bash", "curl", "tar", "gzip", "base64", "awk", "cut",
               "uname", "mktemp", "date", "sync", "sed", "head", "tr", "cat",
-              "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm")
+              "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "tail", "dirname")
 # openssl is a floor of its own (GSJ_OPENSSL_FLOOR): the fake answers
 # `openssl version` with the banner a test chooses -- OpenSSL 3 unless told
 # otherwise, so no test here depends on the host's flavour (macOS ships
@@ -135,7 +141,7 @@ def test_a_too_old_client_is_refused_by_name_floor_and_finding(runtime, tmp_path
     assert "ADMITTED" not in result.stdout
     # "requires Helm >= X, found 3.19.2" -- the tool, the floor, and what is here
     assert f"requires {tool} >= {FLOORS[tool]}, found {version}" in result.stderr, result.stderr
-    assert "--fetch-tools" in result.stderr
+    assert f"--fetch-tools={tool}" in result.stderr, result.stderr
 
 
 @pytest.mark.parametrize("missing", ["helm", "kubectl", "jq"])
@@ -146,7 +152,7 @@ def test_a_missing_client_is_refused_and_names_the_escape_hatch(runtime, tmp_pat
     assert result.returncode != 0
     assert "ADMITTED" not in result.stdout
     assert f"requires {missing} >= {FLOORS[missing]}, found none on PATH" in result.stderr
-    assert "--fetch-tools" in result.stderr
+    assert f"--fetch-tools={missing}" in result.stderr, result.stderr
 
 
 def test_the_refusal_precedes_the_payload_and_touches_no_cluster(runtime, tmp_path):
@@ -170,25 +176,194 @@ def test_the_refusal_precedes_the_payload_and_touches_no_cluster(runtime, tmp_pa
 def test_fetch_tools_keeps_the_download_path_and_skips_the_preflight(runtime, tmp_path):
     """An air-gapped or under-provisioned box can still bring its own.
 
-    With --fetch-tools, a box with NO helm/kubectl/jq at all must not be
-    refused for that reason; bootstrap proceeds to the payload step.
+    With --fetch-tools (all three clients), a box with NO helm/kubectl/jq at
+    all must not be refused for that reason; bootstrap proceeds to the
+    payload step. FETCH_TOOLS=true without a FETCH_SET -- a caller that
+    sources the runtime and sets only the flag -- means the same three.
     """
     run, _, _ = runtime
     path = _tools(tmp_path / "tools", helm=None, kubectl=None, jq=None)
     refused = run("FETCH_TOOLS=false; bootstrap", PATH=path)
-    fetched = run("FETCH_TOOLS=true; bootstrap", PATH=path)
     # Same box, same empty toolchain: only the default path refuses for it.
     assert "requires jq >=" in refused.stderr   # jq is checked first
+    for spelling in ("FETCH_TOOLS=true; FETCH_SET='jq kubectl helm'", "FETCH_TOOLS=true"):
+        fetched = run(spelling + "; bootstrap", PATH=path)
+        for tool in ("helm", "kubectl", "jq"):
+            assert f"requires {tool} >=" not in fetched.stderr, (spelling, fetched.stderr)
+
+
+# --- which clients a run fetches: --fetch-tools, or --fetch-tools=TOOL[,TOOL] --
+#
+# The bare flag fetches all three pinned clients. But the pinned kubectl is
+# pinned for the release, not for the customer's server, and kubectl is
+# supported only within one minor of the server it talks to; and only the four
+# recovery paths that render a release offline need Helm 4 at all. The
+# single-client form fetches what is named and keeps this box's others, which
+# are still held to their floors in the first seconds.
+
+# main() up to bootstrap: what the argument parsing left for the runtime.
+_PARSED = 'bootstrap() { printf "FETCH_TOOLS=%s FETCH_SET=[%s]\\n" "$FETCH_TOOLS" "$FETCH_SET"; exit 0; }\n'
+
+
+@pytest.mark.parametrize("flags,fetch_tools,fetch_set", [
+    ([], "false", ""),
+    (["--fetch-tools"], "true", "jq kubectl helm"),
+    (["--fetch-tools=helm"], "true", "helm"),
+    (["--fetch-tools=kubectl,jq"], "true", "jq kubectl"),
+    (["--fetch-tools=helm,helm"], "true", "helm"),
+    (["--fetch-tools=helm", "--fetch-tools=jq"], "true", "jq helm"),
+    (["--fetch-tools=helm", "--fetch-tools"], "true", "jq kubectl helm"),
+])
+def test_fetch_set_names_the_clients_this_run_fetches(runtime, flags, fetch_tools, fetch_set):
+    """The contract the rest of the runtime reads: FETCH_TOOLS is true when
+    anything is fetched, and FETCH_SET holds the fetched clients' names,
+    space-separated in bootstrap's order, '' when none."""
+    run, state, _ = runtime
+    result = run(_PARSED + "main install --config site.json --non-interactive " + " ".join(flags))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"FETCH_TOOLS={fetch_tools} FETCH_SET=[{fetch_set}]", result.stdout
+    assert json.loads(state.read_text())["calls"] == []
+
+
+@pytest.mark.parametrize("command", [
+    "inspect", "install", "upgrade --to v1.2.3", "resume", "repair", "credential-repair", "tls-repair",
+    "lease-repair", "abandon", "sweep", "addon-repair", "backup", "backup-repair", "restore", "restore-repair",
+])
+def test_every_command_but_init_accepts_every_fetch_tools_form(runtime, command):
+    run, _, _ = runtime
+    for flag, fetch_set in (("--fetch-tools", "jq kubectl helm"), ("--fetch-tools=helm", "helm"),
+                            ("--fetch-tools=kubectl,jq", "jq kubectl")):
+        result = run(_PARSED + f"main {command} {flag}")
+        assert result.returncode == 0, (command, flag, result.stderr)
+        assert result.stdout.strip() == f"FETCH_TOOLS=true FETCH_SET=[{fetch_set}]", (command, flag, result.stdout)
+
+
+@pytest.mark.parametrize("flag,named", [
+    ("--fetch-tools=terraform", "terraform"),
+    ("--fetch-tools=helm,oc", "oc"),
+    ("--fetch-tools=Helm", "Helm"),
+    ("--fetch-tools=", "an empty name"),
+    ("--fetch-tools=helm,,jq", "an empty name"),
+])
+def test_an_unknown_fetch_tools_client_is_refused_by_name_before_bootstrap(runtime, flag, named):
+    run, state, _ = runtime
+    result = run("bootstrap() { echo REACHED; exit 0; }\nmain install " + flag)
+    assert result.returncode == 1 and "REACHED" not in result.stdout, result.stdout + result.stderr
+    line = result.stderr.strip().splitlines()[-1]
+    assert line.startswith("GSJ: unknown --fetch-tools client: " + named), line
+    assert "helm, kubectl and jq" in line and "--fetch-tools=helm" in line, line
+    assert json.loads(state.read_text())["calls"] == []
+
+
+def test_the_help_names_the_single_client_fetch(runtime):
+    run, _, _ = runtime
+    result = run("main help")
+    assert "any command but init also accepts --fetch-tools" in result.stdout
+    assert "--fetch-tools=TOOL[,TOOL]" in result.stdout and "--fetch-tools=helm" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("tool,version", [("kubectl", "1.23.17"), ("jq", "1.5"), ("kubectl", None), ("jq", None)])
+def test_a_helm_only_fetch_still_holds_this_boxs_kubectl_and_jq_to_their_floors(runtime, tmp_path, tool, version):
+    """--fetch-tools=helm replaces helm alone: a too-old or missing kubectl or
+    jq is still refused by name in the first seconds, before the payload is
+    unpacked, while the helm it replaces -- here one below the floor -- is
+    not judged on this box's copy."""
+    run, state, _ = runtime
+    path = _tools(tmp_path / "tools", **{**FLOORS, "helm": "3.11.3", tool: version})
+    result = run("FETCH_TOOLS=true; FETCH_SET=helm; bootstrap; echo REACHED", PATH=path)
+    assert result.returncode != 0 and "REACHED" not in result.stdout
+    finding = f"found {version}" if version else "found none on PATH"
+    assert f"requires {tool} >= {FLOORS[tool]}, {finding}" in result.stderr, result.stderr
+    assert f"--fetch-tools={tool}" in result.stderr, result.stderr
+    assert "requires helm" not in result.stderr, result.stderr
+    assert json.loads(state.read_text())["calls"] == []
+
+
+def test_a_kubectl_and_jq_fetch_still_holds_this_boxs_helm_to_its_floor(runtime, tmp_path):
+    run, state, _ = runtime
+    path = _tools(tmp_path / "tools", **{**FLOORS, "helm": "3.11.3", "kubectl": "1.23.17", "jq": None})
+    result = run("FETCH_TOOLS=true; FETCH_SET='jq kubectl'; bootstrap; echo REACHED", PATH=path)
+    assert result.returncode != 0 and "REACHED" not in result.stdout
+    assert f"requires helm >= {FLOORS['helm']}, found 3.11.3" in result.stderr, result.stderr
+    assert "--fetch-tools=helm" in result.stderr, result.stderr
+    assert "requires jq" not in result.stderr and "requires kubectl" not in result.stderr, result.stderr
+    assert json.loads(state.read_text())["calls"] == []
+
+
+def _fetching_bootstrap(run, tmp_path, work, path, fetch_set, pinned):
+    """bootstrap() through its fetch loop, which the fixture's `bash -c` never
+    reaches: $0 there carries no payload. The script written here IS the
+    installer bootstrap unpacks, laid out like the real one -- the runtime's
+    functions, a fetch that serves synthetic pinned clients from
+    TEST_WORK/pinned and logs each URL, then a real payload below the
+    marker. `pinned` maps each client to the version its fetched copy
+    reports. Returns the result, {tool: (path, version)} as the run resolved
+    them after bootstrap, and the URLs fetched in order."""
+    os_name = platform.system().lower()
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}[platform.machine()]
+    spelled = Path(_tools(tmp_path / "pinned-build", **pinned))   # the spellings the PATH fakes use
+    store = work / "pinned"
+    store.mkdir()
+    for tool in pinned:
+        if tool == "helm":
+            with tarfile.open(store / "helm", "w:gz") as archive:
+                archive.add(spelled / "helm", arcname=f"{os_name}-{arch}/helm")
+        else:
+            shutil.copyfile(spelled / tool, store / tool)
+    files = {"release.json": b"{}\n"}
+    files["SHA256SUMS"] = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in files.items()).encode()
+    packed = io.BytesIO()
+    with tarfile.open(fileobj=packed, mode="w:gz") as archive:
+        for name, data in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+    script = ('source "$TEST_FUNCTIONS"\n'
+              "gsj_client_info() { printf 'https://example.test/%s\\t%s\\n' \"$1\" " + "a" * 64 + "; }\n"
+              'fetch() { printf \'%s\\n\' "$1" >> "$TEST_WORK/fetched.log"; cp "$TEST_WORK/pinned/${1##*/}" "$2"; }\n'
+              f"FETCH_TOOLS=true; FETCH_SET='{fetch_set}'; COMMAND=install\n"
+              "bootstrap\n"
+              'for tool in helm kubectl jq; do printf \'%s %s %s\\n\' "$tool" "$(command -v "$tool")" "$(client_version "$tool")"; done\n'
+              "printf 'major %s\\n' \"$HELM_MAJOR\"\n"
+              "exit 0\n"
+              "__GSJ_PAYLOAD_BELOW__\n")
+    (work / "installer.sh").write_bytes(script.encode() + base64.encodebytes(packed.getvalue()))
+    (tmp_path / "tmp").mkdir()
+    result = run('exec bash "$TEST_WORK/installer.sh"', PATH=path, TMPDIR=str(tmp_path / "tmp"),
+                 XDG_CACHE_HOME=str(tmp_path / "cache"))
+    clients = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(" ")
+        if len(parts) == 3 and parts[0] in ("helm", "kubectl", "jq"):
+            clients[parts[0]] = (parts[1], parts[2])
+    log = work / "fetched.log"
+    return result, clients, log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize("fetch_set,box,fetched_tools", [
+    ("helm", {"helm": None, "kubectl": "1.33.6", "jq": "1.7"}, ["helm"]),
+    ("jq kubectl", {"helm": "3.19.2", "kubectl": None, "jq": None}, ["jq", "kubectl"]),
+    ("jq kubectl helm", {"helm": None, "kubectl": None, "jq": None}, ["jq", "kubectl", "helm"]),
+])
+def test_bootstrap_downloads_exactly_the_fetched_clients_and_keeps_this_boxs_others(runtime, tmp_path, fetch_set, box, fetched_tools):
+    """The download loop runs for the clients FETCH_SET names and no other:
+    each fetched client sits first on PATH from the private directory, and
+    every other one is this box's own. A helm-only fetch therefore drives
+    the run with the pinned Helm 4 and the kubectl that matches this box's
+    server."""
+    run, _, work = runtime
+    pinned = {"helm": "4.2.2", "kubectl": "1.35.8", "jq": "1.8.2"}
+    path = _tools(tmp_path / "tools", **box)
+    result, clients, fetched = _fetching_bootstrap(run, tmp_path, work, path, fetch_set, pinned)
+    assert result.returncode == 0, result.stderr
+    assert fetched == ["https://example.test/" + tool for tool in fetched_tools], fetched
     for tool in ("helm", "kubectl", "jq"):
-        assert f"requires {tool} >=" not in fetched.stderr, fetched.stderr
-
-
-def test_fetch_tools_is_an_accepted_argument_on_every_command():
-    source = (INSTALLER / "runtime.sh").read_text()
-    assert "--fetch-tools) FETCH_TOOLS=true; shift;;" in source
-    assert "FETCH_TOOLS=false" in source, "the flag must default to using the consumer's tools"
-    assert "--fetch-tools" in source.split("gsj-install.sh inspect")[1][:2000], \
-        "the help output must name the escape hatch"
+        where, version = clients[tool]
+        if tool in fetched_tools:
+            assert version == pinned[tool] and where.endswith("/bin/" + tool) and "/gsj-install." in where, (tool, where, version)
+        else:
+            assert (where, version) == (str(Path(path) / tool), box[tool]), (tool, where, version)
+    assert f"major {clients['helm'][1].split('.')[0]}" in result.stdout, result.stdout
 
 
 @pytest.mark.parametrize("version,ownership", [
@@ -324,7 +499,21 @@ def test_cluster_free_serialization_is_refused_precisely_on_helm_3(runtime, tmp_
         assert "ADMITTED" in result.stdout
     else:
         assert "only Helm 4 can do" in result.stderr, result.stderr
-        assert "--fetch-tools" in result.stderr
+        assert "--fetch-tools=helm" in result.stderr, result.stderr
+
+
+def test_the_helm_4_refusals_name_the_helm_only_fetch(runtime, tmp_path):
+    """Only the four recovery paths that render a release offline need Helm
+    4, and fetching Helm alone keeps this box's kubectl -- the one matched to
+    its server -- so both refusals name --fetch-tools=helm."""
+    run, state, _ = runtime
+    path = _tools(tmp_path / "tools", **{**FLOORS, "helm": "3.22.0"})
+    for body in ("helm_dialect; require_offline_render", "COMMAND=addon-repair; helm_verb_preflight"):
+        result = run(body + "; echo ADMITTED", PATH=path)
+        assert result.returncode == 1 and "ADMITTED" not in result.stdout, result.stderr
+        line = result.stderr.strip().splitlines()[-1]
+        assert "only Helm 4 can do" in line and "--fetch-tools=helm" in line, line
+    assert json.loads(state.read_text())["calls"] == []
 
 
 def test_every_cluster_free_render_site_is_guarded():
@@ -586,7 +775,7 @@ def test_openssl_is_admitted_or_refused_by_name_floor_and_finding(runtime, tmp_p
         assert "--fetch-tools does not supply OpenSSL" in result.stderr
 
 
-@pytest.mark.parametrize("fetch_tools", ["false", "true"])
+@pytest.mark.parametrize("fetch_tools", ["false", "true", "true; FETCH_SET=helm"])
 def test_the_openssl_refusal_is_in_bootstrap_before_the_clients_and_survives_fetch_tools(runtime, tmp_path, fetch_tools):
     """LibreSSL and a too-old helm together: the OpenSSL refusal is the one
     reported, so it precedes the client preflight; and --fetch-tools, which
