@@ -6241,16 +6241,18 @@ init_publish() {
  # planted there (or a link to one) was opened for writing -- the run blocked
  # on it -- and the write that followed opened the name a second time. The
  # copy is written once, by the open that creates a fresh random name beside
- # it (noclobber opens a name that is not there with O_EXCL), and ln -T links
- # that into place: it fails for an existing name of any type (without -T, ln
- # links INTO an existing directory, or a link to one).
+ # it (noclobber opens a name that is not there with O_EXCL), and link(1)
+ # links that into place: it is link(2) itself, which fails for an existing
+ # name of any type and never descends into one (ln links INTO an existing
+ # directory, or a link to one, and its -T that stops that is GNU's alone: on
+ # a macOS box every publication failed as "not writable").
  local name=$1 dest="$2/$1" temp
  temp=$(mktemp -u "$2/.$1.XXXXXXXXXX" 2>/dev/null) || { INIT_WHY="$2 is not writable"; return 1; }
  if ! ( set -o noclobber; cat "$INIT_STAGE/$name" > "$temp" ) 2>/dev/null; then
    [[ -e $temp ]] || { INIT_WHY="$2 is not writable"; return 1; }
    rm -f "$temp"; INIT_WHY="$dest could not be written"; return 1
  fi
- if ! ln -T "$temp" "$dest" 2>/dev/null; then
+ if ! link "$temp" "$dest" 2>/dev/null; then
    rm -f "$temp"
    if [[ -e $dest || -L $dest ]]; then INIT_WHY="$dest appeared during the download and was not replaced"; return 2; fi
    INIT_WHY="$2 is not writable"; return 1
@@ -6379,7 +6381,7 @@ init_box() {
  local name here self trust base origin version identity found dir where present=0 downloaded=0 missing='' why='' status detail utility target
  local -a wanted=() saved=()
  INIT_PASS=0; INIT_FAIL=0; INIT_UNKNOWN=0; INIT_ROWS=''; INIT_FIXES=''; INIT_WHY=''; INIT_RC=0
- for utility in df stat id dirname basename tr head tail sed wc readlink ln; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
+ for utility in df stat id dirname basename tr head tail sed wc readlink link; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
  # This file, through any symlink it was run as: "beside the installer" is
  # beside the file itself.
  self=$0; while [[ -L $self ]]; do target=$(readlink -- "$self") || fail "the link $self could not be read"; [[ $target == /* ]] && self=$target || self="$(dirname -- "$self")/$target"; done

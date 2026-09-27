@@ -39,7 +39,7 @@ COMPANIONS = ("verify-release.sh", "release.pem", "installer-descriptor.json", "
 # the system directories; nothing else is reachable. `jq` is real (inspect
 # runs it); openssl is wrapped like the clients tests do.
 UTILITIES = ("bash", "tar", "gzip", "base64", "awk", "cut", "mktemp", "sync", "sed", "head", "tail", "tr",
-             "cat", "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "ln", "stat", "getconf",
+             "cat", "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "link", "stat", "getconf",
              "dirname", "basename", "grep", "wc", "sort", "sysctl", "env", "readlink", "perl", "sleep")
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # Every diagnostic bash or a tool prints when a script walks into a trap; no
@@ -1099,14 +1099,19 @@ cat "$TEST_WORK/publish.out"
 """
 
 
-def _publish(runtime, tmp_path, plant=None):
+# ln as macOS ships it: BSD's, which has no -T.
+_BSD_LN = """ln() { case "$1" in -T) echo "ln: illegal option -- T" >&2; return 1;; esac; command ln "$@"; }
+"""
+
+
+def _publish(runtime, tmp_path, plant=None, bsd_ln=False):
     run, _, _ = runtime
     stage, dest = tmp_path / "stage", tmp_path / "dest"
     stage.mkdir(); dest.mkdir()
     (stage / "release.pem").write_text("the checked copy\n")
     if plant:
         plant(dest / "release.pem")
-    return run(_PUBLISH, TEST_STAGE=str(stage), TEST_DEST=str(dest)), dest
+    return run((_BSD_LN if bsd_ln else "") + _PUBLISH, TEST_STAGE=str(stage), TEST_DEST=str(dest)), dest
 
 
 @pytest.mark.parametrize("planted", ["a FIFO", "a link to a FIFO", "a link to a file", "a dangling link", "a directory", "a link to a directory"])
@@ -1116,8 +1121,9 @@ def test_a_name_planted_where_a_companion_is_published_is_never_opened_nor_repla
     there (or a link to one) was opened for writing -- the run blocked until
     something read it -- and the unguarded write that followed opened the
     name again. The copy is written to a fresh private name and linked into
-    place with ln, which fails for an existing name of any type and never
-    opens it (ln -T: a plain ln links INTO a directory, or a link to one):
+    place with link(1) -- link(2), which fails for an existing name of any
+    type and never opens it or descends into it (a plain ln links INTO a
+    directory, or a link to one):
     the planted name is left exactly as it was, nothing is left beside it or
     in it, and the result is the 'appeared' refusal (2)."""
     fifo, precious, elsewhere = tmp_path / "fifo", tmp_path / "precious", tmp_path / "elsewhere"
@@ -1149,6 +1155,16 @@ def test_a_name_planted_where_a_companion_is_published_is_never_opened_nor_repla
         assert name.is_symlink()
     assert precious.read_text() == "precious" and not (tmp_path / "absent").exists() and list(elsewhere.iterdir()) == []
     assert sorted(p.name for p in dest.iterdir()) == ["release.pem"], "a temporary name was left beside the planted one"
+
+
+def test_a_companion_is_published_by_an_ln_without_minus_T(runtime, tmp_path):
+    """init supports a macOS box, whose ln is BSD's and has no -T: every
+    companion's publication failed there and was reported as 'not writable'.
+    link(1) is POSIX and the same call on both."""
+    result, dest = _publish(runtime, tmp_path, bsd_ln=True)
+    assert "rc=0" in result.stdout, result.stdout + result.stderr
+    assert (dest / "release.pem").read_text() == "the checked copy\n"
+    assert sorted(p.name for p in dest.iterdir()) == ["release.pem"]
 
 
 def test_a_companion_is_published_whole_and_private_and_an_unwritable_folder_is_named(runtime, tmp_path):
