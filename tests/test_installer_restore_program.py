@@ -223,7 +223,8 @@ def test_corrected_restore_refuses_drift_before_lease_or_other_mutations(stopped
 OLD = '2000-01-01T00:00:00.000000Z'
 ATTEMPT, SECOND, ORPHAN, EARLIER = '1' * 24, '2' * 24, '3' * 24, '4' * 24
 FAILED = {'attempt': ATTEMPT, 'revision': 2, 'release_secret_uid': 'failed-history', 'status': 'failed'}
-FRESH = 'another Kubernetes context whose namespace synthetic-namespace is empty'
+FRESH = ('into an empty namespace synthetic-namespace from a new site directory: on another cluster, '
+         'or on this one once the deployment is removed')
 MUTATIONS = ('create', 'replace', 'apply', 'delete', 'exec', 'patch', 'scale')
 CHART = {'metadata': {'name': 'gsj', 'version': '0.1.0'}, 'templates': [{'name': 'templates/gsj.yaml', 'data': 'c3ludGhldGlj'}]}
 REPAIR = '''
@@ -748,8 +749,12 @@ install_exit_traps
         assert reason in result.stderr and 'stay retained for inspection' in result.stderr, result.stderr
         assert 'repair --operation' not in result.stderr and 'Use resume' not in result.stderr, result.stderr
         # The message and RECOVERY_HINT name the same fresh restore, never a corrected release.
-        assert f'; keep operation {operation} retained and restore {fresh} in {FRESH}\n' in result.stderr, result.stderr
-        assert f'Use restore of {fresh} in {FRESH}; keep operation {operation} retained.' in result.stderr, result.stderr
+        route = (f'{FRESH} (abandon --operation {operation}, helm uninstall synthetic-release, sweep, '
+                 'then delete namespace synthetic-namespace)')
+        assert (f'; keep operation {operation} retained with this site directory as it is, and restore {fresh} {route}\n'
+                in result.stderr), result.stderr
+        assert (f'Use restore of {fresh} {route}; keep operation {operation} retained with this site directory as it is.'
+                in result.stderr), result.stderr
         assert 'corrected' not in result.stderr, result.stderr
         if fresh != SOURCE:
             assert f'restore {SOURCE} in' not in result.stderr and f'restore of {SOURCE} in' not in result.stderr

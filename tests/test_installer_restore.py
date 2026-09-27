@@ -470,3 +470,24 @@ def test_any_other_restore_checkpoint_still_refuses_a_fresh_restore(runtime, tmp
     assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
                    for call in json.loads(state.read_text())["calls"])
 
+
+def test_the_fresh_restore_refusal_names_both_routes_for_one_cluster(runtime):
+    # Most sites have one cluster: the empty namespace is on another cluster,
+    # or this one recreated once the deployment is removed; a new site
+    # directory either way, keeping the retained operation's as it is.
+    run, _, work = runtime
+    operation = "a" * 24
+    result = run(f'''OPERATION={operation}; LEASE_ACQUIRED=true; GSJ_WORK="$TEST_WORK/throwaway"; mkdir -p "$GSJ_WORK"
+install_exit_traps
+restore_fresh_fail 'the restored evidence changed'
+''')
+    assert result.returncode != 0
+    route = ("into an empty namespace synthetic-namespace from a new site directory: on another cluster, or on this one "
+             f"once the deployment is removed (abandon --operation {operation}, helm uninstall synthetic-release, sweep, "
+             "then delete namespace synthetic-namespace)")
+    fresh = "its verified archive with the exact source installer"
+    assert (f"GSJ: the restored evidence changed; keep operation {operation} retained with this site directory as it is, "
+            f"and restore {fresh} {route}\n") in result.stderr, result.stderr
+    assert (f"Use restore of {fresh} {route}; keep operation {operation} retained with this site directory as it is."
+            ) in result.stderr, result.stderr
+    assert "Kubernetes context" not in result.stderr

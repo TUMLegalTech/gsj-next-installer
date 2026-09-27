@@ -3983,10 +3983,16 @@ helm_application_prepare() {
 restore_fresh_fail() {
  # A restore whose evidence changed outside its recorded writes has one named
  # recovery; its retained operation is never deleted, reset or replayed. $2
- # overrides which fresh restore it names.
+ # overrides which fresh restore it names. Most sites have one cluster, so the
+ # empty namespace is on another cluster or this one recreated once the
+ # deployment is removed, from a new site directory either way: this one keeps
+ # the retained operation's evidence, and on this cluster its unfinished
+ # checkpoint refuses a fresh restore (restore_archive retires only a completed
+ # one).
  local fresh="${2:-its verified archive with the exact source installer}"
- RECOVERY_HINT="restore of $fresh in another Kubernetes context whose namespace $NAMESPACE is empty; keep operation $OPERATION retained"
- fail "$1; keep operation $OPERATION retained and restore $fresh in another Kubernetes context whose namespace $NAMESPACE is empty"
+ local into="into an empty namespace $NAMESPACE from a new site directory: on another cluster, or on this one once the deployment is removed (abandon --operation $OPERATION, helm uninstall $RELEASE, sweep, then delete namespace $NAMESPACE)"
+ RECOVERY_HINT="restore of $fresh $into; keep operation $OPERATION retained with this site directory as it is"
+ fail "$1; keep operation $OPERATION retained with this site directory as it is, and restore $fresh $into"
 }
 helm_application_validate() {
  local attempt directory current uid revision name kind object latest
@@ -4358,7 +4364,7 @@ except OSError as e: print(getattr(e,"verify_message",None) or getattr(e,"reason
    resume="resume --operation $OPERATION with the operation's exact target installer"; fresh='install afresh into an empty namespace'
    if [[ ${RESTORE_PROGRAM_ACTIVE:-false} == true ]]; then
      resume="resume --operation $OPERATION with this installer"
-     fresh="restore its verified archive with the exact source installer in another Kubernetes context whose namespace $NAMESPACE is empty"
+     fresh="restore its verified archive with the exact source installer into an empty namespace $NAMESPACE from a new site directory: on another cluster, or on this one once the deployment is removed (abandon --operation $OPERATION, helm uninstall $RELEASE, sweep, then delete namespace $NAMESPACE)"
    fi
    next="If the failure was transient, $resume once the route is reachable"
    RECOVERY_HINT="$resume once the route is reachable, if the failure was transient; otherwise keep operation $OPERATION retained and $fresh"

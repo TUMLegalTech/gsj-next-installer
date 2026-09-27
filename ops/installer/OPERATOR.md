@@ -2906,8 +2906,9 @@ route the acceptance verifier could never use, cannot be continued by this
 release's installer, which refuses that saved site. Keep the operation retained
 and take its fresh path: restore its verified archive (a restore's archive, or
 the backup an upgrade or repair took) with that archive's exact source installer
-into another Kubernetes context whose namespace of the same name is empty, or,
-for a first install, `install` afresh into an empty namespace.
+into an empty namespace of the same name from a new site directory, on another
+cluster or on this one once the deployment is removed, or, for a first install,
+`install` afresh into an empty namespace.
 
 Before the installer starts or reconnects a verifier for an unfinished run, it
 opens one TCP connection from the `gsj-web` container over this route, or to
@@ -2964,8 +2965,9 @@ operation's `origin-tls-failed`: run `tls-repair --operation ID` when the
 installer names it, or correct the certificate as described above, then that
 `resume`, waiting for the Lease as above.
 Otherwise keep the operation retained and take the fresh path: for a restore,
-restore the same verified archive with the exact source installer into another
-Kubernetes context whose namespace of the same name is empty; for a continued
+restore the same verified archive with the exact source installer into an empty
+namespace of the same name from a new site directory, on another cluster or on
+this one once the deployment is removed; for a continued
 first install, `install` afresh into an empty namespace. A run left under an
 earlier `public_url` keeps its own route, which the current site cannot
 correct; the installer reports that instead of a correction.
@@ -3321,9 +3323,10 @@ verification.
 A restore has no repair for a terminal corpus code or a terminal bot check:
 `resume` would repeat the failure, and `repair` refuses a restore whose
 application Helm revision has completed. Keep the operation retained for
-inspection. The installer names a fresh restore into another Kubernetes context
-whose namespace of the same name is empty (restore keeps the archive's
-namespace and release names):
+inspection. The installer names a fresh restore into an empty namespace of the
+same name (restore keeps the archive's namespace and release names) from a new
+site directory, on another cluster or on this one once the deployment is
+removed:
 
 | Stop | Fresh restore |
 |---|---|
@@ -3880,8 +3883,7 @@ Use the installer that owns the operation: the corrected installer named by the
 restore-program transition receipt, or the exact source installer when no
 transition was recorded. Only an owning installer from this release onward has
 this repair; do not run an earlier owning installer's `repair` for a restore.
-Without such an installer, use the restore into another Kubernetes context
-below.
+Without such an installer, use the fresh restore below.
 
 ```sh
 bash gsj-install.sh repair --operation "$GSJ_OPERATION_ID" \
@@ -3925,25 +3927,29 @@ same installer; if the new revision fails, fix its cause and run repair again.
 | The configuration differs from the operation's saved configuration | Rerun with the exact site configuration the operation saved |
 | An installer other than the owner (another target release, or not the recorded restore program) | Rerun with the installer that owns the operation |
 | A corrected installer with no recorded transition | `repair --operation` with the exact source installer |
-| A restored claim receipt, checkpoint entry or other local evidence is missing or unreadable | The restore into another Kubernetes context below; rerunning cannot restore it |
+| A restored claim receipt, checkpoint entry or other local evidence is missing or unreadable | The fresh restore below; rerunning cannot restore it |
 | `--backup-round` or `--continue-helm-installer` was given | Rerun without that option |
 | The restore stopped in another phase | Inspect the saved state; repair does not continue it |
 
-A refusal whose message names a restore of the verified archive in another
-Kubernetes context means repair cannot re-prove this operation's recorded
+A refusal whose message names a restore of the verified archive into an empty
+namespace from a new site directory means repair cannot re-prove this operation's recorded
 state: a changed credential, claim, volume or provisioning marker; Helm history
 outside the restored history and this operation's attempts; a failed revision
 that is not the signed chart and configuration; a GSJ application or corpus
 initializer container that already ran; missing or unreadable local evidence;
 no recorded Helm target or pre-startup capacity pass; or a pending revision,
-which an interrupted Helm client leaves and which has no continuation. Keep the operation retained and never delete it or its
-namespace. Restore the same verified archive into another Kubernetes context
-whose namespace of the same name is empty (restore keeps the archive's
-namespace and release names):
+which an interrupted Helm client leaves and which has no continuation. Keep the operation retained and its site directory
+as it is: the directory holds the operation's evidence, and its unfinished
+restore checkpoint refuses a fresh restore there. Restore the same verified
+archive into an empty namespace of the same name (restore keeps the archive's
+namespace and release names) from a new site directory: on another cluster,
+keeping this namespace too, or, with one cluster, on this one once the
+deployment is removed (`abandon --operation`, `helm uninstall` of the release,
+`sweep`, then delete the namespace; with `local-path` that erases the claims):
 
 ```sh
 bash source-gsj-install.sh restore --archive "$GSJ_BACKUP_ARCHIVE" \
-  --config "$HOME/gsj-operator/recovery-site-other-context.json" --non-interactive
+  --config "$HOME/gsj-fresh-restore/site.json" --non-interactive
 ```
 
 The repair command itself never uninstalls or rolls back Helm; recreates claims,
