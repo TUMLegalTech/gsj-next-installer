@@ -4165,7 +4165,25 @@ initializer_pod_owned() {
  local pods=$1 name=$2 uid=$3 deploy_uid=$4 rs='' rs_uid=''
  IFS=$'\t' read -r rs rs_uid < <(jq -r --arg name "$name" --arg uid "$uid" '[.items[]|select(.metadata.name==$name and .metadata.uid==$uid)|.metadata.ownerReferences[]?|select(.controller==true and .kind=="ReplicaSet")|[.name,.uid]][0]//empty|@tsv' "$pods") || true
  [[ -n $rs && -n $rs_uid ]] || return 1
- k get replicasets "$rs" -o json 2>/dev/null | jq -e --arg rs_uid "$rs_uid" --arg name "$RELEASE-web" --arg uid "$deploy_uid" '.metadata.uid==$rs_uid and any(.metadata.ownerReferences[]?; .controller==true and .kind=="Deployment" and .name==$name and .uid==$uid)' >/dev/null
+ # A kubeconfig that may not read ReplicaSets proves no chain, and the
+ # release's own Pod looked foreign on every poll: no progress, no log, and
+ # its terminal verdict unjudged until the deadline ran out. Only a read
+ # refused as forbidden is that gap (a missing ReplicaSet proves nothing):
+ # it is said once, and a Pod a ReplicaSet controls is judged as the release
+ # before the chain judged every Pod, by the release's labels and not being
+ # deleted. kubectl's words are classified, never repeated.
+ # replicasets_readable is wait_application's local: once per wait, and no
+ # exported value decides it.
+ if ${replicasets_readable:-true}; then
+   if k get replicasets "$rs" -o json > "$GSJ_WORK/initializer-replicaset.json" 2> "$GSJ_WORK/initializer-replicaset.err"; then
+     jq -e --arg rs_uid "$rs_uid" --arg name "$RELEASE-web" --arg uid "$deploy_uid" '.metadata.uid==$rs_uid and any(.metadata.ownerReferences[]?; .controller==true and .kind=="Deployment" and .name==$name and .uid==$uid)' "$GSJ_WORK/initializer-replicaset.json" >/dev/null
+     return
+   fi
+   [[ $(tr '[:upper:]' '[:lower:]' < "$GSJ_WORK/initializer-replicaset.err") == *forbidden* ]] || return 1
+   replicasets_readable=false
+   log "This kubeconfig may not get replicasets.apps in namespace $NAMESPACE, so an application Pod's owner chain to Deployment $RELEASE-web cannot be proven; the wait judges a Pod that a ReplicaSet controls, carries release $RELEASE's labels and is not being deleted. Grant get on replicasets.apps to restore the proof"
+ fi
+ jq -e --arg name "$name" --arg uid "$uid" --arg release "$RELEASE" 'any(.items[]; .metadata.name==$name and .metadata.uid==$uid and .metadata.deletionTimestamp==null and .metadata.labels["app.kubernetes.io/instance"]==$release and .metadata.labels["app.kubernetes.io/component"]=="gsj")' "$pods" >/dev/null
 }
 initializer_stop() {
  # Terminal codes never clear by waiting; the others retry inside the Pod.
@@ -4220,7 +4238,7 @@ initializer_stop() {
  esac
 }
 wait_application() {
- local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod pod_uid state deploy_uid verdicts code verdict_pod verdict_uid line_code line_pod line_uid
+ local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod pod_uid state deploy_uid verdicts code verdict_pod verdict_uid line_code line_pod line_uid replicasets_readable=true
  while (( SECONDS < end )); do
    assert_owner
    helm_application_validate

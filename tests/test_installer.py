@@ -2934,7 +2934,9 @@ def _wait_application(runtime, staged_in_this_run, verdict_persists, waiting=Non
     """drives wait_application over a fake kubectl: `waiting` is the Pod list
     the labels select before the restart (the application Pod after its
     verdict by default), `deletion` what the API answers the recreation
-    (ok, or refused: the uid precondition failed / the Pod is gone)"""
+    (ok, or refused: the uid precondition failed / the Pod is gone), and
+    `replicaset` the ReplicaSet the chain reads, or "forbidden": the read
+    refused as RBAC refuses it, on stderr with exit 1"""
     run, _, work = runtime
     site = _site(); site["deadlines"] = {"initialization_seconds": 60, "dependencies_seconds": 60}
     (work / "site.json").write_text(json.dumps(site))
@@ -2942,13 +2944,17 @@ def _wait_application(runtime, staged_in_this_run, verdict_persists, waiting=Non
     (work / "pods-running.json").write_text(json.dumps({"items": [_application_pod("running", uid="installer-pod-uid-0002")]}))
     (work / "deploy-not-ready.json").write_text(json.dumps(_deploy(False)))
     (work / "deploy-ready.json").write_text(json.dumps(_deploy(True)))
-    (work / "replicaset.json").write_text(json.dumps(replicaset if replicaset is not None else _replicaset()))
+    if replicaset == "forbidden":
+        (work / "replicasets-forbidden").write_text("")
+    else:
+        (work / "replicaset.json").write_text(json.dumps(replicaset if replicaset is not None else _replicaset()))
     script = f'''
 k() {{
   case "$1 $2" in
     "get deploy") if [[ -f $TEST_WORK/recovered ]]; then cat "$TEST_WORK/deploy-ready.json"; else cat "$TEST_WORK/deploy-not-ready.json"; fi;;
     "get pods") if [[ -f $TEST_WORK/deleted && {'false' if verdict_persists else 'true'} == true ]]; then cat "$TEST_WORK/pods-running.json"; else cat "$TEST_WORK/pods-waiting.json"; fi;;
-    "get replicasets") [[ $3 == synthetic-release-web-7c9d8 ]] || return 1; cat "$TEST_WORK/replicaset.json";;
+    "get replicasets") if [[ -f $TEST_WORK/replicasets-forbidden ]]; then printf 'Error from server (Forbidden): replicasets.apps "%s" is forbidden: User "synthetic-operator" cannot get resource "replicasets" in API group "apps" in the namespace "synthetic-namespace"\\n' "$3" >&2; return 1; fi
+      [[ $3 == synthetic-release-web-7c9d8 ]] || return 1; cat "$TEST_WORK/replicaset.json";;
     "delete --raw") printf '%s %s\\n' "$*" "$(jq -c . "$5")" >> "$TEST_WORK/kubectl-deletes"; [[ {deletion} == ok ]] || return 1; : > "$TEST_WORK/deleted";;
     "delete pod") printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-deletes"; : > "$TEST_WORK/deleted";;
     "logs "*) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-logs";;
@@ -3136,3 +3142,45 @@ def test_the_releases_own_source_verification_verdict_gets_its_restart_behind_a_
     assert "restarting it once on the staged blocks" in result.stderr and "stopped terminally" not in result.stderr
     assert result.stderr.count(FOREIGN_NOT_OWNED) == 1, result.stderr
 
+
+# --- a kubeconfig that may not read ReplicaSets ---
+
+RS_GAP = "may not get replicasets.apps"
+
+
+def test_a_kubeconfig_that_may_not_read_replicasets_still_judges_the_releases_own_verdict(runtime):
+    """The owner chain runs through the Pod's ReplicaSet. A kubeconfig that
+    may not read ReplicaSets made the release's own Pod look foreign on every
+    poll: its progress and its log vanished, and its terminal verdict was
+    never judged -- the wait ran out its whole deadline and then named
+    resume. A read refused as forbidden is said once, naming the permission,
+    and the wait judges the Pod that carries the release's labels and is not
+    being deleted, as the release before the chain did. kubectl's own words
+    are not repeated."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_application_pod("running"), "deadline-exceeded")],
+                                        replicaset="forbidden")
+    assert result.returncode == 1, result.stderr
+    assert "stopped terminally (deadline-exceeded)" in result.stderr, result.stderr
+    assert result.stderr.count(RS_GAP) == 1, result.stderr
+    assert "not owned by release" not in result.stderr and "Forbidden" not in result.stderr, result.stderr
+    assert OWN_PROGRESS in result.stdout and deletes == []
+
+
+def test_the_replicaset_gap_is_said_once_and_a_pod_of_another_controller_stays_unjudged(runtime):
+    """Said once for the whole wait, not on every poll, while the release's own
+    Pod shows its progress and its log on each; a Pod whose own controller is
+    no ReplicaSet is still not the release's, and its verdict is named, never
+    judged."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_foreign_pod(), "deadline-exceeded"),
+                                                 _application_pod("running")],
+                                        replicaset="forbidden")
+    assert result.returncode == 97, result.stderr                     # every poll ran: the wait went on
+    assert result.stderr.count(RS_GAP) == 1, result.stderr
+    polls = result.stdout.count(OWN_PROGRESS)
+    assert polls == 4 and result.stderr.count(FOREIGN_NOT_OWNED) == polls, (polls, result.stderr)
+    logs = (work / "kubectl-logs").read_text().splitlines()
+    assert len(logs) == polls and all("synthetic-release-web-7c9d8-abcde" in line for line in logs), logs
+    assert "stopped terminally" not in result.stderr and deletes == []
