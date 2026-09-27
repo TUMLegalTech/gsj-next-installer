@@ -198,7 +198,9 @@ startup_source_select() {
    cp "$saved/site.json" "$directory/site.json"; cp "$saved/values.json" "$directory/values.json"
  else
    jq -s '.[0]*.[1]' "$PREDECESSOR_PAYLOAD/defaults.json" "$STATE_DIR/site.pending.json" | jq --slurpfile schema "$PREDECESSOR_PAYLOAD/site.schema.json" -f "$PREDECESSOR_PAYLOAD/validate.jq" > "$directory/site.json"
-   jq --slurpfile release "$PREDECESSOR_PAYLOAD/release.json" -f "$PREDECESSOR_PAYLOAD/compile.jq" "$directory/site.json" > "$directory/values.json"
+   # the outbound list the operation recorded rides along (a policy names
+   # addresses; they were resolved when the operation started, never here)
+   GSJ_PAYLOAD=$PREDECESSOR_PAYLOAD compile_values_recorded "$directory/site.json" "$STATE_DIR/values.pending.json" > "$directory/values.json"
    jq -e --slurpfile saved "$STATE_DIR/values.pending.json" '.==$saved[0]' "$directory/values.json" >/dev/null || fail 'saved first-startup configuration does not compile to its signed predecessor values'
  fi
  storage_identity > "$GSJ_WORK/storage.json"
@@ -627,7 +629,10 @@ startup_helm_stage() {
  jq --arg web "$RELEASE-web" '.[]|select(.kind=="Deployment" and .metadata.name==$web)' "$GSJ_WORK/startup-next-resources.json" > "$GSJ_WORK/startup-next-web.json"
  # First init must be the exact script/marker barrier for the new, not-yet
  # provisioned Helm revision. No corpus or application process may precede it.
- jq -e --arg generation "$RELEASE_ID:$revision" --arg marker "$RELEASE-provisioned" '.spec.replicas==1 and .spec.template.spec.initContainers[0].name=="wait-deps" and .spec.template.spec.initContainers[0].command==["python","/scripts/wait-deps.py"] and any(.spec.template.spec.initContainers[0].env[];.name=="GSJ_DEPLOYMENT_GENERATION" and .value==$generation) and any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER" and .value==$marker)' "$GSJ_WORK/startup-next-web.json" >/dev/null || fail 'successor application lacks its exact first-init provisioning barrier'
+ # The barrier reads the marker from a mounted ConfigMap volume (the pod
+ # holds no API token): the volume names the marker, optional, mounted into
+ # wait-deps at the directory its env names.
+ jq -e --arg generation "$RELEASE_ID:$revision" --arg marker "$RELEASE-provisioned" '.spec.replicas==1 and .spec.template.spec.initContainers[0].name=="wait-deps" and .spec.template.spec.initContainers[0].command==["python","/scripts/wait-deps.py"] and any(.spec.template.spec.initContainers[0].env[];.name=="GSJ_DEPLOYMENT_GENERATION" and .value==$generation) and any(.spec.template.spec.initContainers[0].env[];.name=="WAIT_MARKER_DIR" and .value=="/marker") and any(.spec.template.spec.initContainers[0].volumeMounts[];.name=="marker" and .mountPath=="/marker") and any(.spec.template.spec.volumes[];.name=="marker" and .configMap.name==$marker and .configMap.optional==true)' "$GSJ_WORK/startup-next-web.json" >/dev/null || fail 'successor application lacks its exact first-init provisioning barrier'
  marker=$(k get configmap "$RELEASE-provisioned" -o json)
  jq -e --arg generation "$RELEASE_ID:$revision" '.data.generation!=$generation' <<< "$marker" >/dev/null || fail 'successor provisioning already ran outside this continuation'
  current=$(jq --arg web "$RELEASE-web" '.[]|select(.kind=="Deployment" and .metadata.name==$web)' "$GSJ_WORK/startup-continuation/live.json"); uid=$(jq -r .metadata.uid <<< "$current")
@@ -745,7 +750,7 @@ startup_helm_continue() {
  jq --slurpfile schema "$payload/site.schema.json" -f "$payload/validate.jq" "$SITE" > "$working/site.json"
  cmp -s "$working/site.json" "$SITE" || jq -e --slurpfile site "$SITE" '.==$site[0]' "$working/site.json" >/dev/null || fail 'current configuration does not satisfy the signed target schema'
  cmp -s "$SITE" "$STATE_DIR/site.pending.json" || fail 'continuation requires the exact saved target configuration'
- jq --slurpfile release "$payload/release.json" -f "$payload/compile.jq" "$SITE" > "$GSJ_WORK/values.pending.json"
+ compile_values_recorded "$SITE" "$STATE_DIR/values.pending.json" > "$GSJ_WORK/values.pending.json"
  if [[ -f $directory/intent.json && ! -L $directory/intent.json ]]; then
    jq -e --arg program "$program" --argjson replacement "$STARTUP_PROGRAM_REPLACE" --arg target "$target" --arg operation "$OPERATION" --arg script "$(sha_file "$CONTINUE_HELM_INSTALLER")" --arg site "$(sha_file "$SITE")" '.format=="gsj.startup-helm-continuation/1" and (.program==$program or $replacement) and .target==$target and .operation==$operation and .installer_sha256==$script and .site_sha256==$site' "$directory/intent.json" >/dev/null || fail 'saved continuation program, installer or configuration differs'
    local evidence

@@ -35,9 +35,11 @@ def partial(shell):
             pod['spec']['initContainers'] = [
                 {'name': 'wait-deps', 'image': 'web@sha256:' + '1' * 64,
                  'command': ['python', '/scripts/wait-deps.py'],
-                 'env': [{'name': 'GSJ_DEPLOYMENT_GENERATION', 'value': 'source:1'}, {'name': 'WAIT_MARKER', 'value': 'gsj-provisioned'}]},
+                 'env': [{'name': 'GSJ_DEPLOYMENT_GENERATION', 'value': 'source:1'}, {'name': 'WAIT_MARKER_DIR', 'value': '/marker'}],
+                 'volumeMounts': [{'name': 'marker', 'mountPath': '/marker', 'readOnly': True}]},
                 {'name': 'corpus-initialize', 'image': 'web@sha256:' + '1' * 64, 'command': ['python', '-m', 'gsj_deploy.initialize']},
             ]
+            pod['spec']['volumes'] = [{'name': 'marker', 'configMap': {'name': 'gsj-provisioned', 'optional': True}}]
         source.append({'apiVersion': 'apps/v1', 'kind': 'Deployment', 'metadata': metadata('gsj-' + role),
                        'spec': {'replicas': 1, 'selector': {'matchLabels': {'role': role}}, 'template': pod}})
     source.append({'apiVersion': 'batch/v1', 'kind': 'Job', 'metadata': metadata('gsj-provision'),

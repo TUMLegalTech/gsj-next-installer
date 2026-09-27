@@ -55,7 +55,8 @@ exactly these values. Every leaf below is a value the chart declares in
 | `ingress.controller` | `traefik.io/ingress-controller` under the managed Traefik profile, else `k8s.io/ingress-nginx` (a `--arg ingress_controller` is accepted by the program but not passed by the runtime today) |
 | `ingress.tls` | `[{secretName: tls.secret, hosts: [<host>]}]` |
 | `networkPolicy.enabled`, `networkPolicy.ingressControllerNamespace` | `true`, `ingress.namespace` |
-| `networkPolicy.egress.endpoints` | `[{cidr, port}]`: one entry per address of `llm.base_url`, `ocr.url`, each `llm.allowed_origins[]` and each proxy URL in `trust.proxy_file`, the URL's port (or the scheme's default) and its host resolved by the installer on the machine it runs on at every compile (`getent ahosts`; an IP literal is itself; a host that does not resolve is refused by name); `[]` for a site that names none. The chart renders them as `ipBlock` rules of the gsj pod's outbound policy — a policy cannot name a hostname |
+| `networkPolicy.egress.endpoints` | `[{cidr, port}]`, sorted and unique: one entry per address of `llm.base_url`, `ocr.url`, each `llm.allowed_origins[]`, each proxy URL in `trust.proxy_file` (`HTTP_PROXY`, `HTTPS_PROXY`), `public_url` and, when set, `verification.connect_host` with `connect_port`; the URL's port (or the scheme's default: 443 https, 1080 socks, else 80), the host as itself when it is an IP literal (IPv4 `/32`, IPv6 `/128`) and otherwise resolved with `getent ahosts` on the machine the installer runs on. Resolution happens when an operation STARTS (`install`, `upgrade`, `restore`): a host of the LLM, the OCR, an origin or a proxy that does not resolve there is refused by its site key and origin (a proxy URL is never repeated; a port outside 1–65535 is refused too; an unreadable proxy file is refused); the public URL's and the verification route's host get an entry when they resolve and a log line when they do not. Every later run of that operation (`resume`, `repair`, the restore program, the startup continuation) and every verb that applies nothing (`backup`, `sweep`, `abandon`, the named repairs) reuse the list recorded in the operation's values, so the compiled configuration stays byte-identical across an operation and never depends on the resolver again; with nothing recorded they resolve what they can and refuse nothing. `compile.jq` emits the key only when the runtime passes the list (`--argjson egress_endpoints`); a compile without it yields the values of the release before the list existed. The chart renders the entries as `ipBlock` rules of the gsj pod's outbound policy, beside every endpoint the values name by an IPv4 literal (`llm.model`, `ocr.url`, `llm.keyedOrigins`), which the chart admits on its own — a policy cannot name a hostname, and a hostname among those with an empty list refuses the render |
+| `networkPolicy.ingressControllerPodSelector` | `{"app.kubernetes.io/name": "traefik"}` under the managed Traefik profile, else `{}` (emitted with the list above): the controller's own pods within `ingress.namespace`; empty admits every pod of that namespace on every port, which a reused controller that shares its namespace with other workloads inherits |
 | `operator.login`, `operator.existingSecret` | `operator.login`, `operator.secret` (the installer creates that Secret before Helm) |
 | `operator.password`, `operator.autogenPassword` | `""`, `false` |
 | `agent.turnTimeout` | `limits.turn_seconds` |
@@ -84,7 +85,7 @@ Rendered by the chart:
 
 | kind | name | notes |
 |---|---|---|
-| Deployment | `R-web` | containers `gsj-web`, `gsj-mcp`, `agent-runner`; init containers `wait-deps`, then `corpus-copy` + `corpus-initialize` when `corpus.enabled` (else `migrate`); `enableServiceLinks: false`; `spec.progressDeadlineSeconds` = `startup.progressDeadlineSeconds` |
+| Deployment | `R-web` | containers `gsj-web`, `gsj-mcp`, `agent-runner`; init containers `wait-deps`, then `corpus-copy` + `corpus-initialize` when `corpus.enabled` (else `migrate`); `enableServiceLinks: false`; `serviceAccountName: default`, `automountServiceAccountToken: false`, no projected token; `spec.progressDeadlineSeconds` = `startup.progressDeadlineSeconds`. `wait-deps` reads the ready marker from the `marker` ConfigMap volume (`configMap.name: R-provisioned`, `optional: true`, mounted read-only at `/marker`, env `WAIT_MARKER_DIR=/marker`) — the startup continuation asserts exactly this barrier; `gsj-web`, `gsj-mcp`, `corpus-initialize` and `import-decisions` carry `ORT_DISABLE_TELEMETRY=1`; `agent-runner` carries `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1` |
 | Deployment | `R-forgejo`, `R-chroma` | stock images |
 | Service | `R-web` (8780), `R-forgejo` (3000), `R-chroma` (8000) | in-cluster addresses the installer and the verifier use (`http://R-forgejo:3000`) |
 | Job | `R-provision` | hooks `post-install,post-upgrade,post-rollback`, `hook-delete-policy: before-hook-creation`; containers `plan`, `forge-bootstrap`, `provision`; carries `GSJ_DEPLOYMENT_GENERATION` and `GSJ_RELEASE_IDENTITY` |
@@ -118,7 +119,20 @@ operation-scoped `R-capacity-*`, `R-storage-*`, `R-restore-*`, `R-backup-*`,
 Health: every probe of every container hits the process-local `/livez`; the
 installer's NetworkPolicy check hits `R-web:8780/readyz` from a Pod in the
 Forgejo namespace. `/readyz` reports `degraded` with per-check truth and never
-removes the door from the Service.
+removes the door from the Service. The same check runs a probe program in the
+`gsj-web` container (`python -c <program> egress-probe`, the targets on
+stdin: httpx GETs that must answer — Forgejo, Chroma, the LLM's `/v1/models`
+and the OCR route when `endpoint-preflight.json` found them working — and
+socket connects that must fail within 10 s), a bash `/dev/tcp` probe in the
+Chroma container (a positive control against the cluster DNS the policy
+admits, then Forgejo, the door, a public address and `github.com`, which must
+be blocked, and a `getent` lookup that must answer), and reads the door's
+isolation panel through the public route as the operator (`POST /api/login`,
+`POST /api/admin/isolation`, `POST /api/logout`; every verdict of both
+vantages must be `blockiert`). Its record (`network-check.json`, the summary's
+`networkpolicy`) keeps the three pairs and an `egress` object: the pod's
+probe, `asserted` (which site endpoints were held to an answer), Chroma's
+report and the panel's verdicts.
 
 ## 5. Helm
 
