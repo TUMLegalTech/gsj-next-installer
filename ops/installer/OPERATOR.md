@@ -2850,7 +2850,7 @@ that can open nothing never passes); the three pairs of the earlier check
 still hold (Forgejo reaches the door on 8780, Forgejo does not reach Chroma,
 the door reaches Chroma); and the application's own isolation panel, read
 through the public route as the operator, calls every canary "blockiert" from
-both its vantages — on a site that names a proxy the panel's verdicts are
+both its vantages — on a site whose proxy file names an https proxy the panel's verdicts are
 recorded, not held, because its probes go through the proxy. A check that
 finds a connection where none may exist stops
 the install at `verifying`, as the earlier deny check did; what every probe

@@ -189,7 +189,7 @@ elif a[:2] == ["get", "lease"]:
 elif a[:2] == ["get", "networkpolicy"]:
     # the outbound policy the cluster holds: absent (nothing printed, --ignore-not-found) or unreadable when a test says so
     if s.get("fail_networkpolicy_get"): code = 1
-    elif s.get("no_egress_policy"): code = 0 if "--ignore-not-found" in a else 1
+    elif s.get("no_egress_policy") or (s.get("no_chroma_policy") and a[2].endswith("-chroma-egress")): code = 0 if "--ignore-not-found" in a else 1
     else: print("networkpolicy.networking.k8s.io/" + a[2])
 elif a[:2] == ["get", "pods"]:
     # a label selector narrows the list, as it does on a cluster; without one every Pod is listed
@@ -285,7 +285,7 @@ url = next((v for i, v in enumerate(a) if (v.startswith("https://") or v.startsw
 if url and "/api/" not in url and "-w" in a and ("/models" in url or "/chat/completions" in url or "/v1" in url):
     # the network check's host-side endpoint probe: the state's "silent" list names endpoints that answer nothing
     p = pathlib.Path(os.environ["TEST_KUBECTL_STATE"]); s = json.loads(p.read_text())
-    s.setdefault("host_probes", []).append(a); p.write_text(json.dumps(s))
+    s.setdefault("host_probes", []).append(a); s.setdefault("host_probe_ca_env", []).append(os.environ.get("CURL_CA_BUNDLE", "unset")); p.write_text(json.dumps(s))
     if any(part in url for part in s.get("silent_endpoints", [])): sys.exit(7)
     if any(part in url for part in s.get("tls_endpoints", [])): sys.exit(60)
     if any(part in url for part in s.get("proxy_status_endpoints", [])): sys.stdout.write("502"); sys.exit(0)
@@ -1750,11 +1750,12 @@ def _network_cluster(state, *, deny_code, deny_delay=0.0, egress_rules=None):
     work = state.parent / "work"
     (work / "op.pass").write_text("synthetic-operator-password\n"); (work / "op.pass").chmod(0o600)
     (work / "manifest.yaml").write_text("---\n# Source: gsj/templates/networkpolicy.yaml\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
-                                        "metadata:\n  name: synthetic-release-gsj-egress\nspec:\n  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: gsj\n")
+                                        "metadata:\n  name: synthetic-release-gsj-egress\nspec:\n  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: gsj\n"
+                                        "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: synthetic-release-chroma-egress\n")
     (work / "endpoint-preflight.json").write_text(json.dumps({"format": "gsj.endpoint-preflight/1", "probed_from": "synthetic", "llm": "working", "ocr": "working"}))
 
 
-CHROMA_CLOSED = "control=connected forgejo=blocked web=blocked public-address=blocked github.com=blocked dns=ok"
+CHROMA_CLOSED = "control=connected forgejo=blocked web=blocked public-address=blocked github.com=blocked api=blocked dns=ok"
 
 
 def _closed_egress_probe(**changes):
@@ -1812,7 +1813,7 @@ def test_networkpolicy_check_records_the_closed_outbound_list_from_inside_both_p
     assert result.returncode == 0, result.stderr
     record = json.loads((work / "network-check.json").read_text())
     assert record["status"] == "passed" and record["egress"]["gsj"]["refuse"]["pi.dev"]["connected"] is False
-    assert record["egress"]["chroma"] == {"control": "connected", "forgejo": "blocked", "web": "blocked", "public-address": "blocked", "github.com": "blocked", "dns": "ok"}
+    assert record["egress"]["chroma"] == {"control": "connected", "forgejo": "blocked", "web": "blocked", "public-address": "blocked", "github.com": "blocked", "api": "blocked", "dns": "ok"}
     assert record["egress"]["asserted"] == {"llm": True, "ocr": True, "isolation": True}
     assert record["egress"]["isolation"] == {"targets": ["https://huggingface.co", "https://pypi.org", "https://github.com"],
                                              "server": ["blockiert"] * 3, "runner": ["blockiert"] * 3}
@@ -3511,6 +3512,9 @@ def test_the_network_check_holds_the_three_pairs_alone_when_the_applied_chart_re
     result = run(NETWORK_VERIFY)
     assert result.returncode != 0 and "could not be read from the cluster" in result.stderr, result.stderr
     assert not (work / "egress-probe.json").exists()
+    s = json.loads(state.read_text()); s["fail_networkpolicy_get"] = False; s["no_chroma_policy"] = True; state.write_text(json.dumps(s))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode != 0 and "renders synthetic-release-chroma-egress but the cluster does not hold it" in result.stderr, result.stderr
 
 
 def test_the_host_side_endpoint_probe_dials_as_the_pod_dials_and_a_tls_failure_keeps_the_skip(runtime):
@@ -3551,7 +3555,7 @@ def test_the_host_side_endpoint_probe_dials_as_the_pod_dials_and_a_tls_failure_k
     ("http://llm.models.svc.cluster.local:8000/v1", None, "llm.base_url (http://llm.models.svc.cluster.local:8000) names an in-cluster Service"),
     ("https://xn--mnchen-3ya.example/v1", {"cidr": "203.0.113.%d/32" % (sum("xn--mnchen-3ya.example".encode()) % 200 + 10), "port": 443}, ""),
     ("https://münchen.example/v1", {"cidr": "203.0.113.%d/32" % (sum("münchen.example".encode()) % 200 + 10), "port": 443}, ""),
-    ("http://[64:ff9b::10.0.0.5]:8000/v1", {"cidr": "64:ff9b::10.0.0.5/128", "port": 8000}, ""),
+    ("http://[64:ff9b::10.0.0.5]:8000/v1", {"cidr": "64:ff9b::a00:5/128", "port": 8000}, ""),
 ])
 def test_a_name_is_resolved_before_it_is_called_in_cluster_and_any_host_byte_is_admitted(runtime, tmp_path, url, entry, words):
     """The resolver is asked first: a public name that carries a `svc` label
@@ -3579,3 +3583,35 @@ def test_the_startup_source_proof_pod_switches_onnx_telemetry_off():
     text = (INSTALLER / "startup-recovery.sh").read_text()
     line = next(l for l in text.splitlines() if "startup-data-pod.json" in l and 'name:"source-proof"' in l)
     assert 'env:[{name:"ORT_DISABLE_TELEMETRY",value:"1"}]' in line
+
+
+@pytest.mark.parametrize("url", ["http://bad host.example:8080/v1", "http://tab\there.example/v1", "http://[dead:beef]:8000/v1", "http://[abc]:8000/v1", "http://[zz::1]:8000/v1"])
+def test_a_host_no_host_can_be_and_a_bracketed_string_that_is_no_address_are_refused(runtime, tmp_path, url):
+    """A space or a control byte is nothing a host carries; a bracketed
+    string the resolver cannot parse is no address a policy can be written
+    for: each refuses by name instead of reaching the cluster as an invalid
+    rule."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    site = json.loads((work / "site.json").read_text()); site["ocr"]["url"] = url
+    (work / "site.json").write_text(json.dumps(site))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    assert result.returncode != 0, result.stderr
+    assert "ocr.url (" in result.stderr and "is not a host and a port (1-65535) a NetworkPolicy can be written for" in result.stderr, result.stderr
+
+
+def test_the_host_side_probe_trusts_the_system_bundle_and_the_sites_ca_never_the_delivery_ca(runtime):
+    """load_site exports the delivery CA for the downloads; the pod never
+    trusts it, so the probe passes its own bundle (the system's, plus
+    trust.ca_file when set) and runs without the export — with no
+    trust.ca_file the system bundle alone rides --cacert."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    result = run(NETWORK_VERIFY, CURL_CA_BUNDLE=str(work / "download-ca.pem"))
+    assert result.returncode == 0, result.stderr
+    s = json.loads(state.read_text())
+    for probe in s["host_probes"]:
+        assert probe[probe.index("--cacert") + 1].endswith("/answers-here-ca.pem"), probe
+    assert set(s["host_probe_ca_env"]) == {"unset"}, s["host_probe_ca_env"]
+    bundle = (work / "answers-here-ca.pem").read_bytes()
+    assert bundle and bundle == Path((work / "answers-here-ca.path").read_text().strip()).read_bytes(), "the system bundle alone, byte for byte"

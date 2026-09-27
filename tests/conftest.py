@@ -54,6 +54,8 @@ if state and os.path.exists(state):
 try:
     ip = ipaddress.ip_address(name); print(f"{ip} STREAM {name}"); sys.exit(0)
 except ValueError: pass
+# a colon is no part of a name: the resolver answers nothing for it (a bracketed string that is no address)
+if ":" in name: sys.exit(2)
 # a name the test's state lists as loopback answers as /etc/hosts would on a machine that maps it locally
 if name in s.get("loopback", []): print(f"127.0.0.1 STREAM {name}"); sys.exit(0)
 # an in-cluster Service name resolves nowhere outside its cluster

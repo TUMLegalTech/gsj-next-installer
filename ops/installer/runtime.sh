@@ -1244,7 +1244,7 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  # the character tests below read bytes, whatever the operator's locale: a
  # name is refused only for what no host can carry
  local LC_ALL=C
- local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:.]+$' local_answer='^(127\.|169\.254\.|::1$|[fF][eE]80:|0\.0\.0\.0$)'
+ local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:.]+$' local_answer='^(127\.|169\.254\.|::1$|::$|[fF][eE][89aAbB]|0\.0\.0\.0$)' forbidden='[][[:space:][:cntrl:]/@?#\\]'
  ipv4="^$octet\.$octet\.$octet\.$octet$"
  # what a refusal or a log line names: the site key and, for the LLM, the OCR
  # and an origin, the URL's origin; never a proxy URL (its file may carry what
@@ -1268,9 +1268,19 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  # hex, colons and dots (an embedded IPv4 as in 64:ff9b::10.0.0.5 included),
  # a zone-scoped literal (fe80::1%eth0) is no address a policy can name; a
  # name may carry any byte a host can, and the resolver says what it is
+ if (( literal )); then
+   [[ $host =~ $ipv4 || ( $host =~ $ipv6 && $host == *:* ) ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+   if [[ $host == *:* ]] && command -v getent >/dev/null 2>&1; then
+     # the resolver parses the literal into its canonical form; what it
+     # cannot parse is no address a policy can be written for
+     local parsed; parsed=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}')
+     [[ -n $parsed ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+     host=$parsed
+   fi
+ fi
  if [[ $host =~ ^::[fF]{4}:(.*)$ ]]; then local mapped=${BASH_REMATCH[1]}; [[ $mapped =~ $ipv4 ]] && host=$mapped; fi
- if (( literal )); then [[ $host =~ $ipv6 || $host =~ $ipv4 ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
- else [[ -n $host && ! $host =~ [[:space:][:cntrl:]/@?#\[\]] ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"; fi
+ if (( literal )); then :
+ else [[ -n $host && ! $host =~ $forbidden ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"; fi
  for p in $ports; do
    { [[ $p =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )); } || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
  done
@@ -4245,8 +4255,11 @@ network_verify() {
    jq -n --arg source "$forge" --argjson seconds "$elapsed" '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,egress:"not rendered by the applied chart"}' > "$STATE_DIR/network-check.json"
    return 0
  fi
- held=$(k get networkpolicy "$RELEASE-gsj-egress" --ignore-not-found -o name) || fail "the outbound policy $RELEASE-gsj-egress could not be read from the cluster"
- [[ -n $held ]] || fail "the applied chart renders $RELEASE-gsj-egress but the cluster does not hold it"
+ local policy
+ for policy in "$RELEASE-gsj-egress" "$RELEASE-chroma-egress"; do
+   held=$(k get networkpolicy "$policy" --ignore-not-found -o name) || fail "the outbound policy $policy could not be read from the cluster"
+   [[ -n $held ]] || fail "the applied chart renders $policy but the cluster does not hold it"
+ done
  local node llm ocr probe llm_state='' ocr_state='' unreached reached
  node=$(k get pod "$pod" -o json | jq -r '.status.hostIP // ""')
  [[ -n $node ]] || fail "the application pod $pod reports no host address; the outbound check cannot name the node"
@@ -4277,10 +4290,13 @@ network_verify() {
  # that opens a connection, so bash's own /dev/tcp is the probe — proven
  # able to connect first, against the cluster DNS the policy admits (the
  # resolver /etc/resolv.conf names), so a probe that cannot open anything
- # never passes as "everything blocked".
+ # never passes as "everything blocked". The Kubernetes API's ClusterIP is
+ # among the targets that must be blocked: any unpoliced pod reaches it, so
+ # a policy that is missing shows even on a cluster without internet, where
+ # the public canaries are refused anyway.
  chroma=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=chroma" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
  local chroma_report connected
- chroma_report=$(k exec "$chroma" -- bash -c ': chroma-egress; r=""; dns=$(awk "/^nameserver/{print \$2; exit}" /etc/resolv.conf); if [ -n "$dns" ] && timeout 10 bash -c "exec 3<>/dev/tcp/$dns/53" 2>/dev/null; then r="control=connected "; else r="control=blocked "; fi; for t in "forgejo '"$RELEASE"'-forgejo 3000" "web '"$RELEASE"'-web 8780" "public-address 1.1.1.1 443" "github.com github.com 443"; do set -- $t; if timeout 10 bash -c "exec 3<>/dev/tcp/$2/$3" 2>/dev/null; then r="$r$1=connected "; else r="$r$1=blocked "; fi; done; if getent hosts '"$RELEASE"'-forgejo >/dev/null 2>&1; then r="${r}dns=ok"; else r="${r}dns=failed"; fi; printf "%s" "$r"') || fail "the outbound probe did not run in the Chroma pod (exit $?)"
+ chroma_report=$(k exec "$chroma" -- bash -c ': chroma-egress; r=""; dns=$(awk "/^nameserver/{print \$2; exit}" /etc/resolv.conf); if [ -n "$dns" ] && timeout 10 bash -c "exec 3<>/dev/tcp/$dns/53" 2>/dev/null; then r="control=connected "; else r="control=blocked "; fi; for t in "forgejo '"$RELEASE"'-forgejo 3000" "web '"$RELEASE"'-web 8780" "public-address 1.1.1.1 443" "github.com github.com 443" "api ${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc} ${KUBERNETES_SERVICE_PORT:-443}"; do set -- $t; if timeout 10 bash -c "exec 3<>/dev/tcp/$2/$3" 2>/dev/null; then r="$r$1=connected "; else r="$r$1=blocked "; fi; done; if getent hosts '"$RELEASE"'-forgejo >/dev/null 2>&1; then r="${r}dns=ok"; else r="${r}dns=failed"; fi; printf "%s" "$r"') || fail "the outbound probe did not run in the Chroma pod (exit $?)"
  [[ $chroma_report == "control=connected "* ]] || fail "the Chroma pod's probe could not open a connection even to cluster DNS, which its outbound policy admits; the probe proves nothing (it reported: $chroma_report)"
  connected=$(tr ' ' '\n' <<< "$chroma_report" | awk -F= '$2=="connected" && $1!="control" {print $1}' | paste -sd ',' - | sed 's/,/, /g')
  [[ -z $connected ]] || fail "NetworkPolicy outbound deny was not enforced on Chroma: it connected to $connected, and Chroma may reach nothing but DNS"
@@ -4302,8 +4318,18 @@ endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s,
  # counts is an HTTP status from the endpoint — the pod's probe counts the
  # same thing — so a TLS failure keeps the endpoint's skip, and a status the
  # proxy itself answers with (407, 502, 503, 504) is not the endpoint's
+ # load_site exports CURL_CA_BUNDLE with the delivery CA for the downloads;
+ # the pod never trusts that CA, so this probe builds its own bundle from
+ # the system's and trust.ca_file and runs curl without the export
  local code rc=0 file proxy='' args=(--silent --show-error --max-time 10 -o /dev/null -w '%{http_code}')
- file=$(j '.trust.ca_file // ""'); [[ -z $file ]] || { file=$(resolve_file "$file"); [[ -r $file ]] && { cat "$(system_ca_bundle)" "$file" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null && args+=(--cacert "$GSJ_WORK/answers-here-ca.pem"); }; }
+ CURL_CA_BUNDLE='' system_ca_bundle > "$GSJ_WORK/answers-here-ca.path" 2>/dev/null || return 1
+ # written afresh each time: a copy of the system bundle would keep its
+ # read-only mode and refuse the next write
+ rm -f "$GSJ_WORK/answers-here-ca.pem"
+ cat "$(cat "$GSJ_WORK/answers-here-ca.path")" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null || return 1
+ chmod 600 "$GSJ_WORK/answers-here-ca.pem"
+ file=$(j '.trust.ca_file // ""'); [[ -z $file ]] || { file=$(resolve_file "$file"); [[ -r $file ]] && cat "$file" >> "$GSJ_WORK/answers-here-ca.pem"; }
+ args+=(--cacert "$GSJ_WORK/answers-here-ca.pem")
  file=$(j '.trust.proxy_file // ""')
  if [[ -n $file ]]; then
    file=$(resolve_file "$file")
@@ -4314,7 +4340,7 @@ endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s,
      [[ -z $bypass ]] || args+=(--noproxy "$bypass")
    fi
  fi
- code=$(curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
+ code=$(env -u CURL_CA_BUNDLE curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
  (( rc == 0 )) || return 1
  [[ $code =~ ^[1-5][0-9][0-9]$ ]] || return 1
  case $code in 407|502|503|504) [[ -z $proxy ]];; *) return 0;; esac
@@ -5553,7 +5579,10 @@ restore_archive() {
    def acme: {tls:(.tls|{issuer,email,acme_server,secret}),ingress_class:.ingress.class};
    .tls.profile!="managed-acme" or (acme==($target[0]|acme))
  ' "$GSJ_WORK/restore-source-site.json" >/dev/null || fail 'restore cannot change the ACME account, issuer or solver identity'
- compile_values "$GSJ_WORK/restore-source-site.json" > "$GSJ_WORK/restore-source-values.json"
+ # the source values feed the identity comparison and the reference list,
+ # which never read the outbound list: compiled without it, so the source
+ # site's endpoints are not resolved and its proxy file is not looked for
+ compile_values_recorded "$GSJ_WORK/restore-source-site.json" /dev/null > "$GSJ_WORK/restore-source-values.json"
  # Context, node and StorageClass may relocate. Account, endpoint/model/auth,
  # trust, public host, and typed resource references must retain their identity.
  jq -e --slurpfile target "$GSJ_WORK/values.pending.json" '
