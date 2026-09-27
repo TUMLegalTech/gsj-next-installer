@@ -10,20 +10,23 @@ reads; the initializer receives exactly its settings keys; the verifier's
 checks, failure codes and exit codes are what the runtime and the operator
 guide expect; and the deadline, controller and released-vectors mappings hold.
 
-Skip-guarded on the pinned Git objects (a public runner has no product) and
-on helm and jq, like the product's own chart tests. One contract needs no
-product: a site file written for the previous release keeps its meaning under
-this one. It reads that release's installer files from this repository's own
-Git tags, so it runs on the public runner too, and skips only where the tag
-is absent (a shallow clone).
+Skip-guarded on the pinned Git objects (a public runner has no product), on
+helm where a test renders the chart, and on jq, like the product's own chart
+tests. One contract needs neither the product nor helm: a site file written
+for the previous release keeps its meaning under this one. It reads that
+release's installer files from this repository's own Git tags, so it runs on
+the public runner too, and skips only where the tag is absent (a shallow
+clone).
 """
 import ast
+import inspect
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 import pytest
 import yaml
@@ -32,10 +35,11 @@ from tests import pinned_web
 from tests.pinned_web import needs_web
 from tests.test_installer import INSTALLER, ROOT, _release, _site
 
-# needs_web marks each test that reads the pinned product, not the module: the
-# continuity test at the end reads only this repository's Git.
-pytestmark = [pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed"),
-              pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")]
+# needs_web marks each test that reads the pinned product and needs_helm each
+# test that renders it, not the module: the continuity test at the end reads
+# only this repository's Git and runs jq.
+needs_helm = pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+pytestmark = [pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")]
 
 EXAMPLES = sorted((INSTALLER / "examples").glob("*.site.json"))
 CORPUS = ["--set", "corpus.enabled=true", "--set", "corpus.manifestSha256=" + "a" * 64,
@@ -103,6 +107,7 @@ def web_deployment(docs, release="gsj"):
 # ---- every example site: validate, compile, render ---------------------------
 
 @needs_web
+@needs_helm
 @pytest.mark.parametrize("example", EXAMPLES, ids=[p.name for p in EXAMPLES])
 def test_every_example_site_validates_compiles_and_renders_with_the_pinned_chart(tmp_path, example):
     site = validated(merged(example))
@@ -170,6 +175,7 @@ def test_the_synthetic_site_compiles_to_the_documented_keys(tmp_path):
 # ---- the objects and init containers the runtime addresses -------------------
 
 @needs_web
+@needs_helm
 def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
     docs = rendered(tmp_path, None, *CORPUS)
     names = {(d["kind"], d["metadata"]["name"]) for d in docs}
@@ -197,6 +203,7 @@ def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
 
 
 @needs_web
+@needs_helm
 def test_the_init_containers_run_the_documented_programs_with_the_termination_policy_the_runtime_reads(tmp_path):
     web = web_deployment(rendered(tmp_path, None, *CORPUS))
     inits = {c["name"]: c for c in web["spec"]["template"]["spec"]["initContainers"]}
@@ -217,6 +224,7 @@ def test_the_init_containers_run_the_documented_programs_with_the_termination_po
 
 
 @needs_web
+@needs_helm
 def test_the_initializer_receives_exactly_its_settings_keys(tmp_path):
     docs = rendered(tmp_path, None, *CORPUS, "--set", "corpus.releasedVectors=true")
     scripts = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "gsj-scripts")
@@ -270,6 +278,7 @@ def test_the_verifier_contract_is_what_the_runtime_and_the_guide_expect():
 # ---- the mappings the chart and the installer agree on (moved from the product's chart tests) ----
 
 @needs_web
+@needs_helm
 def test_progress_deadline_outlasts_the_dependency_wait_and_the_import(tmp_path):
     """The first rollout holds the dependency wait AND the corpus import. The
     chart's defaults ARE the installer's mapping of the same site deadlines
@@ -298,6 +307,7 @@ def test_progress_deadline_outlasts_the_dependency_wait_and_the_import(tmp_path)
 
 
 @needs_web
+@needs_helm
 def test_compiled_values_name_the_controller_and_carry_no_inert_key(tmp_path):
     """compile.jq names the controller — its managed Traefik by profile, a
     reused class by the spec.controller the installer passes, else
@@ -326,6 +336,7 @@ def test_compiled_values_name_the_controller_and_carry_no_inert_key(tmp_path):
 
 
 @needs_web
+@needs_helm
 def test_the_site_declares_released_vectors_to_the_initializer(tmp_path):
     """compile.jq turns a configured corpus.vectors_url OR vectors_path into
     corpus.releasedVectors=true — the declaration the initializer waits on
@@ -343,6 +354,23 @@ def test_the_site_declares_released_vectors_to_the_initializer(tmp_path):
         docs = rendered(tmp_path, None, *CORPUS, "--set", f"corpus.releasedVectors={flag}")
         scripts = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "gsj-scripts")
         assert json.loads(scripts["data"]["initializer.json"])["released_vectors"] is (flag == "true")
+
+
+def _helm_skips(item):
+    marks = getattr(item, "pytestmark", [])
+    return [m for m in (marks if isinstance(marks, list) else [marks])
+            if m.name == "skipif" and "helm" in m.kwargs.get("reason", "")]
+
+
+def test_only_the_tests_that_render_the_pinned_chart_skip_without_helm():
+    """A runner without helm still holds every contract no render needs, the
+    previous release's site continuity above all: it reads Git and runs jq.
+    The helm skip sits on each test that renders, never on the module."""
+    assert _helm_skips(sys.modules[__name__]) == [], "the module skips every test on a runner without helm"
+    for name, test in sorted(globals().items()):
+        if name.startswith("test_"):
+            renders = re.search(r"\brendered\(|\bhelm\b.*\btemplate\b", inspect.getsource(test)) is not None
+            assert bool(_helm_skips(test)) == renders, name
 
 
 @needs_web
