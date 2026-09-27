@@ -2501,7 +2501,12 @@ URL_SINKS = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still
                        r"|\b(RECOVERY_HINT|note|hint|found|next|fresh|resume|message|line)=)")
 # a filter that DERIVES from its input -- a digest, a field, a count, a file written
 # by the installer's own writers -- so what comes out is not the URL
-URL_DERIVES = re.compile(r"\|\s*(cut|tr|sed|awk|grep|head|tail|sha256sum|shasum|md5sum|openssl|base64|jq|wc|sort|uniq|od|xxd|fold|rev|atomic|immutable_file)\b")
+URL_DERIVES = re.compile(r"\|\s*(cut|tr|sha256sum|shasum|md5sum|openssl|base64|wc|sort|uniq|od|xxd|fold|rev|atomic|immutable_file)\b")
+# head, tail, sed, awk, grep and jq hand their input on (`| head -n 1`, `| sed -n p`,
+# `| jq -R .` print the URL itself); only these forms of them extract: a sed
+# substitution whose replacement is one captured group, a grep that counts or
+# only tests. Matched on the raw text, where the quoted sed program still is.
+URL_EXTRACTS = re.compile(r"\|\s*(sed\s+(-[nE]+\s+)*'s([#/|,])[^']*?\3\\[1-9]\3p?'|grep\s+-[A-Za-z]*[cq])")
 URL_ASSIGN = re.compile(r"(?:^|[;&|({]\s*|\bthen\s+|\belse\s+|\bdo\s+|\blocal\s+(?:-[A-Za-z]+\s+)*|\bexport\s+|\bdeclare\s+(?:-[A-Za-z]+\s+)*|\s)([A-Za-z_][A-Za-z0-9_]*)=")
 URL_FUNCTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{")
 URL_LOCAL = re.compile(r"\blocal\s+((?:-[A-Za-z]+\s+)*)([^;|&]*)")
@@ -2539,20 +2544,22 @@ def _logical_lines(text):
     return out
 
 
-def _expandable(line):
-    """the line with its single-quoted segments blanked: nothing expands there"""
+def _expandable(line, at=None):
+    """the line with its single-quoted segments blanked: nothing expands there
+    (`at`, a list, receives the index in `line` of every character returned)"""
     out, i, double = [], 0, False
+    at = [] if at is None else at
     while i < len(line):
         c = line[i]
         if c == "\\" and double:
-            out.append(line[i:i + 2]); i += 2; continue
+            out.append(line[i:i + 2]); at.extend(range(i, min(i + 2, len(line)))); i += 2; continue
         if c == '"':
             double = not double
         elif c == "'" and not double:
             end = line.find("'", i + 1)
             end = len(line) - 1 if end < 0 else end
-            out.append("''"); i = end + 1; continue
-        out.append(c); i += 1
+            out.append("''"); at.extend((i, end)); i = end + 1; continue
+        out.append(c); at.append(i); i += 1
     return "".join(out)
 
 
@@ -2581,9 +2588,10 @@ def _value_word(line, start):
                         break
                 j += 1
             inner = line[i + 2:j].strip()
-            if inner.split(" ", 1)[0] in ("j", "jq") and not URL_DERIVES.search(inner):
+            derives = URL_DERIVES.search(inner) or URL_EXTRACTS.search(inner)
+            if inner.split(" ", 1)[0] in ("j", "jq") and not derives:
                 parts.append(line[i:j + 1])             # a site field read: the URL itself
-            elif inner.split(" ", 1)[0] in ("printf", "echo", "cat") and not URL_DERIVES.search(inner):
+            elif inner.split(" ", 1)[0] in ("printf", "echo", "cat") and not derives:
                 parts.append(inner)
             i = j + 1; continue
         if not double and c in " \t;&|":
@@ -2611,9 +2619,11 @@ def _printed_urls(directory):
     `fail "...$where"`), within its function when it is `local` there and
     everywhere in the file otherwise. A backslash-continued line and a quoted
     string that spans lines are scanned whole. A printf piped into a filter
-    that derives (cut, tr, sed, a digest...) does not print; one piped into
-    anything else (cat, tee, less, a function) does. Nothing expands inside
-    single quotes, so text there is not a URL."""
+    that derives (cut, tr, a digest...) does not print, nor one piped into a
+    sed that keeps one captured group or a grep that counts or tests; one
+    piped into anything else (cat, tee, less, a function, head, tail, awk,
+    grep or jq, and sed in any other form) does. Nothing expands inside single
+    quotes, so text there is not a URL."""
     hits = []
     for path in sorted(Path(directory).glob("*.sh")):
         lines, current = [], None
@@ -2646,12 +2656,14 @@ def _printed_urls(directory):
                     scope = fn if name in locals_of.get(fn, ()) else None
                     if (scope, name) not in aliases and any(True for _ in _unwrapped(urlish, _value_word(line, m.end()))):
                         aliases.add((scope, name)); changed = True
-        for fn, n, line in lines:
+        for fn, n, raw in lines:
             urlish = urlish_in(fn)
-            line = _expandable(line)
+            at = []
+            line = _expandable(raw, at)
             for sink in URL_SINKS.finditer(line):
                 printed = line[sink.start():]
-                if printed.startswith("printf") and "|" in printed and URL_DERIVES.search(printed) and "| tee" not in printed:
+                derives = URL_DERIVES.search(printed) or URL_EXTRACTS.search(raw[at[sink.start()]:])
+                if printed.startswith("printf") and "|" in printed and derives and "| tee" not in printed:
                     continue                            # a printf piped into a filter derives, it does not print
                 for found in _unwrapped(urlish, printed):
                     hits.append(f"{path.name}:{n}: {found}")
@@ -2680,6 +2692,16 @@ URL_SCAN_MUTANTS = {
     "a printf piped into tee": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | tee "$GSJ_WORK/x"\n}\n',
     "a printf piped into a pager": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | less\n}\n',
     "an echo of the site field": 'mutant() {\n echo "at $(j .llm.base_url)"\n}\n',
+    # head, tail, sed, awk, grep and jq hand their input on unchanged in these
+    # forms: the URL itself is printed, or aliased and printed later
+    "a printf piped into head": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | head -n 1\n}\n',
+    "a printf piped into tail": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | tail -n 1\n}\n',
+    "a printf piped into sed -n p": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -n p\n}\n',
+    "a printf piped into awk": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | awk \'{print}\'\n}\n',
+    "a printf piped into grep": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | grep https\n}\n',
+    "a printf piped into jq -R": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | jq -R .\n}\n',
+    "an alias through head": 'mutant() {\n local url=$1 first\n first=$(printf \'%s\' "$url" | head -n 1)\n fail "cannot reach $first"\n}\n',
+    "a site field through sed -n p": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -n p)\n log "at $where"\n}\n',
 }
 URL_SCAN_CLEAN = {
     "the origin": 'clean() {\n local url=$1\n log "could not be acquired from $(url_origin_only "$url")"\n}\n',
@@ -2689,6 +2711,9 @@ URL_SCAN_CLEAN = {
     "a single-quoted literal": "clean() {\n log 'set corpus.vectors_url in the site file'\n}\n",
     "a URL passed to a command": 'clean() {\n local url=$1 code\n code=$(curl --silent --output /dev/null --write-out \'%{http_code}\' "$url" || true)\n log "answered HTTP $code"\n}\n',
     "a local of the same name in another function": 'other() {\n local where=$1\n where="registry.base ($(url_origin_only "$where"))"\n}\nclean() {\n local where=$1\n log "$where is not a plain file"\n}\n',
+    "a printf piped into a sed capture": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sed -E \'s#https://([^/:]+).*#\\1#\'\n}\n',
+    "a port through sed -n and a capture": 'clean() {\n local url=$1 port\n port=$(printf \'%s\' "$url" | sed -nE \'s#https://[^/:]+:([0-9]+).*#\\1#p\')\n log "port $port"\n}\n',
+    "a count through grep": 'clean() {\n local url=$1 slashes\n slashes=$(printf \'%s\' "$url" | grep -c /)\n log "$slashes slashes"\n}\n',
 }
 
 
