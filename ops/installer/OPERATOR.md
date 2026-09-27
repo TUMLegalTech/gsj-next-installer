@@ -170,11 +170,14 @@ balancer's traffic to it, and `reuse` it — `ingress.class` its IngressClass,
 `ingress.namespace` the namespace its Pods run in. What the installer checks
 of a reused class is that an IngressClass of that name exists and, before the
 Lease of an `install` or `upgrade`, that `ingress.namespace` exists and holds a
-Running Pod. It recognizes a controller among those Pods by its name or its
-image (ingress-nginx, Traefik, HAProxy, Contour, Istio) or by the controller
-your IngressClass names (OpenShift's router, Kong); Running Pods none of which
-it recognizes are said in a log line, and the run goes on. It does not check
-that a controller there is the one behind the class.
+Running Pod. It recognizes a controller among those Pods by its name, when
+that contains ingress, traefik, nginx, haproxy, contour or istio; by an image
+that contains ingress-nginx, traefik, haproxy or contour; or by the controller
+your IngressClass names — `openshift.io/ingress-to-route`, whose Pods are named
+`router-*`, and `konghq.com/ingress-controller`, whose images are Kong's.
+Running Pods none of which it recognizes are said in a log line, and the run
+goes on. It does not check that a controller there is the one behind the
+class.
 
 **A stock k3s box is the common case of this**, because k3s ships Traefik.
 `managed-traefik` is *not* your way out: it installs a second Traefik from a
@@ -264,13 +267,14 @@ what we measured:
   not exist (*"ingress.namespace … does not exist"*) and one that holds no
   Running Pod (*"ingress.namespace … runs no ingress controller: it holds no
   Running Pod (… Pod(s) in all)"*). A Running Pod is enough to pass. When none
-  of them is a controller the check recognizes — by its name or its image
-  (ingress, traefik, nginx, haproxy, contour, istio), or by the controller the
-  IngressClass `ingress.class` names (OpenShift's `router-*` Pods, Kong's
-  images) — it is said, and the run goes on: *"ingress.namespace … holds …
-  Running Pod(s), and none of them is an ingress controller this check
-  recognizes by its name, its image or the controller IngressClass … names. …
-  The run goes on"*. So a namespace that runs other workloads and no
+  of them is a controller the check recognizes — by its name (one containing
+  ingress, traefik, nginx, haproxy, contour or istio), by its image (one
+  containing ingress-nginx, traefik, haproxy or contour), or by the controller
+  the IngressClass `ingress.class` names (`openshift.io/ingress-to-route`: its
+  `router-*` Pods; `konghq.com/ingress-controller`: Kong's images) — it is
+  said, and the run goes on: *"ingress.namespace … holds … Running Pod(s), and
+  none of them is an ingress controller this check recognizes by its name, its
+  image or the controller IngressClass … names. … The run goes on"*. So a namespace that runs other workloads and no
   controller passes this check with only that line to show for it. (Read from
   the chart and the installer, not measured: get it wrong that way on a CNI
   that enforces policy and the install stops at its own public-route probe,
@@ -596,12 +600,30 @@ working directory, which it makes with `mktemp` under `TMPDIR` (else `/tmp`).
 With a small root disk, move them instead of freeing space you do not have:
 export both, as absolute paths to directories that exist, in the shell you
 will install from — `export XDG_CACHE_HOME=/data/gsj-cache TMPDIR=/data/gsj-tmp`.
-Neither variable makes its directory, so make them first, on the data disk
-(`mkdir -p -m 700 /data/gsj-cache /data/gsj-tmp`), and export them before
-`init` — its `disk` row measures them — and before every verb after it: the
-installer's working directory, and the corpus envelope inside it, follow
-`TMPDIR` on every run. Step 8's free-space check measures whichever filesystems
-those name. (Read from the installer; our own runs left both where they were.)
+Neither variable makes its directory, so make them first, on the data disk,
+and export them before `init` — its `disk` row measures them — and before
+every verb after it: the installer's working directory, and the corpus
+envelope inside it, follow `TMPDIR` on every run. Step 8's free-space check
+measures whichever filesystems those name. (Read from the installer; our own
+runs left both where they were.) Make them private to you, as the block below
+does: `mkdir -p -m 700` sets the mode only of a directory it creates, so the
+`chmod 700` after it is what makes one that already existed private, and on a
+data disk whose directories pass a setgid bit or a default ACL down to new
+directories, strip both, or the private directories the installer makes there
+inherit a group or an access entry they were meant to exclude:
+
+```sh
+if [ -z "${CACHE_DIR:-}" ] || [ -z "${TMP_DIR:-}" ]; then
+  echo 'set first, then paste this block again -- CACHE_DIR=<an absolute path on the data disk for the cache, for example /data/gsj-cache>; TMP_DIR=<one for TMPDIR, for example /data/gsj-tmp>' >&2
+else
+  mkdir -p -m 700 "$CACHE_DIR" "$TMP_DIR"
+  chmod 700 "$CACHE_DIR" "$TMP_DIR"                                  # mkdir -p leaves an existing directory's mode alone
+  chmod g-s "$CACHE_DIR" "$TMP_DIR"                                  # a setgid bit inherited from the disk's directory
+  if command -v setfacl >/dev/null; then setfacl -b -k "$CACHE_DIR" "$TMP_DIR"; fi   # every ACL entry, the default ACL included
+  ls -ld "$CACHE_DIR" "$TMP_DIR"                                     # drwx------, your user, no + after the mode
+  export XDG_CACHE_HOME="$CACHE_DIR" TMPDIR="$TMP_DIR"
+fi
+```
 
 ```sh
 helm version --short
@@ -873,11 +895,11 @@ into a registry your nodes already reach and set `registry.base` (next).
 
 `Pending` is not a pull failure: an unsatisfiable `nodeSelector` also parks a
 Pod in `Pending` forever. `kubectl -n default describe pod pull-probe` says
-which one you have. The installer's own probe asks for 300m CPU and 384Mi in
-all, which this one does not, so a node this block passes on can still be too
-full for it: a probe Pod the scheduler has not placed after 300 s is refused as
-*"the image pull probe's Pod was not scheduled"*, never as a pull
-([what it asks for](#make-your-nodes-able-to-pull-the-images)).
+which one you have. The installer's own probe Pods ask for 100m CPU and 128Mi
+each, one Pod at a time, which this one does not, so a node this block passes
+on can still be too full for them: a probe Pod the scheduler has not placed
+after 300 s is refused as *"the image pull probe's Pod was not scheduled"*,
+never as a pull ([what it asks for](#make-your-nodes-able-to-pull-the-images)).
 
 **[if]** your registry needs credentials, the probe needs them too, in the
 same namespace. Set all three variables: `create secret` accepts empty strings
@@ -1696,13 +1718,13 @@ replaces them when it is larger. The three Pods are:
 Round up when you plan — 9 GiB and 3 CPUs leaves margin. 8.25Gi and 2.2 CPUs
 is what the **scheduler** demands; the preflight checks only the 8.25Gi, so a
 node short of CPU is not refused — its Pod simply stays Pending. An upgrade
-needs a little more while its pull proof runs: the probe Pod comes before the
-backup quiesces the running deployment, so the node must also hold **300m CPU
-and 384Mi** unreserved beside that deployment's 8.25Gi and 2.2 CPUs, or the
-upgrade stops, before anything is applied, with *"the image pull probe's Pod
-was not scheduled"* ([Make your nodes able to pull the
-images](#make-your-nodes-able-to-pull-the-images)). The preflight's memory
-check does not include it. A 9 GiB node carrying the deployment has 768Mi
+needs a little more while its pull proof runs: the probe Pods come before the
+backup quiesces the running deployment, one at a time, so the node must also
+hold **100m CPU and 128Mi** — one probe Pod's request — unreserved beside that
+deployment's 8.25Gi and 2.2 CPUs, or the upgrade stops, before anything is
+applied, with *"the image pull probe's Pod was not scheduled"* ([Make your
+nodes able to pull the images](#make-your-nodes-able-to-pull-the-images)). The
+preflight's memory check does not include it. A 9 GiB node carrying the deployment has 768Mi
 left before the kubelet's own reservation and the system Pods take theirs.
 `inspect`'s `compute.already_requested` reports what is already committed there and
 `storage.claim_backing` the claim filesystem's free bytes; §"What initialization
@@ -1792,13 +1814,19 @@ does, an `install` or `upgrade` refuses it before the Lease rather than run it
 ```
 GSJ: kubectl version skew: the kubectl --fetch-tools downloaded for this run is
 1.35.8 and the server is 1.31.5, more than one minor apart, and kubectl is
-supported within one minor of the server. Run without --fetch-tools to use this
-machine's kubectl, or with --fetch-tools=helm, which fetches only Helm and keeps
-this machine's kubectl
+supported within one minor of the server; it is this release's pinned kubectl,
+and any --fetch-tools that fetches kubectl downloads it again. Install a kubectl
+within one minor of 1.31.5 on this machine, then run without --fetch-tools, or
+with --fetch-tools=helm, which fetches only Helm and keeps this machine's
+kubectl
 ```
 
-Your own kubectl, skewed the same way, is only warned about, in the log line
-the kubectl row quotes. Upgrade your own kubectl rather than fetching that one.
+Install that kubectl first: both routes the refusal names run on this
+machine's own, and a machine with none, or one below the floor, is refused in
+its first seconds with a refusal that names `--fetch-tools=kubectl`, which
+brings the same pin back. Your own kubectl, skewed the same way, is only warned
+about, in the log line the kubectl row quotes. Upgrade your own kubectl rather
+than fetching that one.
 `upgrade --to` and `repair --to` hand the clients this run fetched on to the
 target release's installer they verify and run — the bare `--fetch-tools` when
 all three were fetched, `--fetch-tools=` with the set otherwise — so that
@@ -1992,10 +2020,13 @@ Pod specs now name — and `registry.pull_secret` the Secret name to create.
 
 **What the installer does, with it or without it.** Every image pull is proven
 before anything is applied, for every site: before Helm applies anything the
-installer starts one Pod on your storage node with one container per image, by
-digest — at the repositories the release names, or relocated under
-`registry.base` when you set it — using your pull Secret, and waits for the
-node's own container runtime to pull all six. The log names both ends:
+installer starts one Pod on your storage node for each image in turn, each a
+single container naming its image by digest — at the repositories the release
+names, or relocated under `registry.base` when you set it — using your pull
+Secret. It waits for the node's own container runtime to pull that image,
+deletes the Pod, waits until it is gone and starts the next, until all six are
+pulled; a node's kubelet pulls one image at a time anyway, so six Pods in turn
+take as long as one Pod of six would. The log names both ends:
 *"Proving node … can pull all 6 images from … before anything is applied"*,
 then *"All 6 images pulled from … by digest"*. A wrong prefix, a digest that
 was not copied and a credential that does not apply stop there once a pull has
@@ -2008,9 +2039,9 @@ large image on a slow link can time out once and pull on the next attempt. So
 after 90 s it is said once in the log and waited out for
 `deadlines.dependencies_seconds` from its first report, or to the end of the
 probe's wait (*How long it waits*, below) where that comes first: *"The node's
-pull of this release's images from … is failing and being retried, for … The
-container runtime reported, for one of them, …, which a retry can clear, so the
-wait goes on up to deadlines.dependencies_seconds (900 s) after it was first
+pull of this release's images from … is failing and being retried, for image …
+of 6, … The container runtime reported …, which a retry can clear, so the wait
+goes on up to deadlines.dependencies_seconds (900 s) after it was first
 reported while the kubelet retries, and a failure still reported then is
 refused"* (*"… up to deadlines.dependencies_seconds (900 s) while …"* on a site
 that sets or changes `registry.base`, whose whole wait is that deadline). One
@@ -2018,17 +2049,22 @@ still reported then is refused by its class, ending *"…, still failing
 deadlines.dependencies_seconds (900 s) after it was first reported, while the
 kubelet retried"*, or *"…, still failing at the end of … while the kubelet
 retried"* where the probe's wait ended first. It is never waited out to the
-longer bound a pull still under way gets. The refusal names the images that
-fail and what the container runtime reported for one of them — a cause no
-retry changes, where any image reported one — in the installer's words: the
-registry refused the pull, does not hold that name and digest, the reference is
-not a valid image name, the node could not reach the registry or does not trust its
+longer bound a pull still under way gets. Each of these clocks — the 90 s, a
+failure's `deadlines.dependencies_seconds` and the 300 s below — runs from what
+the Pod in hand reported; the six Pods share only the probe's whole wait. The
+refusal names the one image — its place among the six, the reference the probe
+composed for it, how many were pulled before it and how many are not yet
+tried — and what the container runtime reported for it, a cause no retry
+changes where it reported one, in the installer's words: the registry refused
+the pull, does not hold that name and digest, the reference is not a valid
+image name, the node could not reach the registry or does not trust its
 certificate, the registry rate-limited the pull, the node's disk is full, or
-*"a condition this installer does not classify"*. The runtime's own message is
-kept in the state directory, never printed:
+*"a condition this installer does not classify"*. No Pod is created for the
+images not yet tried. The runtime's own message is kept in the state
+directory, never printed:
 
 ```
-GSJ: the node cannot pull this release from registry.base (registry.example.org/team/wrong): 6 of 6 images: ... The container runtime reported, for one of them, the registry does not hold that name and digest (not found); its own words are kept in .../pull-probe-status.json. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's ... Helm has applied nothing in this run
+GSJ: the node cannot pull this release from registry.base (registry.example.org/team/wrong): image 1 of 6, registry.example.org/team/wrong/...@sha256:... (0 pulled before it, 5 not yet tried). The container runtime reported the registry does not hold that name and digest (not found); its own words are kept in .../pull-probe-status.json. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's ... Helm has applied nothing in this run
 ```
 
 What it asks you to check follows the site. With `registry.base`, the copy and
@@ -2053,16 +2089,19 @@ node's side — a registry CA it does not trust, its DNS or proxy, a full disk �
 needs no site change: the refusal names `resume --operation ID` for it, once the
 node can pull.
 
-**The probe Pod must be admitted first.** Its containers never run; each asks
-for `cpu: 50m` and `memory: 64Mi`, with both its limits equal to those
+**Each probe Pod must be admitted first.** Its one container never runs; it
+asks for `cpu: 100m` and `memory: 128Mi`, with both its limits equal to those
 requests — a limit-to-request ratio of 1, and no CPU limit left for a
-LimitRange to inject — so the Pod asks for 300m and 384Mi in all. A namespace
-LimitRange or ResourceQuota that refuses it stops the run before any pull,
-named as a policy and not as your kubeconfig's permissions: *"the image pull
-probe could not be created in namespace …, so whether the node can pull from
-… is unproven: an admission policy (LimitRange or ResourceQuota) refused the
-Pod; kubectl's own words are kept in …/pull-probe-create.err. Each of its 6
-containers requests cpu 50m and memory 64Mi, with limits equal to those
+LimitRange to inject. Those are the storage check's figures, and every chart
+container that names a request asks for at least as much, so a namespace that
+admits the installer's other Pods admits these; one of them is all the probe
+holds at any moment. A namespace LimitRange or ResourceQuota that refuses one
+stops the run before that Pod pulls anything, named as a policy and not as
+your kubeconfig's permissions: *"the image pull probe could not be created in
+namespace …, so whether the node can pull from … is unproven: an admission
+policy (LimitRange or ResourceQuota) refused the Pod; kubectl's own words are
+kept in …/pull-probe-create.err. Each probe Pod, one per image in turn, has one
+container requesting cpu 100m and memory 128Mi, with limits equal to those
 requests: the namespace's LimitRange must admit that (its minimum, maximum and
 maxLimitRequestRatio) and its ResourceQuota must leave room for it"*. Any other
 admission policy is named *"an admission policy refused it"*, and the refusal
@@ -2074,17 +2113,18 @@ an install or an upgrade; for a restore, the verb its phase accepts —
 `applying`, otherwise `resume` — *"… once the namespace admits the probe Pod
 (wait 180 s first: this operation's Lease must go unrenewed that long)"*.
 
-**Admitted, it must be placed.** The scheduler places the probe Pod beside what
-the node already carries — on an upgrade the running deployment too, because
-the probe comes before the backup quiesces it — so `storage.node` needs its
-300m CPU and 384Mi unreserved on top of that ([6. Your storage
-node](#before-you-start) has the figures). A Pod the scheduler has not placed
-pulls nothing. One whose `PodScheduled` condition has stayed `False` for 300 s,
-or still is when a shorter `deadlines.dependencies_seconds` ends the wait, is
-refused by name, not as a pull:
+**Admitted, each must be placed.** The scheduler places each probe Pod beside
+what the node already carries — on an upgrade the running deployment too,
+because the probe comes before the backup quiesces it — so `storage.node` needs
+one Pod's 100m CPU and 128Mi unreserved on top of that: each Pod is deleted,
+and gone, before the next is created ([6. Your storage node](#before-you-start)
+has the figures). A Pod the scheduler has not placed pulls nothing. One whose
+`PodScheduled` condition has stayed `False` for 300 s from its own first
+report, or still is when the probe's wait ends first, is refused by name, not
+as a pull, naming the image it was to pull:
 
 ```
-GSJ: the image pull probe's Pod was not scheduled (PodScheduled: Unschedulable) within 300 s, so whether the node can pull from the release's own repositories is unproven: storage.node (NODE) has no room for its 6 containers' requests together, cpu 300m and memory 384Mi, beside what the Pods already there request (the running deployment's too, when there is one), or does not accept it (cordoned, tainted, or no node of that name). The Pod's status, with the scheduler's own words, is kept in .../pull-probe-status.json. Helm has applied nothing in this run
+GSJ: the image pull probe's Pod was not scheduled (PodScheduled: Unschedulable) within 300 s, so whether the node can pull image 1 of 6 from the release's own repositories is unproven: storage.node (NODE) has no room for its request, cpu 100m and memory 128Mi, beside what the Pods already there request (the running deployment's too, when there is one), or does not accept it (cordoned, tainted, or no node of that name). The Pod's status, with the scheduler's own words, is kept in .../pull-probe-status.json. Helm has applied nothing in this run
 ```
 
 The reason is repeated only when it is `Unschedulable` or `SchedulerError`,
@@ -2094,8 +2134,8 @@ node the scheduler may use has that room or accepts the Pod. The cure is room,
 not a site value: free requests on that node, or let it accept the Pod
 (uncordon it, lift the taint), wait the 180 s
 the operation's Lease needs, and run the `resume --operation ID` the closing
-line names *"once room is freed on node … for the probe Pod's cpu 300m and
-memory 384Mi"*. A first install is also offered `abandon` and `install` again
+line names *"once room is freed on node … for the probe Pod's cpu 100m and
+memory 128Mi"*. A first install is also offered `abandon` and `install` again
 *"from the corrected file with another storage.node"*; an installed release is
 told that *"a changed storage.node is refused for an installed release, whose
 claims stay where they are"*; a restore names the verb its phase accepts and
@@ -2109,15 +2149,16 @@ neither sets nor changes `registry.base` keeps that time: a pull still under
 way when `deadlines.dependencies_seconds` (900 s by default) is spent is logged
 once — *"The node is still pulling this release's images from … at
 deadlines.dependencies_seconds (900 s), as on a slow link to the registry; the
-wait goes on …"*, said only while the Pod is placed and its containers report
+wait goes on …"*, said only while a Pod is placed and its container reports
 a pull (a Pod not placed, or with no container status, is not pulling at all)
 — and waited for up to `deadlines.initialization_seconds` more. A site that
-sets or changes `registry.base` waits `deadlines.dependencies_seconds` at most for all six images together, the
-corpus image included. Either way, a still-unfinished pull at the end is
-refused:
+sets or changes `registry.base` waits `deadlines.dependencies_seconds` at most
+for all six images together, the corpus image included: the six Pods spend
+that one wait between them. Either way, a still-unfinished pull at the end is
+refused, naming the image whose pull was under way:
 
 ```
-GSJ: the node did not finish pulling this release's images from registry.base (registry.example.org/team) within deadlines.dependencies_seconds (900 s): ...; the Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
+GSJ: the node did not finish pulling this release's images from registry.base (registry.example.org/team) within deadlines.dependencies_seconds (900 s): image 4 of 6, registry.example.org/team/...@sha256:... (3 pulled before it, 2 not yet tried), was not pulled; ...; the Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
 ```
 
 (*"… within deadlines.dependencies_seconds plus
@@ -3480,9 +3521,13 @@ finished by `resume --operation ID` with the same file, once its Lease has gone
 180 s unrenewed: the `resume` rewrites what is left, says the first line
 quoted above, clears the mark and ends with *"Operation is already complete"*. It admits
 exactly that one difference between your file and the saved site,
-`corpus.allow_update`, while the mark is there, and refuses any other as it
-always does. A site file that has become a symbolic link by then is not
-written through; the saved site and the installed record say `false`, and the
+`corpus.allow_update`, and only for an operation recorded complete that still
+carries the mark, and refuses any other as it always does. The mark is written
+before the operation is recorded complete, and neither file is rewritten until
+it is, so before then the two agree: a `corpus.allow_update` you changed in
+your file for an operation not yet complete is your own edit, refused like any
+other (a `resume` says *"resume configuration changed; …"*). A site file that has
+become a symbolic link by then is not written through; the saved site and the installed record say `false`, and the
 line says so instead: *"The corpus change this operation admitted is complete
 (fingerprint … to …) and corpus.allow_update is false in the operation's saved
 site and the installed record, but … is now a symbolic link or no longer a
@@ -4156,7 +4201,10 @@ directory, and the corpus envelope inside it, sit under `TMPDIR` (else `/tmp`)
 on the machine you install from, and a small root filesystem is no place for
 them either. Make a directory on the data disk and export `TMPDIR` to it before
 `init` and before every verb — `init` measures it, and the directory must exist
-first ([step 1](#step-1--check-your-machine-and-your-cluster) has the line).
+first. Make it private as the block above makes the transfer directory —
+`chmod 700`, `chmod g-s`, and `setfacl -b -k` where `setfacl` exists; [step
+1](#step-1--check-your-machine-and-your-cluster) has that block for it and the
+cache directory.
 
 Set `backup.offbox_url` to a final HTTPS directory endpoint when the operation
 should export automatically. It PUTs the three required files, GETs each back
@@ -4452,8 +4500,10 @@ which an interrupted Helm client leaves and which has no continuation. Keep the 
 as it is: the directory holds the operation's evidence, and its unfinished
 restore checkpoint refuses a fresh restore there (*"restore checkpoint already
 exists; use restore-repair --operation ID for its recorded resource/file phase
-or resume for application startup"*). Restore the same verified
-archive into an empty namespace of the same name (restore keeps the archive's
+or resume for application startup"*; once you have abandoned the operation,
+*"restore checkpoint already exists for operation …, which was abandoned
+before its restore completed, …"*, naming the route below). Restore the same
+verified archive into an empty namespace of the same name (restore keeps the archive's
 namespace and release names) from a new site directory: on another cluster,
 keeping this namespace too, or, with one cluster, on this one once the
 deployment is removed (`abandon --operation`, `helm -n NAMESPACE uninstall` of
@@ -4619,7 +4669,7 @@ first install, or its recovery, realistically meets:
 | `target release does not declare this source-to-target transition` | this executable is a different release from the one that installed, or started the operation on, this target | use the executable that did; or `abandon`, `helm uninstall` (claims are kept), `sweep`, and install afresh onto the kept claims with `storage.*.existing_claim` |
 | `bootstrap utility required` | a utility every verb needs before anything else is missing — `curl`, `tar`, `gzip`, `base64`, `openssl`, `awk`, `cut`, `uname`, `mktemp`, `date` or `sync`, named — or, as *bootstrap utility required: sha256sum or shasum*, a SHA-256 tool. `init` also needs `df`, `stat`, `id`, `dirname`, `basename`, `tr`, `head`, `tail`, `sed`, `wc`, `readlink` and `link` (the POSIX utility it publishes its checked files with) | install it, then run the same command |
 | `requires helm >= …`, `requires kubectl >= …`, `requires jq >= …` | that client is missing, reported no version, or is below its floor | install or upgrade it, or re-run with the `--fetch-tools=TOOL` the refusal names |
-| `kubectl version skew` | an `install` or `upgrade` would run on a kubectl that `--fetch-tools` downloaded, more than one minor from the server | run without `--fetch-tools`, or with `--fetch-tools=helm`, to keep your own kubectl |
+| `kubectl version skew` | an `install` or `upgrade` would run on a kubectl that `--fetch-tools` downloaded, more than one minor from the server — this release's pin, which every `--fetch-tools` that fetches kubectl brings back | install a kubectl within one minor of the server on this machine, then run without `--fetch-tools`, or with `--fetch-tools=helm`, which keeps it |
 | `TLS Secret is unavailable` | under `tls.profile=existing`, `tls.secret` is not in the target namespace — or, *… could not be read*, your kubeconfig could not read it there | create it there, the namespace first, or copy a certificate Secret of any name from another namespace under the name `tls.secret` (the refusal names the commands), or correct the access; then the same command |
 | `TLS Secret is incomplete` | `tls.secret` is not of type `kubernetes.io/tls`, lacks `tls.crt` or `tls.key`, or its `tls.crt` is not a PEM certificate | replace it with one that is (the refusal about the type and the keys names the commands; the one about the certificate names its host) |
 | `TLS certificate host mismatch` | under `tls.profile=files`, the certificate in `tls.certificate_file` does not name `public_url`'s host. Under `existing`, a certificate in `tls.secret` for another host, or past its expiry date, is said in a log line ending *"The run goes on"*, not refused; where the controller serves it, the install stops hours in at *public HTTPS route is unreachable* | a certificate for that host, or the right `public_url` |
@@ -4636,10 +4686,10 @@ first install, or its recovery, realistically meets:
 | `the corpus initializer needs …Mi` | `resources.initializer.limits.memory` is below what this release's corpus needs | raise it in the site file to at least the figure named |
 | `backup cannot change application settings` | the site file differs from the installed one outside its `backup`, `delivery` and `verification` blocks and `storage.transfer_path` and `storage.minimum_free_bytes` — an edited `registry.base` counts | put the installed values back, or run the operation that adopts the edit — an upgrade, or `install` again with the same installer — then back up |
 | `temporary storage backend cleanup incomplete` | the storage check's temporary claim bound a volume and marked it `Delete`, and 120 s after that claim was deleted the volume was still there. The message names the volume and its phase, and the phase is the whole difference | *…and it is now Failed*: nothing on this cluster deletes a volume of that class. Name your own claim in `storage.data.existing_claim`; wait until the operation's Lease has gone 180 s unrenewed, `abandon --operation ID --reason "…"`, install again. The volume it names accepts no claim until that PersistentVolume object is deleted and created again — do that only if you still want it. *…was still present (phase …)*, any other phase, `unknown` if it could not be read: whatever removes volumes of that class is slow or stuck. Do **not** delete the volume; look at that provisioner or deleter, then continue with the command the closing line names |
-| `the image pull probe could not be created in namespace` | the Pod that proves the pulls was refused before any pull — *an admission policy (LimitRange or ResourceQuota) refused the Pod*, *an admission policy refused it*, or your kubeconfig's permissions | admit it — each of its six containers requests `cpu: 50m` and `memory: 64Mi`, both limits equal to those requests (300m and 384Mi in all), and it is labelled `gsj.io/pull-probe` — then the command the closing line names: `resume`, or for a restore the verb its phase accepts |
-| `the node cannot pull this release from` | the pull proof failed: `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry. A failure no retry changes (a refused credential, a name or digest the registry does not hold, an invalid name) is refused after 90 s; any other within `deadlines.dependencies_seconds` of its first report, *"… still failing deadlines.dependencies_seconds (…) after it was first reported …"*, or at the end of the probe's wait where that comes first, *"… still failing at the end of …"* | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
-| `the image pull probe's Pod was not scheduled` | the scheduler left the probe Pod unplaced (`PodScheduled` `False`) for 300 s, or to the end of a shorter `deadlines.dependencies_seconds`: `storage.node` has no room for its six containers' 300m CPU and 384Mi beside what the Pods there already request — on an upgrade the running deployment's too — or does not accept it (cordoned, tainted, no node of that name). The scheduler's words are kept in `pull-probe-status.json` | free requests on that node, or uncordon it, wait 180 s, then the `resume --operation ID` the closing line names; a first install may instead `abandon` and `install` again with another `storage.node`, which an installed release cannot change; a restore names the verb its phase accepts |
-| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers and the probe Pod can be scheduled |
+| `the image pull probe could not be created in namespace` | a Pod that proves a pull, one per image in turn, was refused before it pulled — *an admission policy (LimitRange or ResourceQuota) refused the Pod*, *an admission policy refused it*, or your kubeconfig's permissions | admit it — each probe Pod is one container requesting `cpu: 100m` and `memory: 128Mi`, the storage check's figures, both limits equal to those requests, and is labelled `gsj.io/pull-probe` — then the command the closing line names: `resume`, or for a restore the verb its phase accepts |
+| `the node cannot pull this release from` | the pull proof failed for the image it names (*"image … of 6, … (… pulled before it, … not yet tried)"*): `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry. A failure no retry changes (a refused credential, a name or digest the registry does not hold, an invalid name) is refused after 90 s; any other within `deadlines.dependencies_seconds` of its first report, *"… still failing deadlines.dependencies_seconds (…) after it was first reported …"*, or at the end of the probe's wait where that comes first, *"… still failing at the end of …"* | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
+| `the image pull probe's Pod was not scheduled` | the scheduler left a probe Pod unplaced (`PodScheduled` `False`) for 300 s, or to the end of the probe's wait where that came first: `storage.node` has no room for its request, 100m CPU and 128Mi, beside what the Pods there already request — on an upgrade the running deployment's too — or does not accept it (cordoned, tainted, no node of that name). The scheduler's words are kept in `pull-probe-status.json` | free requests on that node, or uncordon it, wait 180 s, then the `resume --operation ID` the closing line names; a first install may instead `abandon` and `install` again with another `storage.node`, which an installed release cannot change; a restore names the verb its phase accepts |
+| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with the named image's pull still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers and the probe Pod can be scheduled |
 | `Helm provisioning failed; persistent state was retained` | the Helm apply of an install, upgrade or restore exited non-zero; the last 25 lines of Helm's log precede it. The operation stays in its Helm phase, where `resume` refuses | fix the cause, wait 180 s, then the `repair --operation ID --config … --non-interactive` the closing line names |
 | `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin (the refusal names the floor that set it; a tenth of the filesystem is the `emptyDir`'s alone); nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
 | `the operation Lease is already free; nothing to abandon` | `abandon` on a target with no live operation — normal after a completed install | carry on; it exits `1` while doing no harm, so do not let a script stop on it |
@@ -4899,7 +4949,12 @@ that removes its test accounts — and the record is retired after it
 (*"Prior verification run … cleaned under its original identity; starting
 target-release acceptance"*). Anything else there
 either refuses the fresh restore — an unfinished checkpoint with *"restore
-checkpoint already exists; …"* — or strands it partway, at verification with
+checkpoint already exists; …"*, or, once the operation that left it has been
+abandoned or swept, with *"restore checkpoint already exists for operation …,
+which was abandoned before its restore completed, so restore-repair and resume
+refuse it; keep this site directory as it is, and restore into an empty
+namespace … from a new site directory: …"* (*swept* where a sweep ended it),
+which names this route — or strands it partway, at verification with
 *"verification ownership ledger is missing after launch"*, where only that
 state's own recovery continues it. A
 directory no installer has used holds nothing of the kind. Keep the old one: its

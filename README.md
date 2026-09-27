@@ -44,14 +44,14 @@ install and when you would find out.
   install does not complete — it stops at its own network check, after the
   corpus import and before any acceptance check has run. Every pull of the
   release's images is proven on the storage node before anything is applied,
-  for every site, so nodes that cannot pull stop an install at its start,
-  not hours in. A pull that fails in a way no retry changes (a refused
-  credential, a name or digest the registry does not hold, an invalid name)
-  is refused after 90 s; any other failure within
+  for every site, one probe Pod per image in turn, so nodes that cannot pull
+  stop an install at its start, not hours in. A pull that fails in a way no
+  retry changes (a refused credential, a name or digest the registry does not
+  hold, an invalid name) is refused after 90 s; any other failure within
   `deadlines.dependencies_seconds` (900 s by default) of its first report;
-  and a probe Pod the
-  scheduler cannot place — its six containers ask for 300m CPU and 384Mi in
-  all, beside the running deployment on an upgrade — after 300 s. With
+  and a probe Pod the scheduler cannot place — each asks for 100m CPU and
+  128Mi, one at a time, beside the running deployment on an upgrade — after
+  300 s. With
   `registry.base` (or on the upgrade that drops it) all six images must
   arrive within `deadlines.dependencies_seconds`, which a slow link to the
   mirror may need raised; without it a pull still under way then is waited
