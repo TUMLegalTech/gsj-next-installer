@@ -632,3 +632,21 @@ def test_the_marker_admits_a_difference_in_allow_update_alone(runtime):
     assert run(body).stdout.split() == ["only=admitted", "more=refused"]
     (work / "operation.json").write_text(json.dumps({"operation": OPERATION, "status": "complete"}))
     assert run(body).stdout.split() == ["only=refused", "more=refused"]
+
+
+@pytest.mark.parametrize("status, admitted", [("verifying", False), ("complete", True)])
+def test_the_marker_admits_the_difference_only_once_the_operation_is_complete(runtime, status, admitted):
+    """record_installed writes the marker before it marks the operation
+    complete, and rewrites the operator's file and the saved site only after:
+    in between, both still say what the operation was compiled from, so a
+    difference there is the operator's own edit. The marker admitted it for an
+    operation still verifying -- resume, backup-repair and restore-repair took
+    a changed corpus.allow_update for this operation's own reset."""
+    run, _, work = runtime
+    saved = json.loads((work / "site.json").read_text())
+    (work / "saved.json").write_text(json.dumps(saved))
+    (work / "only.json").write_text(json.dumps(
+        {**saved, "corpus": {**saved["corpus"], "allow_update": not saved["corpus"]["allow_update"]}}))
+    (work / "operation.json").write_text(json.dumps({"operation": OPERATION, "status": status, "corpus_update_reset": "pending"}))
+    result = run('if retained_site_matches "$TEST_WORK/only.json" "$TEST_WORK/saved.json"; then echo admitted; else echo refused; fi')
+    assert result.stdout.split() == ["admitted" if admitted else "refused"], result.stderr

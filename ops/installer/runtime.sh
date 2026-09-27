@@ -1782,13 +1782,16 @@ retained_site_matches() {
  # after the operation was recorded; load_site now records them first.
  # Admit exactly that derivation of this operation's own CA. The one other
  # difference admitted is corpus.allow_update, and only while the operation
- # carries record_installed's corpus_update_reset marker: that operation is
- # complete and was stopped between rewriting the operator's file and its
- # saved site, which its resume finishes. Nothing else.
+ # is complete and carries record_installed's corpus_update_reset marker: it
+ # was stopped between rewriting the operator's file and its saved site,
+ # which its resume finishes. record_installed writes the marker before it
+ # marks the operation complete and rewrites neither before that, so on an
+ # operation not yet complete the two still agree, and a difference is the
+ # operator's own edit. Nothing else.
  cmp -s "$1" "$2" && return
  local derive=false spent=false
  [[ ! -f $STATE_DIR/tls/ca.crt || -L $STATE_DIR/tls/ca.crt ]] || derive=true
- ! jq -e '.corpus_update_reset=="pending"' "$STATE_DIR/operation.json" >/dev/null 2>&1 || spent=true
+ ! jq -e '.corpus_update_reset=="pending" and .status=="complete"' "$STATE_DIR/operation.json" >/dev/null 2>&1 || spent=true
  jq -e --arg ca "$STATE_DIR/tls/ca.crt" --argjson derive "$derive" --argjson spent "$spent" --slurpfile o "$2" '
    def admitted: if $spent then del(.corpus.allow_update) else . end;
    ($o[0]|admitted) as $o | admitted | ($spent and .==$o) or ($derive and
