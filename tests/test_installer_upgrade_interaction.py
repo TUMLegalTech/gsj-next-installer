@@ -106,8 +106,10 @@ main upgrade {arguments} --config "$SITE" --non-interactive
     assert (work / "bootstrapped").exists() is admitted
 
 
-def _compatibility(runtime, fault=None):
-    """Run the real compatibility gate against a synthetic completed source."""
+def _compatibility(runtime, fault=None, edit=None):
+    """Run the real compatibility gate against a synthetic completed source.
+    `edit` changes the current site after the installed record was taken from
+    it."""
     run, kube, work = runtime
     payload = work / "payload"
     payload.mkdir(exist_ok=True)
@@ -145,6 +147,9 @@ def _compatibility(runtime, fault=None):
         if fault == "corpus-allowed":
             site["corpus"]["allow_update"] = True
             (work / "site.json").write_text(json.dumps(site))
+    if edit:
+        edit(site)
+        (work / "site.json").write_text(json.dumps(site))
     (payload / "release.json").write_text(json.dumps(release))
     (work / "values.pending.json").write_text(json.dumps(
         {"storage": {role: {"existingClaim": ""} for role in ("data", "forgejo", "chroma")}}))
@@ -175,3 +180,125 @@ def test_upgrade_compatibility_refuses_each_unsupported_transition(runtime, faul
     assert message in result.stderr
     assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec")
                    for call in json.loads(kube.read_text())["calls"])
+
+
+# ---- the staging directory and the free-space floor are not storage identity ----
+
+WRITES = ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
+UNFROZEN = [(("transfer_path",), "/srv/gsj/transfer"), (("minimum_free_bytes",), 5 * 2 ** 30)]
+FROZEN = [(("profile",), "managed-local-path"), (("class",), "another-class"), (("node",), "another-node"),
+          (("backend_path",), "/srv/another-backend"),
+          (("data", "size"), "40Gi"), (("forgejo", "size"), "20Gi"), (("chroma", "size"), "40Gi"),
+          (("data", "existing_claim"), "claim-of-my-own"), (("forgejo", "existing_claim"), "claim-of-my-own"),
+          (("chroma", "existing_claim"), "claim-of-my-own")]
+
+
+def _storage(path, value):
+    def edit(site):
+        node = site["storage"]
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+    return edit
+
+
+def _frozen_with_unfrozen(path, value):
+    """One frozen storage key changed, and both unfrozen ones with it: leaving
+    those two out of the comparison must not hide any other difference."""
+    def edit(site):
+        _storage(path, value)(site)
+        for unfrozen, changed in UNFROZEN:
+            _storage(unfrozen, changed)(site)
+    return edit
+
+
+def _ids(cases):
+    return [".".join(path) for path, _ in cases]
+
+
+def _no_writes(kube):
+    return not any(call[:1] and call[0] in WRITES for call in json.loads(kube.read_text())["calls"])
+
+
+@pytest.mark.parametrize("path,value", UNFROZEN, ids=_ids(UNFROZEN))
+def test_upgrade_admits_a_changed_transfer_path_or_free_space_floor(runtime, path, value):
+    """A release installed with an empty storage.transfer_path, on a node whose
+    root filesystem cannot hold the archive twice, could neither be backed up
+    nor upgraded, and the path could not be corrected in place: the gate
+    compared the whole storage block. Where a maintenance Pod stages and how
+    much free space it demands say nothing about which volumes hold the data,
+    and both are read from the current site, so a change to either passes."""
+    result = _compatibility(runtime, edit=_storage(path, value))
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("path,value", FROZEN, ids=_ids(FROZEN))
+def test_upgrade_still_refuses_every_other_storage_change(runtime, path, value):
+    _, kube, _ = runtime
+    result = _compatibility(runtime, edit=_frozen_with_unfrozen(path, value))
+    assert result.returncode != 0
+    assert "upgrade cannot change target, operator or storage identity" in result.stderr
+    assert _no_writes(kube)
+
+
+def _backup_compare(runtime, edit):
+    """backup_operation as far as its settings comparison: the installed record
+    is served by the fake ConfigMap, and acquire, the first step after the
+    comparison, ends the run with 93."""
+    run, kube, work = runtime
+    site = json.loads((work / "site.json").read_text())
+    installed = {"format": "gsj.installed/1", "status": "complete", "manifest": {"identity": "synthetic-release"},
+                 "site": json.loads(json.dumps(site)), "storage": [], "namespace_uid": "target-namespace-uid"}
+    edit(site)
+    (work / "site.json").write_text(json.dumps(site))
+    record = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "synthetic-release-installed"},
+              "data": {"installed.json": json.dumps(installed)}}
+    # the fake keys a named get by the kind as spelled: read_installed asks for "configmap"
+    kube.write_text(json.dumps({"lease": None, "calls": [],
+                                "resources": {"configmap/synthetic-release-installed": record}}))
+    return run('acquire() { touch "$TEST_WORK/acquired"; exit 93; }\nbackup_operation\n')
+
+
+@pytest.mark.parametrize("path,value", UNFROZEN, ids=_ids(UNFROZEN))
+def test_backup_admits_a_changed_transfer_path_or_free_space_floor(runtime, path, value):
+    """The same two keys no longer count as application settings for a backup:
+    correcting the staging directory is what makes the backup possible."""
+    _, _, work = runtime
+    result = _backup_compare(runtime, _storage(path, value))
+    assert result.returncode == 93, result.stderr
+    assert (work / "acquired").exists()
+
+
+@pytest.mark.parametrize("path,value", FROZEN, ids=_ids(FROZEN))
+def test_backup_still_refuses_every_other_storage_change(runtime, path, value):
+    _, kube, work = runtime
+    result = _backup_compare(runtime, _frozen_with_unfrozen(path, value))
+    assert result.returncode != 0
+    assert "backup cannot change application settings" in result.stderr
+    assert not (work / "acquired").exists()
+    assert _no_writes(kube)
+
+
+def test_capacity_measurement_applies_the_current_sites_free_space_floor(runtime):
+    """The floor the capacity scan enforces is the one the site names now, so a
+    lowered or raised storage.minimum_free_bytes governs the very backup that
+    follows the edit, not only the one after an operation has recorded it."""
+    run, _, work = runtime
+    site = json.loads((work / "site.json").read_text())
+    installed = {"site": json.loads(json.dumps(site))}
+    site["storage"]["minimum_free_bytes"] = 5 * 2 ** 30
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "installed.json").write_text(json.dumps(installed))
+    helpers = work / "payload" / "helpers"
+    helpers.mkdir(parents=True)
+    (helpers / "capacity.py").write_text("")
+    result = run('''GSJ_PAYLOAD="$TEST_WORK/payload"
+capacity_host_filesystems() { printf '{}\\n' > "$GSJ_WORK/capacity-host.json"; }
+assert_owner() { :; }
+k() { printf '%s\\n' "$@" > "$TEST_WORK/scan-argv"; printf '{"format":"gsj.capacity/1","status":"passed"}\\n'; }
+capacity_scan_pod reader create before
+''')
+    assert result.returncode == 0, result.stderr
+    argv = (work / "scan-argv").read_text().splitlines()
+    assert argv[argv.index("--minimum") + 1] == str(5 * 2 ** 30)
+

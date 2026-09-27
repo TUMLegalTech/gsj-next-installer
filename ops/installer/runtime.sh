@@ -2791,7 +2791,13 @@ compatibility() {
    *) fail 'invalid compatibility source selection';;
  esac
  [[ -s $GSJ_WORK/installed.json ]] || return 0
- jq -e --slurpfile site "$SITE" '.site.target == $site[0].target and .site.operator == $site[0].operator and .site.storage == $site[0].storage' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade cannot change target, operator or storage identity; use a qualified migration/restore operation'
+ # storage.transfer_path and storage.minimum_free_bytes say where a maintenance
+ # Pod stages and how much free space it demands, not which volumes hold the
+ # data; both are read from the current site. Compared, they left a release
+ # installed with an empty transfer_path, on a node whose root filesystem
+ # cannot hold the archive twice, with no backup, no upgrade and no way to
+ # correct the path in place. Every other storage key stays frozen.
+ jq -e --slurpfile site "$SITE" 'def identity: del(.transfer_path,.minimum_free_bytes); .site.target == $site[0].target and .site.operator == $site[0].operator and (.site.storage|identity) == ($site[0].storage|identity)' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade cannot change target, operator or storage identity; use a qualified migration/restore operation'
  jq -e --slurpfile release "$GSJ_PAYLOAD/release.json" '.manifest.model == $release[0].model' "$GSJ_WORK/installed.json" >/dev/null || fail 'model change blocked until both case and decision index migration is supported'
  local source; source=$(jq -r .manifest.identity "$GSJ_WORK/installed.json")
  if [[ $source != "$RELEASE_ID" ]]; then
@@ -2964,7 +2970,11 @@ capacity_scan_pod() {
  fi
  capacity_host_filesystems
  local volumes='{"forgejo":"/volumes/forgejo","gsj":"/volumes/gsj","chroma":"/volumes/chroma"}'
- local minimum; minimum=$(jq -er '.site.storage.minimum_free_bytes' "${CAPACITY_CONTEXT_FILE:-$GSJ_WORK/installed.json}")
+ # The floor is the current site's: it is no longer part of the identity an
+ # upgrade or a backup compares, so an edit governs the very next measurement.
+ # (A restored context records this same site.) The recorded floor stands in
+ # only for a site that names none.
+ local minimum; minimum=$(jq -er --slurpfile site "$SITE" '$site[0].storage.minimum_free_bytes // .site.storage.minimum_free_bytes' "${CAPACITY_CONTEXT_FILE:-$GSJ_WORK/installed.json}")
  if [[ $stage == quiesced ]]; then
    k exec -i "$pod" -- python - --volumes "$volumes" --transfer /transfer --hosts "$(cat "$GSJ_WORK/capacity-host.json")" --minimum "$minimum" --mode "$mode" --quiesced < "$GSJ_PAYLOAD/helpers/capacity.py" > "$GSJ_WORK/capacity-report.json" || result=$?
  else
@@ -3864,7 +3874,10 @@ restart_backup_source() {
 backup_operation() {
  read_installed
  [[ -s $GSJ_WORK/installed.json ]] && jq -e --arg identity "$RELEASE_ID" '.status=="complete" and .manifest.identity==$identity' "$GSJ_WORK/installed.json" >/dev/null || fail 'backup requires the exact completed installed release installer'
- jq -e --slurpfile site "$SITE" '(.site|del(.backup,.delivery,.verification))==($site[0]|del(.backup,.delivery,.verification))' "$GSJ_WORK/installed.json" >/dev/null || fail 'backup cannot change application settings; use the saved site configuration'
+ # The staging directory and the free-space floor are not application
+ # settings either (compatibility says why): correcting the one is what makes
+ # this backup possible, and the capacity check reads both from this site.
+ jq -e --slurpfile site "$SITE" 'def settings: del(.backup,.delivery,.verification,.storage.transfer_path,.storage.minimum_free_bytes); (.site|settings)==($site[0]|settings)' "$GSJ_WORK/installed.json" >/dev/null || fail 'backup cannot change application settings; use the saved site configuration'
  acquire
  read_installed
  jq -e --arg identity "$RELEASE_ID" '.status=="complete" and .manifest.identity==$identity' "$GSJ_WORK/installed.json" >/dev/null || fail 'installed release changed before backup ownership was acquired'
