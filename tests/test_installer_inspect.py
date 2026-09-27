@@ -342,7 +342,7 @@ def test_a_denied_helm_read_yields_no_rows_rather_than_a_fabricated_one(tmp_path
     ("http://user:pw/ZZSECRETCANARY@proxy.example:3128", "(not a valid http(s) address)"),
 ])
 def test_the_profile_keeps_only_the_origin_of_the_proxy(runtime, proxy, origin):
-    """review B2: the proxy field stripped userinfo, scheme and path by
+    """The proxy field once stripped userinfo, scheme and path by
     hand and kept the QUERY and the FRAGMENT -- a full `init` run wrote
     `proxy.example?REVIEW_PROXY_QUERY_SECRET` into the report's
     .inspect.profile.networking.egress.proxy_origin. The field goes through

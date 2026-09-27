@@ -1517,7 +1517,7 @@ def test_the_ghcr_row_reports_what_the_answer_established(tmp_path, keypair, cod
 
 
 def test_the_full_report_carries_only_the_proxy_s_origin(tmp_path, keypair):
-    """Review B2: a full init run -- inspect included, its profile spliced
+    """A full init run -- inspect included, its profile spliced
     into the report -- with a proxy whose URL carries userinfo, a path, a
     query and a fragment, each a canary. The report's
     .inspect.profile.networking.egress.proxy_origin is the origin alone (the

@@ -1,4 +1,4 @@
-"""The initializer qualification (review B1): the pure parts of ci/qualify-initializer.py,
+"""The initializer qualification: the pure parts of ci/qualify-initializer.py,
 and that the release's documents and the runtime registry name it."""
 import importlib.util
 import json

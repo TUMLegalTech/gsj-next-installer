@@ -1662,7 +1662,7 @@ def test_success_summary_reports_identity_status_and_redacted_settings(runtime):
                                        "skipped": [], "endpoints": {}, "public_https": "passed", "networkpolicy": "passed"}
     assert summary["settings"]["operator"]["password_file"] == "(protected file)"
     assert summary["settings"]["llm"]["credential"] == {"file": "(protected file)", "secret": ""}
-    assert summary["settings"]["llm"]["base_url"] == "https://llm.example"      # the origin: review B2
+    assert summary["settings"]["llm"]["base_url"] == "https://llm.example"      # the origin, never the path
     assert "/secure/" not in result.stdout + result.stderr
     assert summary["installed_record"] == str(work / "installed.json")
     assert summary["verification_report"] == str(work / "verification.json")
@@ -2247,10 +2247,14 @@ def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path
 # the documentation RFC 5737 ranges), or four number groups, dotted or dashed,
 # that open a host name: a wildcard-DNS host, whatever address it carries.
 # A review's finding ids are an uppercase letter and digits: a bracketed
-# review note that ends in one, a finding or a sweep named by one, a bracketed
-# ruling number or range, and, only inside brackets, a letter-digits-dash-
-# digits id; the letter is case-sensitive, so a version or an architecture in
-# brackets is not an id.
+# review note that ends in one, even left open on its line; a review, a
+# finding or a sweep named by one, bare or in parentheses; one anywhere inside
+# square brackets, a ruling number or range among them; and one with a dash
+# and digits after it anywhere. The letter is case-sensitive and the id a
+# word of its own, so a version, an architecture or a digest's name is not
+# one. A record's name is hyphenated upper-case words inside brackets; one
+# that is quoted (a value), carries a digit (an algorithm, a challenge) or
+# opens on a single letter (a header) is not.
 # Every alternative is spelled apart by concatenation or by escaped dots, so
 # this file never matches itself; the three scans below import this one list.
 INTERNAL_LABEL = re.compile(
@@ -2261,8 +2265,9 @@ INTERNAL_LABEL = re.compile(
                        r"\b[0-9]{1,3}(?:[.-][0-9]{1,3}){3}\.[a-z]"]) + ")|"
     + "|".join([r"\bPROMO" + r"TION\b", r"\bWEB" + r"NEXT\b", r"\bINIT" + r"-VERB\b", r"\bPILOT" + r"-MOVE\b",
                 r"\bRELEASE" + "-BETA", r"\bBETA" + "[0-9]", r"\bQA" + r"D\b", r"\bPATCH" + "-?[0-9]",
-                r"\[(?i:rev" + r"iew)(?:[ ,]+[A-Za-z]+)*[ ,]+[A-Z][0-9]+\b", r"\b(?i:rev" + r"iew (?:finding|sweep)) [A-Z][0-9]+\b",
-                r"\[R" + r"[0-9]+(?:-[0-9]+)?\]", r"\[[^\]]*\b[A-Z]" + r"[0-9]+-[0-9]+\b[^\]]*\]"]))
+                r"\[(?i:rev" + r"iew)(?:[ ,]+[A-Za-z]+)*[ ,]+[A-Z][0-9]+\b", r"\b(?i:rev" + r"iew)(?: (?i:finding|sweep))? [A-Z][0-9]+\b",
+                r"\[[^\]]*\b[A-Z]" + r"[0-9]+\b[^\]]*\]", r"\b[A-Z]" + r"[0-9]+-[0-9]+\b",
+                r"\[[^\]]*(?<![-\w'\"])[A-Z]{2,}(?:-[A-Z]" + r"{2,})+(?![-\w'\"])[^\]]*\]"]))
 
 
 def internal_labels(name, text):
@@ -2283,16 +2288,22 @@ def test_the_label_guard_finds_an_address_and_a_host_built_on_one():
 
 
 def test_the_label_guard_finds_a_review_s_finding_ids():
-    """A review's finding ids reach comments and docstrings in four shapes: a
-    bracketed review note that ends in an id, a finding or a sweep named by
-    its id, a bracketed ruling number or range, and a bracketed id of a
-    letter, digits, a dash and digits. Each is found. The ids are joined at
-    run time so this file stays clean."""
-    review = "rev" + "iew"
-    for text in (f"its words are kept, never repeated [{review} B2]", f"the fixed word [{review} sweep B2,",
-                 f"a pre-release is not the release ({review} finding B3)", f"{review.capitalize()} sweep N2: three reads",
-                 "the owner record is immutable [" + "R" + "18]", "one Lease per target [" + "R" + "1-6]",
-                 "a stop after the apply [" + "M" + "5-4]", "the claims stay [see " + "W" + "11-2]"):
+    """A review's finding ids reach comments and docstrings in these shapes: a
+    review, a finding or a sweep named by its id -- bare, in parentheses, or
+    in a bracketed note left open on its line; an uppercase letter and digits
+    anywhere inside square brackets, a ruling number or range among them; a
+    letter, digits, a dash and digits anywhere; and a bracketed record name
+    of hyphenated upper-case words. Each is found. The ids and the record
+    name are synthetic and joined at run time so this file stays clean."""
+    review, ident, record = "rev" + "iew", "Q" + "7", "-".join(["SAMPLE", "RECORD"])
+    for text in (f"its words are kept, never repeated [{review} {ident}]", f"the fixed word [{review} sweep {ident},",
+                 f"a pre-release is not the release ({review} finding {ident})", f"{review.capitalize()} sweep {ident}: three reads",
+                 f"{review.capitalize()} {ident}: the summary echoed a path", f"the origin: {review} {ident}",
+                 f"the qualification ({review} {ident}): the pure parts",
+                 f"the owner record is immutable [{ident}]", f"one Lease per target [{ident}-6]",
+                 f"a stop after the apply [see {ident} and the notes]", f"the product deployment [{ident}].",
+                 f"the claims stay (as {ident}-2 held)", f"the listener is polled first ({ident}-5, and then the API)",
+                 f"a pod selector needs 1.27 [{record}]", f"the probe page [see {record} item 1]"):
         assert internal_labels("line", text) == ["line:1"], text
 
 
@@ -2311,6 +2322,17 @@ GUIDE_PROSE = [
     "[Review the saved settings](#upgrade-and-recover-a-named-operation) before a repair; a review finding is not a refusal.",
     "the documentation ranges [TEST-NET-1, TEST-NET-3] and a kubectl within [v1.30-1.32] on x86-64",
     '[[ $holder =~ ^[a-f0-9]{24}$ ]] || shown="[R]"',
+    # a digest's, a key's or an architecture's name in brackets is no id
+    "the release is checked by [SHA256 digests, RSA-2048 keys and x86-64 images] on IPv6 nodes",
+    # nor is a standard's name, a curve's or a time stamp with its dashes
+    "SHA-256, UTF-8, ISO-8859-1 and a P-256 key; the stamp 2025-01-31T12:30:00Z",
+    # upper-case hyphenated words in brackets that are quoted (a value), carry
+    # a digit (an algorithm, a challenge) or open on one letter (a header)
+    'nodeAffinity values: ["STORAGE-NODE"]',
+    "[[ $(init_json_line \"$descriptor\" '  ' signature) == RSA-SHA256 ]]",
+    "[the X-FORWARDED-FOR header, TLS-ALPN-01 and HTTP-01 challenges]",
+    # the word review before a number, a lower-case word or a colon
+    "review the v2 plan, then review 12 findings. Review: the plan.",
 ]
 
 
@@ -2547,7 +2569,7 @@ def test_url_origin_only_strips_the_path_and_the_userinfo(runtime):
 
 
 def test_the_summary_keeps_and_prints_only_the_origin_of_every_site_url(runtime):
-    """Review B2: the closing summary echoed a schema-valid,
+    """The closing summary once echoed a schema-valid,
     credential-bearing URL PATH to stdout -- llm.base_url may carry a path,
     ocr.url must, and the summary printed the site's values whole and kept
     them in summary.json. Every URL the summary keeps or prints now goes
