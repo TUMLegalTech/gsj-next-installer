@@ -602,3 +602,36 @@ def test_a_run_of_an_ended_operation_whose_ledger_went_with_its_claims_is_retire
     else:
         assert result.returncode!=0 and 'verification ownership ledger is missing after launch' in result.stderr
         assert active_path.read_bytes()==before and not (work/'verification'/rid/'retired-verification-active.json').exists()
+
+
+@pytest.mark.parametrize('kind,status,codes,calls',[
+    # An unfinished run: its test accounts are removed under its original binding.
+    ('restore','active',[77,75],['--cleanup','retire','initial','cleanup']),
+    # A finished run of an install, reconnected read-only and retired the same way.
+    ('install','complete',[0,75],['--resume','retire','initial','cleanup']),
+])
+def test_a_replaced_namespace_whose_restore_brought_the_ledger_back_keeps_the_reconciliation(verification,kind,status,codes,calls):
+    """A replaced namespace took the claims the run's ledger lived on, unless a
+    restore brought them back from its archive: then the ledger is there again,
+    and retiring the record on the namespace alone dropped an active run whose
+    test accounts the old binding's reconciliation removes (--cleanup). The
+    record is retired only once the ledger is found absent."""
+    run,state,work,root=verification
+    if status=='complete': assert run([75]).returncode==0
+    else: assert run([1]).returncode!=0
+    active_path=work/'verification-active.json';old=json.loads(active_path.read_text());rid=old['run_id']
+    assert old['status']==status and (root/'remote/data/verification'/rid/'ledger.json').is_file()
+    old['operation']=PRIOR;active_path.write_text(json.dumps(old))
+    (work/'operation.json').write_text(json.dumps({'operation':'a'*24,'kind':kind,'target':'synthetic-release','status':'initializing'}))
+    (work/'operation-intents'/PRIOR).mkdir(parents=True)
+    (work/'operation-intents'/PRIOR/'intent.json').write_text(json.dumps({'format':'gsj.operation-intent/1',
+        'record':{'operation':PRIOR,'target':'synthetic-release','kind':'restore','status':'owned'},'namespace_uid':'replaced-namespace-id'}))
+    state.write_text(json.dumps({'codes':[],'calls':[]}))
+    result=run(codes)
+    assert result.returncode==0,result.stderr
+    assert json.loads(state.read_text())['calls']==calls
+    assert f'Prior verification run {rid} cleaned under its original identity' in result.stderr
+    assert 'Retired verification run' not in result.stderr
+    assert not (work/'verification'/rid/'retired-verification-active.json').exists()
+    current=json.loads(active_path.read_text())
+    assert current['run_id']!=rid and current['operation']=='a'*24 and current['status']=='complete'

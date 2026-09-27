@@ -4616,7 +4616,7 @@ verify_application() {
  # finished run (complete or cleaned: its owned resources are already clean)
  # has nothing left to resume; a namespace replaced since that operation (on
  # one cluster: deleted, recreated, then installed or restored afresh from the
- # same site directory) took any run's ledger with its claims. Resumed, both
+ # same site directory) took the run's ledger with its claims. Resumed, both
  # stopped with 'verification ownership ledger is missing after launch' after
  # everything was rebuilt. Such a record is retired beside its run's evidence
  # and this operation starts its own run; any other keeps its reconciliation.
@@ -4626,7 +4626,15 @@ verify_application() {
    recorded=$(jq -r '.namespace_uid//""' "$STATE_DIR/operation-intents/$prior/intent.json" 2>/dev/null) || recorded=''
    if [[ -n $recorded ]]; then
      nsuid=$(k get namespace "$NAMESPACE" -o json | jq -er '.metadata.uid|select(type=="string" and length>0)') || fail 'operation namespace identity is unavailable'
-     [[ $recorded == "$nsuid" ]] || retire=true
+     # A restore into the replaced namespace brings back the archive's
+     # claims, and the run's ledger with them: retired on the namespace alone,
+     # an active run lost the cleanup that removes its test accounts under its
+     # old binding. So the namespace retires the run only once its ledger is
+     # found absent; a ledger that is there keeps the reconciliation below.
+     if [[ $recorded != "$nsuid" ]]; then
+       existing=$(k exec "$pod" -c gsj-web -- python -c 'import json,pathlib,sys; print(json.dumps((pathlib.Path(sys.argv[1])/"ledger.json").is_file()))' "/data/verification/$run") || fail 'cannot inspect the persistent verification ledger'
+       [[ $existing != false ]] || retire=true
+     fi
    fi
    if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null && jq -e '.status|IN("complete","cleaned")' "$active" >/dev/null; then retire=true; fi
    if $retire; then
