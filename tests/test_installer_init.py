@@ -1397,6 +1397,80 @@ def test_a_release_without_a_corpus_fingerprint_asks_the_homepage_and_says_so(tm
     _no_leak(box, result)
 
 
+def _corpus_tag_findings(runtime, guide, examples):
+    """Where the corpus release's tag is spelled otherwise than the runtime
+    composes it (the github row's probe): the prefix before the fingerprint in
+    the guide's formulas, in every tag the guide and the example sites name
+    literally and in every example's corpus.vectors_url, and the one
+    eight-character fingerprint prefix all those literals share. `examples`
+    maps a file name to its site document. An empty list: no drift."""
+    composed = re.findall(r'corpus_tag="(corpus-[^"$]+\.)\$\{corpus_fp:0:8\}"', runtime)
+    base = re.findall(r'"(https://[^"$]+/releases/download/)\$corpus_tag/vectors\.json"', runtime)
+    if len(composed) != 1 or len(base) != 1:
+        return [f"runtime.sh composes {len(composed)} corpus tags under {len(base)} release URLs"]
+    prefix, base, findings, fingerprints = composed[0], base[0], [], {}
+    formulas = re.findall(r'releases/download/([^"/$]*)\$\{FP:0:8\}/vectors\.json', guide)
+    if len(formulas) < 2 or set(formulas) != {prefix}:
+        findings.append(f"OPERATOR.md: the vectors_url formulas compose {formulas}, the runtime {prefix!r}")
+    for tag in re.findall(r"\bcorpus-[0-9]+\.[A-Za-z0-9.-]*", guide):
+        if tag == prefix:
+            continue                                                # a formula's, checked above
+        fingerprint = tag[len(prefix):].rstrip(".") if tag.startswith(prefix) else ""
+        if not re.fullmatch(r"[0-9a-f]{8}", fingerprint):
+            findings.append(f"OPERATOR.md: {tag}")
+        fingerprints.setdefault(fingerprint, []).append("OPERATOR.md")
+    for name, site in sorted(examples.items()):
+        url = site.get("corpus", {}).get("vectors_url")
+        if url is None:
+            continue                                                # a vectors_path site
+        tag = url[len(base):-len("/vectors.json")] if url.startswith(base) and url.endswith("/vectors.json") else ""
+        if not (tag.startswith(prefix) and re.fullmatch(r"[0-9a-f]{8}", tag[len(prefix):])):
+            findings.append(f"{name}: {url}")
+        fingerprints.setdefault(tag[len(prefix):], []).append(name)
+    if len(fingerprints) != 1:
+        findings.append(f"the literal tags name {len(fingerprints)} fingerprint prefixes: {sorted(fingerprints)}")
+    return findings
+
+
+def _corpus_tag_places():
+    examples = {path.name: json.loads(path.read_text()) for path in sorted((INSTALLER / "examples").glob("*.site.json"))}
+    return (INSTALLER / "runtime.sh").read_text(), (INSTALLER / "OPERATOR.md").read_text(), examples
+
+
+def test_the_corpus_release_tag_is_spelled_as_the_runtime_composes_it_everywhere():
+    """The corpus release's tag -- corpus-1.snowflake-m-v2-int8-768. and the
+    first eight characters of the corpus fingerprint -- is composed by the
+    runtime (the github row's probe), by the guide's two vectors_url
+    formulas, spelled out in the guide's worked text and example documents,
+    in every example site's corpus.vectors_url, and in this module's
+    CORPUS_TAG. A prefix changed in one place and not the others would send
+    the operator, the probe or a test to another release; so would two
+    examples naming different corpus releases."""
+    runtime, guide, examples = _corpus_tag_places()
+    assert _corpus_tag_findings(runtime, guide, examples) == []
+    prefix = re.search(r'corpus_tag="(corpus-[^"$]+\.)\$\{corpus_fp:0:8\}"', runtime).group(1)
+    assert CORPUS_TAG == prefix + CORPUS_FINGERPRINT[:8]
+    assert sum("vectors_url" in site.get("corpus", {}) for site in examples.values()) >= 1
+
+
+@pytest.mark.parametrize("drift", ["the runtime's prefix", "a guide formula", "the guide's worked text", "an example's fingerprint", "an example's prefix"])
+def test_the_corpus_tag_check_names_a_place_that_drifted(drift):
+    runtime, guide, examples = _corpus_tag_places()
+    prefix, other = "corpus-1.snowflake-m-v2-int8-768.", "corpus-2.snowflake-m-v2-int8-768."
+    name = next(n for n, site in sorted(examples.items()) if "vectors_url" in site.get("corpus", {}))
+    if drift == "the runtime's prefix":
+        runtime = runtime.replace('corpus_tag="' + prefix, 'corpus_tag="' + other, 1)
+    elif drift == "a guide formula":
+        guide = guide.replace(prefix + "${FP:0:8}", other + "${FP:0:8}", 1)
+    elif drift == "the guide's worked text":
+        guide = guide.replace("`" + prefix + "13c5dee7`", "`" + prefix + "0badc0de`", 1)
+    else:
+        url = examples[name]["corpus"]["vectors_url"]
+        examples[name]["corpus"]["vectors_url"] = url.replace(prefix + "13c5dee7", prefix + "0badc0de" if drift == "an example's fingerprint" else other + "13c5dee7")
+    assert (runtime, guide) != _corpus_tag_places()[:2] or examples != _corpus_tag_places()[2], "the drift was not planted"
+    assert _corpus_tag_findings(runtime, guide, examples) != []
+
+
 @pytest.mark.parametrize("code,status", [("401", "PASS"), ("200", "PASS"), ("403", "FAIL"), ("500", "FAIL")])
 def test_the_ghcr_row_reports_what_the_answer_established(tmp_path, keypair, code, status):
     """The same rule for ghcr.io, whose PASS includes 401 -- how a registry
