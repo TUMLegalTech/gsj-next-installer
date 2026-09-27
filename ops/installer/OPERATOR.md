@@ -1242,9 +1242,11 @@ it, some of them hours in:
   naming it;
 - an operator Secret already in the namespace whose password differs from
   `operator.password_file`;
-- for a managed add-on profile, add-on CustomResourceDefinitions left on the
-  cluster without the owner record that would admit them, each named, with the
-  teardown that removes them ([Remove a deployment](#remove-a-deployment)).
+- for a managed add-on profile, that add-on's CustomResourceDefinitions left on
+  the cluster without the owner record that would admit them, each named, with
+  the teardown that removes them ([Remove a deployment](#remove-a-deployment)).
+  Those of the add-on the site does not select are named the same way in a log
+  line, and the run goes on: they are not what the selected add-on creates.
 
 Two of these read beyond the namespace — every Ingress on the cluster, and the
 CRDs. Where your kubeconfig may not list those, that check is skipped and the
@@ -4245,9 +4247,10 @@ done
 
 Only once every line reads `0 objects` — `kubectl get <kind> -A` lists no object
 of that kind in any namespace — delete them, each by name:
-`kubectl delete crd NAME`. A set left behind is not harmless: the next managed
-install on this cluster finds CRDs without the owner record that would admit
-them and is refused before its Lease, each one named.
+`kubectl delete crd NAME`. A set left behind is not harmless: the next install
+on this cluster that selects the same add-on finds CRDs without the owner record
+that would admit them and is refused before its Lease, each one named; one that
+selects only the other add-on names them in its log and goes on.
 
 Beyond the cluster, two things outlive all of this and are yours to remove:
 the operator state directory under `$STATE/...` (keep it if you want the audit

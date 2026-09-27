@@ -1329,7 +1329,7 @@ preflight_site_checks() {
  # directory and never repeated. A read this credential may not make is
  # logged and passed, as the capacity check does: a namespace-scoped operator
  # is a supported shape, and the later checks still stand.
- local versions=$1 host secret existing crt key ca ns found pods counts total running controllers client server cv='' sv='' cm sm crds owner names orphans='' homes='' home teardown='' gets where
+ local versions=$1 host secret existing crt key ca ns found pods counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
  host=$(j '.public_url // ""' | sed -E 's#https://([^/:]+).*#\1#')
  # kubectl is supported within one minor of the server (init's kubectl-skew
  # row). A kubectl this run downloaded is the release's pin, not the
@@ -1412,10 +1412,18 @@ preflight_site_checks() {
  fi
  # Leftover managed add-on CRDs: cluster-scoped, so they outlive the add-on's
  # namespace and its owner record (the ConfigMap gsj-addon-owner there, with
- # the same gsj.io/addon-owner label). managed_helm_addon still refuses them
- # under the Lease; named here first, each, with the teardown -- which this
- # installer never performs: deleting a CRD deletes every object of its kind.
- if [[ $(j '.ingress.profile // ""') == managed-traefik || $(j '.tls.profile // ""') == managed-acme ]]; then
+ # the same gsj.io/addon-owner label). managed_helm_addon refuses, under the
+ # Lease, those of the chart it renders; here, first, an orphan is refused
+ # when its API group (spec.group) is one of an add-on this site selects --
+ # Traefik's traefik.io, hub.traefik.io and the earlier traefik.containo.us,
+ # cert-manager's cert-manager.io and acme.cert-manager.io -- and an orphan of
+ # the other add-on is named in a log line and the run goes on. Each is named
+ # with the teardown, which this installer never performs: deleting a CRD
+ # deletes every object of its kind.
+ traefik=false; acme=false
+ [[ $(j '.ingress.profile // ""') != managed-traefik ]] || traefik=true
+ [[ $(j '.tls.profile // ""') != managed-acme ]] || acme=true
+ if $traefik || $acme; then
    if ! crds=$(kubectl --context "$CONTEXT" get customresourcedefinitions -l gsj.io/addon-owner -o json 2> "$STATE_DIR/preflight-addon-crds.err"); then
      log "Leftover managed add-on CustomResourceDefinitions were not checked: this credential could not list them (kubectl's output is kept in $STATE_DIR/preflight-addon-crds.err). One without its owner record is still refused after the Lease"
    else
@@ -1425,19 +1433,36 @@ preflight_site_checks() {
          break
        fi
        if jq -e 'any(.items[]; .metadata.name=="gsj-addon-owner")' <<< "$found" >/dev/null; then continue; fi
-       names=$(jq -r --arg owner "$owner" '[.items[]|select(.metadata.labels["gsj.io/addon-owner"]==$owner)|.metadata.name]|join(" ")' <<< "$crds")
-       orphans+="${orphans:+ }$names"
-       names=$( { kubectl --context "$CONTEXT" get namespaces -l "gsj.io/addon-owner=$owner" -o json 2>/dev/null || true; } | jq -r '[.items[]?.metadata.name]|join(" ")' 2>/dev/null || true)
-       [[ -z $names ]] || homes+="${homes:+ }$names"
+       home=$( { kubectl --context "$CONTEXT" get namespaces -l "gsj.io/addon-owner=$owner" -o json 2>/dev/null || true; } | jq -r '[.items[]?.metadata.name]|join(" ")' 2>/dev/null || true)
+       # One line per verdict: "true NAMES" for the selected add-ons' groups,
+       # "false NAMES" for the rest.
+       while read -r selected names; do
+         if $selected; then orphans+="${orphans:+ }$names"; [[ -z $home ]] || homes+="${homes:+ }$home"
+         else strays+="${strays:+ }$names"; [[ -z $home ]] || stray_homes+="${stray_homes:+ }$home"; fi
+       done < <(jq -r --arg owner "$owner" --argjson traefik "$traefik" --argjson acme "$acme" '
+         [.items[]|select(.metadata.labels["gsj.io/addon-owner"]==$owner)|(.spec.group // "") as $group |
+          {selected:(($traefik and ($group|test("(^|[.])traefik[.](io|containo[.]us)$"))) or ($acme and ($group|IN("cert-manager.io","acme.cert-manager.io")))),
+           name:.metadata.name}] | group_by(.selected)[] | "\(.[0].selected) \(map(.name)|join(" "))"' <<< "$crds")
      done
+     if [[ -n $strays ]]; then
+       where="no add-on namespace is left"; [[ -z $stray_homes ]] || where="add-on namespace: $stray_homes"
+       log "Managed add-on CustomResourceDefinitions of an add-on this site does not select are left without their owner record: $strays ($where). The run goes on: the managed add-ons this site selects do not create them, but a site that selects that add-on is refused on them. To remove them, tear the leftover add-on down; this installer deletes nothing: $(addon_crd_teardown "$strays" "$stray_homes")"
+     fi
      if [[ -n $orphans ]]; then
-       for home in $homes; do teardown+="helm -n $home list names the release; helm -n $home uninstall RELEASE; kubectl delete namespace $home; "; done
        where="no add-on namespace is left"; [[ -z $homes ]] || where="add-on namespace: $homes"
-       gets=$(printf 'kubectl get %s -A, ' $orphans)
-       fail "managed add-on CustomResourceDefinitions are left without their owner record: $orphans ($where). The managed add-on this site selects would be refused on them after the Lease, as a resource that already exists without its owner record. Tear the leftover add-on down first; this installer deletes nothing: ${teardown:+uninstall its Helm release and delete its namespace (${teardown%; }), then }once each of ${gets%, } lists no object any more, delete the definitions by name (kubectl delete customresourcedefinition $orphans). Then run the same command again"
+       fail "managed add-on CustomResourceDefinitions are left without their owner record: $orphans ($where). The managed add-on this site selects would be refused on them after the Lease, as a resource that already exists without its owner record. Tear the leftover add-on down first; this installer deletes nothing: $(addon_crd_teardown "$orphans" "$homes"). Then run the same command again"
      fi
    fi
  fi
+}
+addon_crd_teardown() {
+ # The teardown preflight_site_checks names for the leftover add-on CRDs $1
+ # whose add-on namespaces are $2: the Helm release and the namespace first,
+ # then each definition once no object of its kind is left.
+ local names=$1 homes=$2 home teardown='' gets
+ for home in $homes; do teardown+="helm -n $home list names the release; helm -n $home uninstall RELEASE; kubectl delete namespace $home; "; done
+ gets=$(printf 'kubectl get %s -A, ' $names)
+ printf '%s' "${teardown:+uninstall its Helm release and delete its namespace (${teardown%; }), then }once each of ${gets%, } lists no object any more, delete the definitions by name (kubectl delete customresourcedefinition $names)"
 }
 lease_still_live() {
  # Every "still live" refusal states what it measured: the Lease was renewed

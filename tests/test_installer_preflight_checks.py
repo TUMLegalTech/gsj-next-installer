@@ -346,7 +346,8 @@ def test_an_operator_password_with_a_control_character_is_refused(runtime, tmp_p
 # --- leftover managed add-on CRDs ------------------------------------------------------
 
 def _crd(name, owner=OWNER):
-    return {"metadata": {"name": name, "labels": {"gsj.io/addon-owner": owner}}}
+    """A CRD's name is its plural and its API group, and spec.group is the group."""
+    return {"metadata": {"name": name, "labels": {"gsj.io/addon-owner": owner}}, "spec": {"group": name.split(".", 1)[1]}}
 
 
 def _addon_reads(crds, records, homes):
@@ -361,21 +362,74 @@ def _addon_reads(crds, records, homes):
 
 MANAGED = {"traefik": lambda s: s["ingress"].update(profile="managed-traefik"),
            "acme": lambda s: s["tls"].update(profile="managed-acme")}
+# Each add-on's CRD groups, as the pinned charts render them (traefik.io and
+# hub.traefik.io; cert-manager.io and acme.cert-manager.io) and as an earlier
+# Traefik chart did (traefik.containo.us), and the namespace it lives in.
+LEFTOVERS = {"traefik": ["ingressroutes.traefik.io", "accesscontrolpolicies.hub.traefik.io", "middlewares.traefik.containo.us"],
+             "acme": ["certificates.cert-manager.io", "orders.acme.cert-manager.io"]}
+HOMES = {"traefik": "gsj-ingress", "acme": "gsj-cert-manager"}
+OTHER = {"traefik": "acme", "acme": "traefik"}
+
+
+def _leftovers(addon, owner=OWNER):
+    return [_crd(name, owner) for name in LEFTOVERS[addon]]
 
 
 @pytest.mark.parametrize("profile", sorted(MANAGED))
-def test_leftover_add_on_crds_without_an_owner_record_are_refused_with_their_teardown(runtime, tmp_path, profile):
+def test_leftover_crds_of_the_selected_add_on_without_an_owner_record_are_refused_with_their_teardown(runtime, tmp_path, profile):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
     _site(work, MANAGED[profile])
-    crds = {"items": [_crd("ingressroutes.traefik.io"), _crd("middlewares.traefik.io")]}
-    homes = {"items": [{"metadata": {"name": "gsj-ingress"}}]}
-    line = _refusal(_checks(run, before=_addon_reads(crds, {"items": []}, homes)), state,
-                    "ingressroutes.traefik.io", "middlewares.traefik.io", "gsj-ingress", "helm -n gsj-ingress uninstall",
-                    "kubectl delete namespace gsj-ingress", "kubectl get ingressroutes.traefik.io -A",
-                    "kubectl delete customresourcedefinition ingressroutes.traefik.io middlewares.traefik.io",
+    names, home = LEFTOVERS[profile], HOMES[profile]
+    line = _refusal(_checks(run, before=_addon_reads({"items": _leftovers(profile)}, {"items": []},
+                                                     {"items": [{"metadata": {"name": home}}]})), state,
+                    *names, f"add-on namespace: {home}", f"helm -n {home} uninstall", f"kubectl delete namespace {home}",
+                    f"kubectl get {names[0]} -A", "kubectl delete customresourcedefinition " + " ".join(names),
                     "deletes nothing")
     assert line.startswith("GSJ: managed add-on CustomResourceDefinitions"), line
+
+
+@pytest.mark.parametrize("profile", sorted(MANAGED))
+def test_leftover_crds_of_an_add_on_the_site_does_not_select_are_named_in_a_log_line_and_passed(runtime, tmp_path, profile):
+    """managed_helm_addon collides only with the CRDs of the chart it renders,
+    so the other add-on's leftovers stop nothing: they are named, with the same
+    teardown, and the run goes on."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _site(work, MANAGED[profile])
+    other = OTHER[profile]
+    names, home = LEFTOVERS[other], HOMES[other]
+    result = _checks(run, before=_addon_reads({"items": _leftovers(other)}, {"items": []},
+                                              {"items": [{"metadata": {"name": home}}]}))
+    _admitted(result, state)
+    line = [l for l in result.stderr.splitlines() if "CustomResourceDefinitions" in l][-1]
+    for word in (*names, "does not select", "The run goes on", f"add-on namespace: {home}", f"helm -n {home} uninstall",
+                 f"kubectl delete namespace {home}", f"kubectl get {names[0]} -A",
+                 "kubectl delete customresourcedefinition " + " ".join(names), "deletes nothing"):
+        assert word in line, (word, line)
+
+
+def test_a_managed_traefik_site_refuses_leftover_traefik_crds_and_only_names_leftover_cert_manager_ones(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _site(work, MANAGED["traefik"])
+    crds = {"items": _leftovers("traefik") + _leftovers("acme", owner="b" * 40)}
+    result = _checks(run, before=_addon_reads(crds, {"items": []}, {"items": [{"metadata": {"name": "gsj-ingress"}}]}))
+    line = _refusal(result, state, *LEFTOVERS["traefik"],
+                    "kubectl delete customresourcedefinition " + " ".join(LEFTOVERS["traefik"]))
+    assert not any(name in line for name in LEFTOVERS["acme"]), line
+    assert all(name in result.stderr for name in LEFTOVERS["acme"]), result.stderr
+
+
+def test_a_group_that_only_ends_in_the_same_letters_is_not_the_add_on_s(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    _site(work, MANAGED["traefik"])
+    _site(work, MANAGED["acme"])
+    crds = {"items": [_crd("widgets.nottraefik.io"), _crd("issuers.example-cert-manager.io")]}
+    result = _checks(run, before=_addon_reads(crds, {"items": []}, {"items": []}))
+    _admitted(result, state)
+    assert "widgets.nottraefik.io" in result.stderr and "no add-on namespace is left" in result.stderr, result.stderr
 
 
 def test_add_on_crds_whose_owner_record_exists_pass(runtime, tmp_path):
