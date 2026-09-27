@@ -19,7 +19,7 @@ url_origin() { local rest=${1#*://}; printf '%s://%s' "${1%%://*}" "${rest%%/*}"
 url_origin_only() {
  # scheme://host[:port] of a URL, the path, query, fragment AND any userinfo
  # dropped: a credential can sit in any of them, and a log line or a record
- # names the endpoint, never what it carries [review B2]. Not a URL: printed
+ # names the endpoint, never what it carries. Not a URL: printed
  # as it is (no scheme). A URL whose authority is not a host and a numeric
  # port -- a password with an unencoded "/" cut the authority short, a
  # bracketless IPv6 -- is named by the fixed words below, never repeated.
@@ -37,14 +37,13 @@ known_word() {
  # condition type or reason, a PersistentVolume phase -- is repeated only
  # when it is one of the values this installer knows: the API does not
  # constrain a reason string, so anything else (a crafted status, a value a
- # newer API adds) becomes the fixed word "other" [review sweep B2,
- # review sweep B2]. Usage: known_word VALUE KNOWN...
+ # newer API adds) becomes the fixed word "other". Usage: known_word VALUE KNOWN...
  local value=$1 word; shift
  for word in "$@"; do [[ $value == "$word" ]] && { printf '%s' "$value"; return; }; done
  printf 'other'
 }
 validator_words() {
- # validate.jq's stderr, made printable [review B2]. The validator's OWN
+ # validate.jq's stderr, made printable. The validator's OWN
  # line (`field: reason`, no quote, brace or bracket in it) passes through
  # with the line jq reported; a jq diagnostic -- a type error quotes the
  # input it choked on, a compile error the program -- is named by its line
@@ -68,7 +67,7 @@ pull_failure_condition() {
  # kubelet retries, and words this installer does not classify, which a
  # retry may clear. The message itself is untrusted text -- a registry or
  # a proxy composes it, a bearer can ride in it -- and is never repeated
- # [review B2]; it is kept in the state directory for the operator.
+ # It is kept in the state directory for the operator.
  local m; m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
  case $m in
    *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'definitive\tthe registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
@@ -84,7 +83,7 @@ pull_failure_condition() {
 kubectl_failure_condition() {
  # The same rule for kubectl's stderr on a refused create: classified, kept,
  # never repeated (an admission webhook's message is whatever its author
- # wrote) [review B2].
+ # wrote).
  local m; m=$(tr '[:upper:]' '[:lower:]' < "$1")
  case $m in
    *podsecurity*|*"admission webhook"*|*"denied the request"*|*admission*) printf 'an admission policy refused it';;
@@ -360,7 +359,7 @@ require_offline_render() {
  (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "this step serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools=helm (this release's pinned Helm 4 for this run only, beside your own kubectl and jq)."
 }
 helm_verb_preflight() {
- # THE HELM 4 VERBS, refused in the first seconds [review B3] -- after the
+ # THE HELM 4 VERBS, refused in the first seconds -- after the
  # clients are known and the site is read, before the cluster is read and
  # before the Lease. Four paths reach the offline render above (the sites of
  # require_offline_render, all four): addon-repair always
@@ -523,7 +522,7 @@ validate_site() {
  fi
  # The top-level shape, named before the merge: a site whose whole value is
  # a string or a list would reach `.[0] * .[1]`, and jq's diagnostic for
- # that quotes the value -- a secret pasted in the wrong place [review B2].
+ # that quotes the value -- a secret pasted in the wrong place.
  local shape; shape=$(jq -r type "$CONFIG")
  [[ $shape == object ]] || fail "the site file must be a JSON object at the top level, and $CONFIG holds a $shape. Its contents are not repeated here; the payload's site.schema.json is the field reference"
  if ! { jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE"; } 2> "$GSJ_WORK/validate.err"; then
@@ -648,7 +647,7 @@ wizard() {
  mkdir -p "$(dirname "$CONFIG")"; WIZARD="$GSJ_WORK/wizard.json"
  if [[ -f $CONFIG ]]; then
    # the saved site's shape first: a string or a list would reach the merge,
-   # whose diagnostic quotes the value [review sweep B2]
+   # whose diagnostic quotes the value
    local shape; shape=$(jq -r type "$CONFIG" 2>/dev/null || printf 'value that is not valid JSON')
    [[ $shape == object ]] || fail "the saved site file must be a JSON object at the top level, and $CONFIG holds a $shape. Its contents are not repeated here"
    jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" > "$WIZARD"
@@ -690,7 +689,7 @@ wizard() {
  # Validate to a private file first: a refused answer must never replace the
  # saved site with an empty one, and the refusal is a named one.
  if ! jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$WIZARD" > "$GSJ_WORK/wizard-validated.json" 2> "$GSJ_WORK/validate.err"; then
-   # the validator's own line passes; a jq diagnostic is kept, never printed [review B2]
+   # the validator's own line passes; a jq diagnostic is kept, never printed
    local kept; kept="$(dirname "$CONFIG")/.gsj"; mkdir -p "$kept"; chmod 700 "$kept"; atomic "$kept/site-refusal.err" < "$GSJ_WORK/validate.err"
    words=$(validator_words "$GSJ_WORK/validate.err" "$kept/site-refusal.err")
    # The effective site is the saved file merged with these answers; a refused
@@ -777,7 +776,7 @@ inspect_cluster() {
  # url_origin_only, the one function -- the hand-made cut before it dropped
  # the userinfo, the scheme and the path and KEPT the query and the fragment
  # (an init report carried `proxy.example?REVIEW_PROXY_QUERY_SECRET`)
- # [review B2]. A proxy variable may omit its scheme: one is lent for
+ #. A proxy variable may omit its scheme: one is lent for
  # the parse and taken back, so the field keeps its host[:port] shape; an
  # authority that is not a host is named by the function's fixed words.
  local proxy_set proxy_origin=''
@@ -2091,7 +2090,7 @@ sweep_target() {
      if (( age < 0 )); then renewed="its renewal time is ahead of this clock by $(( -age )) s, a clock skew between the renewing host and this one"; else renewed="renewed $age s ago"; fi
      if (( age < 180 )); then live=" -- and it is still live: abandon takes a Lease only after 180 s unrenewed, so if no installer process is running against this target, wait $(( 180 - age )) s first"; fi
      # the holder is printed only when it is an operation id this installer
-     # writes; a foreign Lease's text is not repeated [review sweep B2]
+     # writes; a foreign Lease's text is not repeated
      local shown=$holder; [[ $holder =~ ^[a-f0-9]{24}$ ]] || shown='<a holder identity this installer did not write>'
      fail "the operation Lease is held by $shown ($renewed); sweep clears only what abandon cannot: run abandon --operation $shown --reason ... first$live"
    fi
@@ -2769,7 +2768,7 @@ PY
    [[ -n $never || $phase == Succeeded || $phase == Failed ]] || never="wait ${phase:-unknown}"
    # the reason and the phase are the API's words; the message is never read
    # here, and only a value this installer KNOWS is repeated -- any other
-   # reason is "other" [review sweep B2]
+   # reason is "other"
    case ${never%% *} in
      '') ;;                                        # the Pod ended between the last poll and the snapshot: the phase is the verdict
      pull) never="pull $(known_word "${never#* }" ErrImagePull ImagePullBackOff ErrImageNeverPull ImageInspectError InvalidImageName RegistryUnavailable)";;
@@ -2813,7 +2812,7 @@ PY
    elif ! $logs_read; then note=" The storage check itself passed (its Pod ended Succeeded), though its measurements could not be read (kubectl logs failed)."
    fi
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-   [[ -z $phase ]] || phase=$(known_word "$phase" Pending Available Bound Released Failed)   # a phase this installer knows, or "other"; unreadable stays unknown [review sweep B2]
+   [[ -z $phase ]] || phase=$(known_word "$phase" Pending Available Bound Released Failed)   # a phase this installer knows, or "other"; unreadable stays unknown
    # After the backup a check whose Pod ended Failed (it started, and its own
    # asserts did not hold) is the backend's to correct, and resume will not
    # repeat the check: both refusals say so. A Pod that never ran is not that.
@@ -3220,7 +3219,7 @@ relocated_images_probe() {
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
  # registry.base has no scheme (the schema holds it to host[:port][/path]), so
  # url_origin_only prints it as it is: routed like every printed address, so
- # the URL scan's alias rule sees the wrapper [review B2]
+ # the URL scan's alias rule sees the wrapper
  if [[ -n $base ]]; then where="registry.base ($(url_origin_only "$base"))"
  elif [[ -n $recorded ]]; then where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"
  else where="the release's own repositories"; fi
@@ -3315,7 +3314,7 @@ relocated_images_probe() {
    elif (( spent >= bound )); then refuse=deadline; fi
    if [[ -n $refuse ]]; then
      # the Pod's status, kept 0600 for the operator: the runtime's own words
-     # and the scheduler's live there, never in the refusal [review B2]
+     # and the scheduler's live there, never in the refusal
      printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
      # The same ImagePullBackOff comes from a changed site (a wrong base, digest or
      # pull Secret: a repair after the correction) and from the node's side (a
@@ -3374,7 +3373,7 @@ relocated_images_probe() {
      # the conditions' types and REASONS, each repeated only when it is a
      # value this installer knows (the API does not constrain a reason
      # string); their messages are the scheduler's free text and are kept,
-     # never repeated [review sweep B2]
+     # never repeated
      local conditions='' ctype creason
      while IFS=$'\t' read -r ctype creason; do
        [[ -n $ctype ]] || continue
@@ -4816,7 +4815,7 @@ installation_summary() {
  # schema) -- goes through url_origin_only, the one function: the origin,
  # never a path, query or userinfo (a path segment is schema-valid and can
  # carry a credential). The full values stay in site.json beside it
- # [review B2].
+ #.
  jq -n --slurpfile site "$SITE" --slurpfile release "$GSJ_PAYLOAD/release.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg chart "$(sha_file "$GSJ_PAYLOAD/chart.tgz")" --arg operation "$OPERATION" --arg record "$STATE_DIR/installed.json" --arg report "$STATE_DIR/verification.json" \
    --arg public_url "$(url_origin_only "$(j '.public_url // ""')")" --arg llm_url "$(url_origin_only "$(j '.llm.base_url // ""')")" --arg ocr_url "$(url_origin_only "$(j '.ocr.url // ""')")" --arg vectors_url "$(url_origin_only "$(j '.corpus.vectors_url // ""')")" --arg offbox_url "$(url_origin_only "$(j '.backup.offbox_url // ""')")" --arg acme_server "$(url_origin_only "$(j '.tls.acme_server // ""')")" '
    $site[0] as $s | $release[0] as $r | $verification[0] as $v |

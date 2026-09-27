@@ -357,7 +357,7 @@ def test_after_the_backup_every_storage_hint_says_resume_does_not_repeat_the_che
 
 
 def test_a_crafted_reason_or_phase_is_cut_to_its_enum_word(tmp_path):
-    """review sweep B2: the never-ran refusal printed the Pod's waiting
+    """a review finding: the never-ran refusal printed the Pod's waiting
     reason, its PodScheduled reason or its phase -- enum words from the API,
     but taken as they came. The review's minor: stripping to
     letters and digits still let an arbitrary alphanumeric reason through

@@ -144,7 +144,7 @@ def test_a_digest_mismatch_names_the_image_and_both_digests_through_the_cli(modu
 
 
 def real_or_stubbed_expected_checks(module, monkeypatch):
-    """Review finding N2: three upgrade-mode tests stubbed
+    """A review finding: three upgrade-mode tests stubbed
     expected_checks() unconditionally, so the hand-run gate -- with the
     pinned Git objects present -- never ran the real check-list read in
     them. The stub is now the public CI's alone (no Git directory carries
@@ -399,7 +399,7 @@ def test_failed_delivery_preflight_prevents_source_install_or_cluster_mutation(m
 def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp_path, monkeypatch, failure):
     import base64
     module = modules[1]
-    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (a review finding)
     if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     target = tmp_path / "candidate"
     target.mkdir()
@@ -464,7 +464,7 @@ def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp
 @pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM])
 def test_cancellation_signal_saves_interruption_before_owned_cleanup(modules, tmp_path, monkeypatch, number):
     module = modules[1]
-    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (a review finding)
     if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     target = tmp_path / "candidate"
     target.mkdir()
@@ -524,7 +524,7 @@ def test_populated_hard_restart_kills_web_runner_and_mcp_with_proven_sigkill(mod
     import httpx
     import hardfault
     module = modules[1]
-    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (a review finding)
     if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     images = {role: {"repository": "example.test/" + role, "digest": "sha256:" + "a" * 64}
               for role in ("web", "runner", "mcp", "forgejo", "chroma", "decisionsData")}

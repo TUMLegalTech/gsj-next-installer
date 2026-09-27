@@ -344,7 +344,7 @@ def test_a_registry_that_does_not_hold_the_digest_is_refused_by_the_condition_th
     assert "registry.base (" + BASE + ")" in result.stderr
     assert "1 of 6 images" in result.stderr
     assert "does not hold" in result.stderr and "manifest unknown" not in result.stderr, \
-        "the cause is the CONDITION the runtime's message establishes, never its words (review finding B2)"
+        "the cause is the CONDITION the runtime's message establishes, never its words (a review finding)"
     assert "Helm has applied nothing in this run" in result.stderr, (
         "true on every chain; 'nothing was applied' was false on a repair of a quiesced deployment")
     assert (work / "deletes").exists(), "the probe Pod is removed on refusal too"
@@ -361,7 +361,7 @@ def test_six_failures_are_one_fact_said_once_not_six_times(runtime, tmp_path):
     """Measured on a proof deployment: a wrong prefix fails all six, and
     containerd's message repeats the reference three times -- 2.5 KB of one fact.
     Every image is named; the condition the runtime reported is named once
-    (its words never: review finding B2, they are kept in the state directory)."""
+    (its words never: a review finding, they are kept in the state directory)."""
     run, _, work = runtime
     words = "rpc error: code = NotFound desc = failed to pull and unpack image: not found " * 3
     (work / "status.json").write_text(_statuses([{"waiting": {"reason": "ImagePullBackOff", "message": words}}] * 6))
@@ -411,7 +411,7 @@ def test_a_pod_that_never_settles_stops_at_the_dependency_deadline_with_its_cond
     _, result = _probe(run, work, tmp_path)
     assert result.returncode != 0
     assert "deadlines.dependencies_seconds" in result.stderr
-    # review sweep B2: the condition's REASON is named; the scheduler's message is kept, never repeated
+    # a review finding: the condition's REASON is named; the scheduler's message is kept, never repeated
     assert "PodScheduled: Unschedulable" in result.stderr and "didn't match Pod's node affinity/selector" not in result.stderr
     assert "didn't match Pod's node affinity/selector" in (work / "pull-probe-status.json").read_text()
 
@@ -488,7 +488,7 @@ def test_the_first_failure_s_words_survive_the_back_off_that_replaces_them(runti
     (work / "status-after-3.json").write_text(_statuses([PULLED] * 5 + [generic]))
     _, result = _probe(run, work, tmp_path)
     assert result.returncode != 0
-    assert "unauthorized" in result.stderr, "the informative message is the one classified (review finding B2: never quoted)"
+    assert "unauthorized" in result.stderr, "the informative message is the one classified (a review finding: never quoted)"
 
 
 def test_a_pod_evicted_before_its_pull_is_not_proof_of_a_pull(runtime, tmp_path):
@@ -523,7 +523,7 @@ def test_a_namespace_that_refuses_the_probe_pod_says_so_by_name(runtime, tmp_pat
         'create) cat >/dev/null; echo "pods \"gsj-pull\" is forbidden: violates PodSecurity restricted" >&2; return 1;;')
     result = run(prelude + "relocated_images_probe")
     assert result.returncode != 0
-    # review finding B2: the refusal names the class of the admission verdict, never kubectl's words (an
+    # a review finding: the refusal names the class of the admission verdict, never kubectl's words (an
     # admission webhook's message is whatever its author wrote); the words are kept in the state directory
     assert "could not be created" in result.stderr and "an admission policy refused it" in result.stderr
     assert "violates PodSecurity" not in result.stderr and "pull-probe-create.err" in result.stderr
@@ -670,7 +670,7 @@ def test_a_restore_continued_under_a_corrected_program_names_that_installer(runt
 
 
 def test_the_runtime_s_words_are_classified_and_never_repeated_bearer_included(runtime, tmp_path):
-    """Review finding B2 (the review's canary `registry-canary`): the refusal quoted
+    """A review finding (the review's canary `registry-canary`): the refusal quoted
     up to 600 characters of the kubelet's message -- untrusted text a
     registry or a proxy composes, which carried a synthetic Authorization
     bearer into the output. The refusal now names the CONDITION the message
@@ -723,7 +723,7 @@ def test_a_probe_pod_kubectl_could_not_create_is_named_without_kubectl_s_words(r
 
 
 def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(runtime, tmp_path):
-    """review sweep B2: the deadline refusal joined every False condition's
+    """a review finding: the deadline refusal joined every False condition's
     MESSAGE -- the scheduler's free text (a taint's key and value, a node's
     name). It now names the conditions' reasons (the API's enum words) and
     keeps the Pod's status in the state directory."""
@@ -747,7 +747,7 @@ def test_the_pull_deadline_names_the_conditions_reasons_never_their_messages(run
 
 
 def test_the_pull_deadline_maps_a_crafted_condition_to_the_word_other(runtime, tmp_path):
-    """review sweep B2: the deadline refusal joined every False condition's
+    """a review finding: the deadline refusal joined every False condition's
     MESSAGE -- the scheduler's free text (a taint's key and value, a node's
     name). It now names the conditions' reasons (the API's enum words) and
     keeps the Pod's status in the state directory."""
