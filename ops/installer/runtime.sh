@@ -2808,7 +2808,18 @@ compatibility() {
  jq -e --slurpfile actual "$GSJ_WORK/storage.json" '.storage == $actual[0]' "$GSJ_WORK/installed.json" >/dev/null || fail 'persistent storage identity changed; restore bindings before upgrading'
  local actual_ns; actual_ns=$(k get namespace "$NAMESPACE" -o json | jq -r .metadata.uid)
  [[ $(jq -r .namespace_uid "$GSJ_WORK/installed.json") == "$actual_ns" ]] || fail 'namespace was recreated; this is a recovery target, not an upgrade'
- if [[ $(jq -r .manifest.corpus.fingerprint "$GSJ_WORK/installed.json") != $(jq -r .corpus.fingerprint "$GSJ_PAYLOAD/release.json") && $(j .corpus.allow_update) != true ]]; then fail 'corpus change requires explicit corpus.allow_update=true and a pre-migration backup'; fi
+ local recorded; recorded=$(jq -r .manifest.corpus.fingerprint "$GSJ_WORK/installed.json")
+ if [[ $recorded != $(jq -r .corpus.fingerprint "$GSJ_PAYLOAD/release.json") ]]; then
+   [[ $(j .corpus.allow_update) == true ]] || fail 'corpus change requires explicit corpus.allow_update=true and a pre-migration backup'
+   # corpus.allow_update=true is consent for this one change. Under the Lease
+   # the admitted change is recorded on the operation, where a resume or a
+   # repair still finds it, and record_installed spends the consent once the
+   # change is complete; the read-only preview before the Lease records nothing.
+   if [[ ${LEASE_ACQUIRED:-false} == true && -n ${OPERATION:-} ]]; then
+     assert_owner
+     jq --arg from "$recorded" '.corpus_update_from=$from' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
+   fi
+ fi
 }
 # GSJ_RUNTIME_HELPER: capacity.py
 capacity_host_filesystems() {
@@ -4455,6 +4466,21 @@ record_ready() {
 
 record_installed() {
  assert_owner
+ # A corpus change this operation admitted (compatibility recorded it under
+ # the Lease) is complete once this record is written, and the consent that
+ # admitted it is spent: left true, the next release's corpus would be adopted
+ # without anyone being asked. The merged site is changed first, so the
+ # installed record carries false; the operator's file and the operation's
+ # saved site only after the operation is complete, because until then a
+ # resume compares them with the site its Helm target was compiled from. A
+ # file that is a link is never rewritten through it, and then nothing is:
+ # records that say false beside a file that says true would refuse every
+ # later backup as a settings change.
+ local corpus_reset=''
+ if jq -e --slurpfile release "$GSJ_PAYLOAD/release.json" '(.kind//"")!="restore" and (.corpus_update_from//"")!="" and .corpus_update_from!=$release[0].corpus.fingerprint' "$STATE_DIR/operation.json" >/dev/null && [[ $(j .corpus.allow_update) == true ]]; then
+   if [[ -f $CONFIG && ! -L $CONFIG ]]; then corpus_reset=rewrite; jq '.corpus.allow_update=false' "$SITE" | atomic "$SITE"
+   else corpus_reset=kept; fi
+ fi
  storage_identity > "$GSJ_WORK/storage.json"
  jq -n --slurpfile manifest "$GSJ_PAYLOAD/release.json" --slurpfile site "$SITE" --slurpfile storage "$GSJ_WORK/storage.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg operation "$OPERATION" --arg nsuid "$(k get namespace "$NAMESPACE" -o json | jq -r .metadata.uid)" '{format:"gsj.installed/1",manifest:$manifest[0],site:$site[0],storage:$storage[0],namespace_uid:$nsuid,operation:$operation,verification:{application:$verification[0],public:$public[0],network:$network[0]},status:"complete"}' | atomic "$GSJ_WORK/installed.json"
  k create configmap "$RELEASE-installed" --from-file="installed.json=$GSJ_WORK/installed.json" --dry-run=client -o json | jq --arg owner "$RELEASE" '.metadata.labels={"gsj.io/owner":$owner}' | k apply -f - >/dev/null
@@ -4463,6 +4489,18 @@ record_installed() {
  jq '.status="complete"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
  if [[ $(jq -r '.kind//""' "$STATE_DIR/operation.json") == restore && -f $STATE_DIR/restoration.json ]]; then
    jq '.status="complete"' "$STATE_DIR/restoration.json" | atomic "$STATE_DIR/restoration.json"
+ fi
+ if [[ -n $corpus_reset ]]; then
+   local change; change="$(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")"
+   if [[ $corpus_reset == rewrite ]]; then
+     # The file first: a stop between the two writes leaves the file and the
+     # installed record agreeing, which is what the next backup compares.
+     jq '.corpus.allow_update=false' "$CONFIG" | atomic "$CONFIG"
+     jq '.corpus.allow_update=false' "$STATE_DIR/site.pending.json" | atomic "$STATE_DIR/site.pending.json"
+     log "The corpus change this operation admitted is complete (fingerprint $change); corpus.allow_update is set back to false in $CONFIG, the operation's saved site and the installed record, so a later release's corpus change is refused until it is admitted again after its own pre-migration backup"
+   else
+     log "The corpus change this operation admitted is complete (fingerprint $change), but $CONFIG is a symbolic link or no longer a regular file, so corpus.allow_update stays true there and in the installed record: set it to false in the file the link names, or a later release's corpus change is admitted without being asked for"
+   fi
  fi
  installation_summary
 }
@@ -6428,7 +6466,9 @@ main() {
  if [[ $COMMAND == upgrade ]]; then [[ -s $GSJ_WORK/installed.json ]] && jq -e '.status=="complete"' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade requires a completed installed-release record'; fi
  compatibility; acquire
  # A preceding operation may have completed between the read-only preview
- # and acquiring the lease. Reconcile the actual source again under ownership.
+ # and acquiring the lease. Reconcile the actual source again under ownership;
+ # this call, not the preview, records an admitted corpus change on the
+ # operation for record_installed.
  compatibility
  # Before backup: backup quiesces a running deployment, and a refused pull must
  # leave what was running, running.

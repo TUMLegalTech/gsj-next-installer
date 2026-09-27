@@ -106,10 +106,10 @@ main upgrade {arguments} --config "$SITE" --non-interactive
     assert (work / "bootstrapped").exists() is admitted
 
 
-def _compatibility(runtime, fault=None, edit=None):
+def _compatibility(runtime, fault=None, edit=None, prefix=""):
     """Run the real compatibility gate against a synthetic completed source.
     `edit` changes the current site after the installed record was taken from
-    it."""
+    it; `prefix` runs before the gate (an owned Lease, for instance)."""
     run, kube, work = runtime
     payload = work / "payload"
     payload.mkdir(exist_ok=True)
@@ -155,7 +155,7 @@ def _compatibility(runtime, fault=None, edit=None):
         {"storage": {role: {"existingClaim": ""} for role in ("data", "forgejo", "chroma")}}))
     (work / "installed.json").write_text(json.dumps(installed))
     kube.write_text(json.dumps(cluster))
-    return run('GSJ_PAYLOAD="$TEST_WORK/payload"\ncompatibility selected\n')
+    return run(prefix + 'GSJ_PAYLOAD="$TEST_WORK/payload"\ncompatibility selected\n')
 
 
 @pytest.mark.parametrize("fault", [None, "corpus-allowed"])
@@ -302,3 +302,149 @@ capacity_scan_pod reader create before
     argv = (work / "scan-argv").read_text().splitlines()
     assert argv[argv.index("--minimum") + 1] == str(5 * 2 ** 30)
 
+
+# ---- corpus.allow_update is consent for one corpus change -----------------------
+
+OPERATION = "a" * 24
+OWNED = f'LEASE_ACQUIRED=true; OPERATION={OPERATION}\nassert_owner() {{ :; }}\n'
+
+
+def _allow_update(site):
+    site["corpus"]["allow_update"] = True
+
+
+@pytest.mark.parametrize("fault,owned,marked", [
+    ("corpus", True, True),     # the gate again under the operation's Lease
+    ("corpus", False, False),   # the read-only preview before the Lease
+    (None, True, False),        # the same corpus: a stale true admits nothing
+])
+def test_an_admitted_corpus_change_is_recorded_on_the_owned_operation(runtime, fault, owned, marked):
+    """The gate that admits a corpus change is the one place that knows the
+    installed corpus; under the Lease it records the admitted change on the
+    operation, which survives a resume, for record_installed to complete. It
+    changes no site file itself."""
+    _, _, work = runtime
+    before = {"operation": OPERATION, "target": "synthetic-release", "kind": "upgrade", "status": "owned"}
+    (work / "operation.json").write_text(json.dumps(before))
+    result = _compatibility(runtime, fault, edit=_allow_update, prefix=OWNED if owned else "")
+    assert result.returncode == 0, result.stderr
+    after = json.loads((work / "operation.json").read_text())
+    assert after == ({**before, "corpus_update_from": "c" * 64} if marked else before)
+    assert json.loads((work / "site.json").read_text())["corpus"]["allow_update"] is True
+
+
+def test_upgrade_records_the_corpus_change_in_its_second_gate_not_the_preview(runtime):
+    """main runs the gate twice: a read-only preview, then again once the Lease
+    is held. Only the second writes, and it writes to the new operation's
+    record, never to the completed operation the preview still sees."""
+    _, _, work = runtime
+    previous = {"operation": "b" * 24, "target": "synthetic-release", "kind": "upgrade", "status": "complete"}
+    (work / "operation.json").write_text(json.dumps(previous))
+    helpers = work / "payload" / "helpers"
+    helpers.mkdir(parents=True)
+    for name in ("verification-cleanup.sh", "startup-recovery.sh"):
+        (helpers / name).write_text("")
+    stubs = f'''GSJ_PAYLOAD="$TEST_WORK/payload"
+bootstrap() {{ :; }}; install_exit_traps() {{ :; }}; load_site() {{ :; }}; helm_verb_preflight() {{ :; }}
+inspect_cluster() {{ printf '{{}}\\n'; }}; preflight() {{ :; }}; endpoint_preflight() {{ :; }}; read_installed() {{ :; }}
+assert_owner() {{ :; }}
+acquire() {{ cp "$STATE_DIR/operation.json" "$TEST_WORK/seen-by-preview.json"; OPERATION={OPERATION}; LEASE_ACQUIRED=true
+  printf '{{"operation":"%s","target":"synthetic-release","kind":"upgrade","status":"owned"}}' "$OPERATION" > "$STATE_DIR/operation.json"; }}
+relocated_images_probe() {{ exit 94; }}
+main upgrade --expected-version v1.2.3 --config "$SITE" --non-interactive
+'''
+    result = _compatibility(runtime, "corpus-allowed", prefix=stubs)
+    assert result.returncode == 94, result.stderr
+    assert json.loads((work / "seen-by-preview.json").read_text()) == previous
+    assert json.loads((work / "operation.json").read_text()) == {
+        "operation": OPERATION, "target": "synthetic-release", "kind": "upgrade", "status": "owned",
+        "corpus_update_from": "c" * 64}
+
+
+def _record_installed(runtime, operation, link=False):
+    """record_installed with the fake: the installed ConfigMap is rendered by a
+    stand-in for `create --dry-run` and captured at apply."""
+    run, _, work = runtime
+    state = work / "state"
+    state.mkdir()
+    payload = work / "payload"
+    payload.mkdir()
+    release = _release()
+    release["corpus"]["fingerprint"] = "b" * 64
+    (payload / "release.json").write_text(json.dumps(release))
+    site = json.loads((work / "site.json").read_text())
+    site["corpus"]["allow_update"] = True
+    for path in (work / "site.json", state / "site.pending.json"):
+        path.write_text(json.dumps(site))
+    # the operator's own file stays narrow: only the one value changes
+    own = {"schema_version": "gsj.site/1", "target": {"context": "synthetic-context"},
+           "corpus": {"vectors_url": "", "allow_update": True}}
+    operator = work / "operator"
+    operator.mkdir()
+    config = operator / "site.json"
+    if link:
+        (operator / "kept-elsewhere.json").write_text(json.dumps(own))
+        config.symlink_to(operator / "kept-elsewhere.json")
+    else:
+        config.write_text(json.dumps(own))
+    for name in ("verification.json", "public-check.json", "network-check.json"):
+        (state / name).write_text("{}")
+    (state / "operation.json").write_text(json.dumps(
+        {"operation": OPERATION, "target": "synthetic-release", "kind": "upgrade", "status": "verifying", **operation}))
+    result = run(f'''STATE_DIR="$TEST_WORK/state"; GSJ_PAYLOAD="$TEST_WORK/payload"; CONFIG="$TEST_CONFIG"; OPERATION={OPERATION}
+assert_owner() {{ :; }}
+storage_identity() {{ printf '[]\\n'; }}
+installation_summary() {{ :; }}
+k() {{ case "$1" in
+  create) jq -n --arg name "$3" --rawfile record "${{4#--from-file=installed.json=}}" '{{apiVersion:"v1",kind:"ConfigMap",metadata:{{name:$name}},data:{{"installed.json":$record}}}}';;
+  apply) cat > "$TEST_WORK/applied.json";;
+  *) kubectl --context "$CONTEXT" --namespace "$NAMESPACE" "$@";;
+esac; }}
+record_installed
+''', TEST_CONFIG=str(config))
+    applied = json.loads(json.loads((work / "applied.json").read_text())["data"]["installed.json"])
+    places = {"site file": json.loads(config.read_text())["corpus"]["allow_update"],
+              "merged site": json.loads((work / "site.json").read_text())["corpus"]["allow_update"],
+              "saved operation site": json.loads((state / "site.pending.json").read_text())["corpus"]["allow_update"],
+              "installed record": applied["site"]["corpus"]["allow_update"],
+              "installed record kept here": json.loads((state / "installed.json").read_text())["site"]["corpus"]["allow_update"]}
+    return result, places, own, config
+
+
+def test_a_completed_corpus_change_sets_allow_update_back_to_false_everywhere(runtime):
+    """A site that set corpus.allow_update=true to admit one corpus change kept
+    it true, so the next release's corpus was adopted without being asked for.
+    Once the operation that made the change is recorded complete, the consent
+    is spent: the operator's file, the merged site, the operation's saved site
+    and the installed record all say false again, and one line says why."""
+    result, places, own, config = _record_installed(runtime, {"corpus_update_from": "c" * 64})
+    assert result.returncode == 0, result.stderr
+    assert places == dict.fromkeys(places, False), places
+    assert json.loads(config.read_text()) == {**own, "corpus": {**own["corpus"], "allow_update": False}}
+    assert "corpus.allow_update" in result.stderr and "set back to false" in result.stderr
+    _, _, work = runtime
+    assert json.loads((work / "state" / "operation.json").read_text())["status"] == "complete"
+
+
+@pytest.mark.parametrize("operation", [
+    {},                                                    # no corpus change in this operation
+    {"corpus_update_from": "b" * 64},                      # recorded, yet the corpus is this release's
+    {"kind": "restore", "corpus_update_from": "c" * 64},   # a restore never spends the consent
+], ids=["no-change", "same-corpus", "restore"])
+def test_allow_update_is_left_alone_unless_a_corpus_change_completed(runtime, operation):
+    result, places, _, _ = _record_installed(runtime, operation)
+    assert result.returncode == 0, result.stderr
+    assert places == dict.fromkeys(places, True), places
+    assert "corpus.allow_update" not in result.stderr
+
+
+def test_a_linked_site_file_keeps_allow_update_and_is_named(runtime):
+    """A site file that is a symbolic link is never rewritten through the link.
+    Changing the records alone would leave the file saying true and every later
+    backup refused as a settings change, so nothing is changed and the closing
+    log names the file for the operator to correct."""
+    result, places, _, config = _record_installed(runtime, {"corpus_update_from": "c" * 64}, link=True)
+    assert result.returncode == 0, result.stderr
+    assert places == dict.fromkeys(places, True), places
+    assert config.is_symlink()
+    assert "is a symbolic link or no longer a regular file" in result.stderr and str(config) in result.stderr
