@@ -1252,9 +1252,9 @@ ipv6_literal_ok() { # an IPv6 literal, an IPv4 octet regex -> 0 when the literal
 }
 resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what cannot be resolved here is said, not refused
  local key=$1 url=$2 scheme='' rest authority host port address shown ports p cidr cidrs=() literal=0
- # the character tests below read bytes, whatever the operator's locale: a
- # name is refused only for what no host can carry
- local LC_ALL=C
+ # the character tests below read bytes in the C locale (in a subshell, so
+ # the resolver keeps the operator's locale and its IDN encoding): a name is
+ # refused only for what no host can carry
  local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:.]+$' local_answer='^(127\.|169\.254\.|::1$|::$|[fF][eE][89aAbB]|0\.0\.0\.0$)' forbidden='[][[:space:][:cntrl:]/@?#\\]'
  ipv4="^$octet\.$octet\.$octet\.$octet$"
  # what a refusal or a log line names: the site key and, for the LLM, the OCR
@@ -1280,12 +1280,12 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  # a zone-scoped literal (fe80::1%eth0) is no address a policy can name; a
  # name may carry any byte a host can, and the resolver says what it is
  if (( literal )); then
-   [[ $host =~ $ipv4 || ( $host =~ $ipv6 && $host == *:* ) ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+   ( LC_ALL=C; [[ $host =~ $ipv4 || ( $host =~ $ipv6 && $host == *:* ) ]] ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
    if [[ $host == *:* ]]; then
      # the literal's grammar is checked here, not by the resolver: a machine
      # without IPv6 answers nothing for any IPv6 query, literal or not; what
      # the resolver does answer is the canonical form, and is taken
-     ipv6_literal_ok "$host" "$ipv4" || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+     ( LC_ALL=C; ipv6_literal_ok "$host" "$ipv4" ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
      if command -v getent >/dev/null 2>&1; then
        local parsed; parsed=$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1}')
        [[ -z $parsed ]] || host=$parsed
@@ -1294,7 +1294,7 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  fi
  if [[ $host =~ ^::[fF]{4}:(.*)$ ]]; then local mapped=${BASH_REMATCH[1]}; [[ $mapped =~ $ipv4 ]] && host=$mapped; fi
  if (( literal )); then :
- else [[ -n $host && ! $host =~ $forbidden ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"; fi
+ else ( LC_ALL=C; [[ -n $host && ! $host =~ $forbidden ]] ) || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"; fi
  for p in $ports; do
    { [[ $p =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )); } || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
  done
@@ -4199,7 +4199,7 @@ public_verify() {
 # public ADDRESS, which needs no name, counts as blocked on any outcome but a
 # completed connection, like every other canary; the Kubernetes API's
 # ClusterIP is among them, the canary any unpoliced pod reaches.
-GSJ_EGRESS_PROBE_PY='import json, socket, sys, time
+GSJ_EGRESS_PROBE_PY='import json, socket, ssl, sys, time
 import httpx
 spec = json.load(sys.stdin)
 out = {"answer": {}, "refuse": {}, "resolve": {}}
@@ -4207,7 +4207,13 @@ for name, url in spec["answer"].items():
     try:
         out["answer"][name] = {"http": httpx.get(url, timeout=10.0, follow_redirects=False).status_code}
     except Exception as exc:
-        out["answer"][name] = {"error": type(exc).__name__}
+        # a TLS-level failure is an answer: the endpoint was reached, and what
+        # it presents is the acceptance checks matter, not the policy
+        cause, tls = exc, False
+        while cause is not None and not tls:
+            tls = isinstance(cause, ssl.SSLError) or "SSL" in type(cause).__name__ or "certificate" in str(cause).lower()
+            cause = cause.__cause__ or cause.__context__
+        out["answer"][name] = {"tls": type(exc).__name__} if tls else {"error": type(exc).__name__}
 for name, target in spec["refuse"].items():
     started = time.monotonic()
     try:
@@ -4286,8 +4292,8 @@ network_verify() {
  # ... and only for an endpoint the applied values admit: a name curl
  # resolves here but the resolver could not is on no list, so the pod's
  # silence is the list's honesty, said in the log, not a policy failure
- [[ -z $llm ]] || { llm_state=silent; if endpoint_answers_here "${llm%/}/models"; then if endpoint_admitted llm.base_url "$llm"; then llm_state=working; else log "llm.base_url ($(url_origin_only "$llm")) answers this machine, but the applied outbound list carries no rule for it; the pod's answer is not held"; fi; fi; }
- [[ -z $ocr ]] || { ocr_state=silent; if endpoint_answers_here "$ocr"; then if endpoint_admitted ocr.url "$ocr"; then ocr_state=working; else log "ocr.url ($(url_origin_only "$ocr")) answers this machine, but the applied outbound list carries no rule for it; the pod's answer is not held"; fi; fi; }
+ [[ -z $llm ]] || { llm_state=silent; if endpoint_answers_here "${llm%/}/models"; then if endpoint_admitted llm.base_url "$llm"; then llm_state=working; else log "llm.base_url ($(url_origin_only "$llm")) answers this machine, but the applied outbound list carries no rule for its address nor for a proxy that routes it; the pod's answer is not held"; fi; fi; }
+ [[ -z $ocr ]] || { ocr_state=silent; if endpoint_answers_here "$ocr"; then if endpoint_admitted ocr.url "$ocr"; then ocr_state=working; else log "ocr.url ($(url_origin_only "$ocr")) answers this machine, but the applied outbound list carries no rule for its address nor for a proxy that routes it; the pod's answer is not held"; fi; fi; }
  jq -n --arg release "$RELEASE" --arg node "$node" --arg llm "$llm" --arg ocr "$ocr" '
    {answer:({forgejo:"http://\($release)-forgejo:3000/api/healthz", chroma:"http://\($release)-chroma:8000/api/v2/heartbeat"}
             + (if $llm != "" then {llm:(($llm|sub("/+$";""))+"/models")} else {} end)
@@ -4301,7 +4307,7 @@ network_verify() {
  probe=$(k exec -i "$pod" -c gsj-web -- python -c "$GSJ_EGRESS_PROBE_PY" egress-probe < "$GSJ_WORK/egress-spec.json") || fail "the outbound probe did not run in the application pod (exit $?)"
  jq -e 'type=="object" and (.answer|type=="object") and (.refuse|type=="object") and (.resolve|type=="object")' <<< "$probe" >/dev/null 2>&1 || fail 'the outbound probe in the application pod reported nothing readable'
  printf '%s' "$probe" | atomic "$STATE_DIR/egress-probe.json"
- unreached=$(jq -r --arg llm_ok "$llm_state" --arg ocr_ok "$ocr_state" '[.answer|to_entries[]|select(.value.http==null)|select(.key!="llm" or $llm_ok=="working")|select(.key!="ocr" or $ocr_ok=="working")|.key]|join(", ")' "$STATE_DIR/egress-probe.json")
+ unreached=$(jq -r --arg llm_ok "$llm_state" --arg ocr_ok "$ocr_state" '[.answer|to_entries[]|select(.value.http==null and .value.tls==null)|select(.key!="llm" or $llm_ok=="working")|select(.key!="ocr" or $ocr_ok=="working")|.key]|join(", ")' "$STATE_DIR/egress-probe.json")
  [[ -z $unreached ]] || fail "NetworkPolicy: the gsj pod did not reach $unreached, which its outbound policy must admit (the probe's outcome is in $STATE_DIR/egress-probe.json)"
  reached=$(jq -r '[.refuse|to_entries[]|select(.value.connected==true)|.key]|join(", ")' "$STATE_DIR/egress-probe.json")
  [[ -z $reached ]] || fail "NetworkPolicy outbound deny was not enforced: the gsj pod connected to $reached, which its outbound policy must refuse (the probe's outcome is in $STATE_DIR/egress-probe.json)"
@@ -4332,14 +4338,20 @@ network_verify() {
      egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
              isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
 }
-endpoint_admitted() { # site key, URL -> 0 when the applied values carry a rule for it, or the chart derives one (an IPv4 literal)
- local rest authority host want
+endpoint_admitted() { # site key, URL -> 0 when the applied values admit the pod's dial: an IPv4 literal the chart derives, an address the name resolves to now (any one, since answer sets rotate), or the proxy the site routes the scheme through
+ local rest authority host want proxy='' pfile
  rest=${2#*://}; authority=${rest%%[/?#]*}; authority=${authority##*@}
  if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; else host=${authority%%:*}; fi
  [[ ! $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+ pfile=$(j '.trust.proxy_file // ""')
+ if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && proxy=$(jq -r --arg url "$2" 'if ($url|startswith("https://")) then (.HTTPS_PROXY // "") else (.HTTP_PROXY // "") end' "$pfile" 2>/dev/null); fi
+ if [[ -n $proxy ]]; then
+   want=$(resolve_endpoint trust.proxy_file "$proxy" 2>/dev/null | jq -s '.') && [[ $want != '[]' ]] \
+     && jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1 && return 0
+ fi
  want=$(resolve_endpoint "$1" "$2" 2>/dev/null | jq -s '.') || return 1
  [[ $want != '[]' ]] || return 1
- jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | all($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1
+ jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | any($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1
 }
 endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s, dialled as the pod dials it
  # the pod dials it with the site's CA bundle, through the site's proxy and

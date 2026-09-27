@@ -64,7 +64,9 @@ install still completes: the checks that need the missing endpoint are skipped,
 the closing line says **PARTIAL** and names them with the reason, and the product
 runs without that capability — scanned pages are not read, or the agent cannot
 answer — until you set the endpoint and run `install` again (the LLM can also be
-set per case, in the lawyer's Einstellungen). Skipping is never quiet and never
+set per case, in the lawyer's Einstellungen — under the closed outbound list
+only an origin whose address is on the list, an `llm.allowed_origins` entry,
+is reachable). Skipping is never quiet and never
 a setting: an endpoint that is configured and answers is always exercised, and
 must pass. **Your OCR endpoint must be able to read an image**, further down
 this step, has the probe and the reasons. It need not be a second server: nothing in the site file ties `ocr.*` to `llm.*`, so if the
@@ -1241,7 +1243,8 @@ The install is complete either way — `backup` and `upgrade` work on it — but
 a partial verification has not exercised the agent, the scanned-page path, or
 both — whichever the skipped checks name. To close it: do what the closing
 line names for each reason — set an absent endpoint in the site file (an LLM
-chosen per case under Einstellungen serves that case, but the acceptance
+chosen per case under Einstellungen serves that case when its origin is on
+the outbound list, an `llm.allowed_origins` entry, but the acceptance
 probes only the site's endpoint), make a configured one answer, make it accept
 the request, or replace one that does not read images — and run `install`
 again from the same site file; the run converges on what exists and re-runs

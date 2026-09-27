@@ -3675,6 +3675,43 @@ def test_the_pod_side_answer_is_held_only_for_an_endpoint_the_applied_values_adm
     (work / "values.pending.json").write_text(json.dumps(values))
     result = run(NETWORK_VERIFY)
     assert result.returncode == 0, result.stderr
-    assert "llm.base_url (https://llm.example) answers this machine, but the applied outbound list carries no rule for it; the pod's answer is not held" in result.stderr
+    assert "llm.base_url (https://llm.example) answers this machine, but the applied outbound list carries no rule for its address nor for a proxy that routes it; the pod's answer is not held" in result.stderr
     record = json.loads((work / "network-check.json").read_text())
     assert record["egress"]["asserted"] == {"llm": False, "ocr": True, "isolation": True}
+
+
+def test_the_pod_side_answer_is_held_for_a_proxied_endpoint_and_a_tls_level_answer_counts(runtime):
+    """On a proxied site the pod dials the proxy, not the endpoint: the dial
+    is admitted by the proxy's rule on the list, so the assertion is held
+    whatever the endpoint's own address. And a TLS-level answer from the
+    pod (a certificate the pod does not trust) proves the policy admitted
+    the dial: it is an answer to this check, the trust is the acceptance's."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1, egress_rules=[{"match": "egress-probe", "code": 0, "stdout": json.dumps(_closed_egress_probe(answer={"llm": {"tls": "ConnectError"}}))}])
+    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": ""}))
+    site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = "proxies.json"
+    (work / "site.json").write_text(json.dumps(site))
+    values = json.loads((work / "values.pending.json").read_text())
+    proxy = "203.0.113.%d/32" % (sum(b"proxy.example") % 200 + 10)
+    values["networkPolicy"]["egress"]["endpoints"] = [{"cidr": proxy, "port": 3128}]   # the proxy alone: the endpoints' own addresses are not on the list
+    (work / "values.pending.json").write_text(json.dumps(values))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode == 0, result.stderr
+    assert "carries no rule" not in result.stderr
+    record = json.loads((work / "network-check.json").read_text())
+    assert record["egress"]["asserted"] == {"llm": True, "ocr": True, "isolation": False}
+    assert record["egress"]["gsj"]["answer"]["llm"] == {"tls": "ConnectError"}
+
+
+def test_the_resolver_keeps_the_operators_locale_for_a_unicode_name(runtime, tmp_path):
+    """The byte tests run in the C locale in a subshell; the resolver is
+    handed the name under the operator's own locale, so a Unicode name
+    reaches it as written."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    site = json.loads((work / "site.json").read_text()); site["llm"]["base_url"] = "https://münchen.example/v1"
+    (work / "site.json").write_text(json.dumps(site, ensure_ascii=False))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload), LC_ALL="de_DE.UTF-8")
+    assert result.returncode == 0, result.stderr
+    assert "münchen.example" in json.loads(state.read_text())["resolved"]
+    assert {"cidr": "203.0.113.%d/32" % (sum("münchen.example".encode()) % 200 + 10), "port": 443} in json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
