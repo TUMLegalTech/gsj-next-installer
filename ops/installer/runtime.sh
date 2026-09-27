@@ -5911,13 +5911,24 @@ restore_archive() {
    # names it complete, abandoned or swept (abandon and sweep mark it after
    # writing their own records), or names a later operation, which acquire
    # admits only after this one ended. Any other checkpoint keeps the refusal.
-   local prior
+   local prior ended=''
    prior=$(jq -r 'select(.status=="complete")|.operation|select(type=="string" and test("^[a-f0-9]{24}$"))' "$STATE_DIR/restoration.json" 2>/dev/null) || prior=''
    if [[ -n $prior && -f $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json && -f $STATE_DIR/operation.json && ! -L $STATE_DIR/operation.json && ! -L $STATE_DIR/restore-$prior ]] &&
      jq -e --arg op "$prior" '.operation!=$op or (.status|IN("complete","abandoned","swept"))' "$STATE_DIR/operation.json" >/dev/null 2>&1; then
      mkdir -p "$STATE_DIR/restore-$prior"; mv "$STATE_DIR/restoration.json" "$STATE_DIR/restore-$prior/retired-restoration.json"
      log "Retired the completed restore checkpoint of ended operation $prior to $STATE_DIR/restore-$prior/retired-restoration.json; this restore records its own"
    fi
+   # An unfinished checkpoint stays: it is its operation's own evidence. The
+   # refusal below names restore-repair and resume, which continue it; once the
+   # canonical record names that operation abandoned or swept, both refuse it,
+   # so the refusal names the one route left, a fresh restore from a new site
+   # directory. restore_fresh_route names the operation to abandon, and this
+   # run holds none yet, so it names that one.
+   if [[ -f $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json && -f $STATE_DIR/operation.json && ! -L $STATE_DIR/operation.json ]]; then
+     prior=$(jq -r 'select(.status!="complete")|.operation' "$STATE_DIR/restoration.json" 2>/dev/null) || prior=''
+     [[ ! $prior =~ ^[a-f0-9]{24}$ ]] || ended=$(jq -r --arg op "$prior" 'select(.operation==$op)|.status' "$STATE_DIR/operation.json" 2>/dev/null) || ended=''
+   fi
+   [[ ! $ended =~ ^(abandoned|swept)$ ]] || fail "restore checkpoint already exists for operation $prior, which was $ended before its restore completed, so restore-repair and resume refuse it; keep this site directory as it is, and restore $(OPERATION=$prior restore_fresh_route)"
    [[ ! -e $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json ]] || fail 'restore checkpoint already exists; use restore-repair --operation ID for its recorded resource/file phase or resume for application startup'
  fi
  [[ -n $ARCHIVE ]] || fail 'restore requires --archive BACKUP.tar.gz.enc'

@@ -598,8 +598,8 @@ def test_a_fresh_restore_retires_the_completed_checkpoint_of_an_ended_restore(ru
 
 
 @pytest.mark.parametrize("checkpoint,canonical", [
-    ("files-restored", (PRIOR, "abandoned")),   # an unfinished restore: its own evidence
-    ("restoring-files", (PRIOR, "swept")),
+    ("files-restored", (PRIOR, "verifying")),   # an unfinished restore whose operation has not ended
+    ("restoring-files", None),
     ("complete", (PRIOR, "verifying")),         # its operation has not ended
     ("complete", None),                         # nothing proves it ended
 ])
@@ -611,6 +611,32 @@ def test_any_other_restore_checkpoint_still_refuses_a_fresh_restore(runtime, tmp
     result = invoke()
     assert result.returncode != 0
     assert "restore checkpoint already exists; use restore-repair --operation ID" in result.stderr, result.stderr
+    assert (work / "restoration.json").read_bytes() == original
+    assert not (work / f"restore-{PRIOR}").exists()
+    assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
+                   for call in json.loads(state.read_text())["calls"])
+
+
+@pytest.mark.parametrize("checkpoint,ended", [("files-restored", "abandoned"), ("restoring-files", "swept")])
+def test_the_unfinished_checkpoint_of_an_ended_restore_names_a_fresh_restore_from_a_new_site_directory(runtime, tmp_path, checkpoint, ended):
+    """The unfinished checkpoint of a restore the operator has since abandoned
+    or swept still refuses a fresh restore from its site directory -- it is
+    that operation's own evidence -- but the refusal named restore-repair and
+    resume, and both refuse an ended operation. It names the route that is
+    left: this site directory kept as it is, and a restore from a new one."""
+    invoke, _ = _restore_fixture(runtime, tmp_path)
+    _, state, work = runtime
+    _prior_restore(work, checkpoint, (PRIOR, ended))
+    original = (work / "restoration.json").read_bytes()
+    result = invoke()
+    assert result.returncode != 0
+    route = ("into an empty namespace synthetic-namespace from a new site directory: on another cluster, or on this one "
+             f"once the deployment is removed (abandon --operation {PRIOR}, helm -n synthetic-namespace uninstall synthetic-release, sweep, "
+             "then delete namespace synthetic-namespace)")
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert refusal == (f"GSJ: restore checkpoint already exists for operation {PRIOR}, which was {ended} before its restore "
+                       f"completed, so restore-repair and resume refuse it; keep this site directory as it is, and restore {route}"), refusal
+    assert "use restore-repair" not in result.stderr
     assert (work / "restoration.json").read_bytes() == original
     assert not (work / f"restore-{PRIOR}").exists()
     assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
