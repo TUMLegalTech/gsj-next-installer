@@ -1070,6 +1070,25 @@ initializer_stop deadline-exceeded
     assert "Use resume" not in result.stderr
 
 
+@pytest.mark.parametrize("kind", ["install", "upgrade"])
+def test_a_failed_helm_apply_names_repair_instead_of_resume_on_exit(runtime, kind):
+    """A failed install or upgrade apply stops in phase applying, where resume
+    refuses (the target Helm revision has not completed) and repair re-applies
+    the saved target: the closing line names repair, as a restore's did."""
+    run, _, work = runtime
+    (work / "operation.json").write_text(json.dumps({"operation": "a" * 24, "kind": kind, "target": "synthetic-release", "status": "applying"}))
+    result = run('''GSJ_WORK="$TEST_WORK/throwaway"; mkdir -p "$GSJ_WORK"
+OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; CONFIG=/secure/site.json; LEASE_ACQUIRED=true; GSJ_PAYLOAD=/synthetic/payload
+install_exit_traps
+assert_owner() { :; }; sleep() { :; }; read_installed() { :; }; stage_operation_config() { :; }; helm_application_prepare() { :; }
+helm() { printf 'Error: UPGRADE FAILED: synthetic\\n' >&2; return 1; }
+helm_apply
+''')
+    assert result.returncode == 1 and "Helm provisioning failed" in result.stderr and "unbound variable" not in result.stderr, result.stderr
+    assert "Use repair --operation aaaaaaaaaaaaaaaaaaaaaaaa --config /secure/site.json --non-interactive after fixing the cause." in result.stderr, result.stderr
+    assert "Use resume" not in result.stderr
+
+
 @pytest.mark.parametrize("code", TERMINAL_CODES + ["chroma-unavailable", "writer-busy", "internal-error"])
 def test_initializer_stop_is_terminal_exactly_for_the_codes_acquire_admits(runtime, code):
     run, _, _ = runtime

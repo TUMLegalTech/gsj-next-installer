@@ -3865,7 +3865,11 @@ helm_apply() {
  local result=0; wait "$HELM_PID" || result=$?; HELM_PID=''
  if (( result != 0 )); then
    tail -n 25 "$STATE_DIR/helm.log" >&2
-   if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null; then RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after fixing the cause"; fi
+   # The operation stays in phase applying, where resume refuses (the target
+   # Helm revision has not completed) and repair re-applies the saved target:
+   # for an install or upgrade as for a restore. A startup continuation is not
+   # what a plain repair re-applies; it keeps its own recovery.
+   if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null || { [[ ${STARTUP_HELM_CONTINUATION:-false} != true ]] && jq -e '.kind=="install" or .kind=="upgrade"' "$STATE_DIR/operation.json" >/dev/null; }; then RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after fixing the cause"; fi
    fail 'Helm provisioning failed; persistent state was retained'
  fi
  helm_application_validate

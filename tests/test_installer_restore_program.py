@@ -555,11 +555,15 @@ def test_resume_of_a_failed_restore_revision_names_its_recovery(failed_helm, cas
     assert _hint(result).startswith(hint) if hint else _hint(result) == ''
 
 
-@pytest.mark.parametrize('kind', ['restore', 'install', 'upgrade'])
-def test_helm_apply_names_repair_only_for_a_restore_and_keeps_its_measured_capacity(runtime, kind):
+@pytest.mark.parametrize('kind', ['restore', 'install', 'upgrade', 'continuation'])
+def test_helm_apply_names_repair_for_a_failed_apply_and_keeps_a_restores_measured_capacity(runtime, kind):
+    # A failed apply stops in phase applying: resume refuses there (the target
+    # Helm revision has not completed) and repair re-applies the saved target,
+    # for an install or upgrade as for a restore. A startup continuation is
+    # not re-applied by a plain repair: it keeps its own recovery.
     run, _, work = runtime
     operation = 'd' * 24
-    put(work / 'operation.json', {'operation': operation, 'kind': kind, 'target': 'synthetic-release', 'status': 'applying'})
+    put(work / 'operation.json', {'operation': operation, 'kind': 'install' if kind == 'continuation' else kind, 'target': 'synthetic-release', 'status': 'applying'})
     result = run(f'''OPERATION={operation}; CONFIG=/synthetic/site.json
 trap 'printf "\\nRECOVERY_HINT=%s\\n" "${{RECOVERY_HINT:-}}" >&2' EXIT
 assert_owner() {{ :; }}; sleep() {{ :; }}; h() {{ return 3; }}
@@ -568,14 +572,18 @@ read_installed() {{ echo read-installed >> "$GSJ_WORK/actions"; : > "$GSJ_WORK/i
 capacity_qualify() {{ echo capacity >> "$GSJ_WORK/actions"; }}
 stage_operation_config() {{ echo staged >> "$GSJ_WORK/actions"; }}
 helm_application_prepare() {{ echo prepared >> "$GSJ_WORK/actions"; }}
+startup_helm_stage() {{ echo continued >> "$GSJ_WORK/actions"; }}
+{'STARTUP_HELM_CONTINUATION=true' if kind == 'continuation' else ''}
 helm_apply''')
     assert result.returncode == 1 and 'Helm provisioning failed' in result.stderr, result.stderr
     actions = (work / 'actions').read_text().split()
+    repair = f'repair --operation {operation} --config /synthetic/site.json --non-interactive after fixing the cause'
     if kind == 'restore':
-        assert actions == ['staged', 'prepared']
-        assert _hint(result) == f'repair --operation {operation} --config /synthetic/site.json --non-interactive after fixing the cause'
+        assert actions == ['staged', 'prepared'] and _hint(result) == repair
+    elif kind == 'continuation':
+        assert actions == ['continued'] and _hint(result) == ''
     else:
-        assert actions == ['read-installed', 'staged', 'prepared'] and _hint(result) == ''
+        assert actions == ['read-installed', 'staged', 'prepared'] and _hint(result) == repair
 
 
 @pytest.mark.parametrize('kind', ['restore', 'install', 'upgrade'])
