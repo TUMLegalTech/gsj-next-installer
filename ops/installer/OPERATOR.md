@@ -53,7 +53,7 @@ timeout, is long enough. What differs is *when*:
 | A registry that mandates a path prefix | nothing relocates the managed add-ons' images; with `registry.base` set, a preflight notice names the ones your profiles select | step 8: the notice in its first seconds, then an add-on whose Pods cannot pull |
 | An OCR endpoint that can read an image — **needed for scanned pages; the install completes without one** | the installer's own probe in its first minute (advisory), then acceptance, which **skips** `scanned-ingest-search` and says so when the endpoint is absent or does not read the test page from inside the cluster | step 8, first minute; step 9, hours in, for the verdict |
 | An LLM endpoint — **needed for the agent; the install completes without one** | the same probe, then acceptance, which skips `agent-turn-note-history` and `generated-document` when the endpoint is absent or does not answer the runner | step 8, first minute; step 9 |
-| NetworkPolicy | acceptance check `networkpolicy` | step 9, hours in |
+| NetworkPolicy | the installer's own deny/allow check, which stops the install after the corpus import and before acceptance runs; step 9's summary reports it as `networkpolicy` | step 8, hours in, once the corpus import is done |
 | Ingress controller | acceptance, for two of the three behaviours it needs — a near-cap upload and an event-stream cadence check assert them across it; a green install does not show that its **timeout** is long enough (measured, below) | step 9, hours in, for a body cap or a buffering proxy; for the timeout, an upload or a turn that dies at your proxy's limit, after the install has passed |
 
 The last row is the reason step 0 exists at all: the installer will happily
@@ -748,7 +748,9 @@ the payload carries.
 This is the most common way an install fails. The installer proves every pull
 of the release's six images on the storage node before it applies anything, so
 the failure stops an install in its first minutes, not hours in — but it stops
-it, and a stopped first install is an operation to abandon and start again.
+it. A stopped first install is abandoned and started again when the cure is a
+changed site file, and resumed once the node can pull when the cause was on
+the node; its closing line offers both.
 Prove it now, on the node that will actually carry the deployment — a green
 result on some other node proves nothing.
 
@@ -777,11 +779,13 @@ removes it. `Completed` is the pass. `ImagePullBackOff` or `ErrImagePull` is
 the failure this step exists to find; `ContainerCreating` means the pull was
 still running when the wait gave up — raise `--timeout` and paste the block
 again. A pull that takes minutes here is a warning for step 8 on a site that
-sets `registry.base`: the installer then waits for all six images, the corpus
-image included, only as long as `deadlines.dependencies_seconds` allows — 900 s
-by default — so on such a link raise it in the site file before you install
-([why](#make-your-nodes-able-to-pull-the-images)). Without `registry.base` the
-wait goes on past that deadline for up to `deadlines.initialization_seconds`
+sets `registry.base`, or has just dropped the one its installed deployment was
+recorded with: the installer then waits for all six images, the corpus image
+included, only as long as `deadlines.dependencies_seconds` allows — 900 s by
+default — so on such a link raise it in the site file before you install
+([why](#make-your-nodes-able-to-pull-the-images)). Without `registry.base`, on
+a site whose installed deployment had none either (a first install included),
+the wait goes on past that deadline for up to `deadlines.initialization_seconds`
 more. It waits instead of watching on purpose. Measured on bash 5.2: Ctrl-C
 ends the whole pasted block and discards whatever was pasted after it, so an
 interrupted watch leaves the Pod behind — and, in the credentialed probe below,
@@ -2537,14 +2541,17 @@ touches your disk:
 
 ```sh
 kubectl -n OTHER-NAMESPACE get secret NAME -o json \
-  | jq '{apiVersion, kind, type, data, metadata: {name: .metadata.name}}' \
+  | jq '{apiVersion, kind, type, data, metadata: {name: "TLS-SECRET"}}' \
   | kubectl -n TARGET-NAMESPACE create -f -
 ```
 
-The `jq` keeps the type and the two keys and drops everything that tied the
-object to its old namespace — its UID, resource version, labels, annotations
-and owner. A copy does not follow the original's renewals; copy it again when
-the original is renewed.
+`TLS-SECRET` is the name `tls.secret` gives: the copy is named for this site,
+whatever the original is called. The `jq` keeps the type and its data and drops
+everything that tied the object to its old namespace — its UID, resource
+version, labels, annotations and owner. A copy does not follow the original's
+renewals; copy it again when the original is renewed, with
+`kubectl -n TARGET-NAMESPACE replace -f -` as the last command, since `create`
+refuses a Secret that already exists (`AlreadyExists`).
 
 Before the Lease, an `install` or `upgrade` reads that Secret and refuses —
 before anything is written — one that does not exist (*"TLS Secret is
@@ -3268,9 +3275,11 @@ reset or storage relocation. A changed corpus requires explicit
 currently refused until both case and decision indexes have a qualified
 migration path.
 
-`corpus.allow_update=true` admits one corpus change, not every later one. Once
-the operation that completed that change — the upgrade, or the `resume` or
-`repair` that finished it — is recorded complete, the installer sets
+`corpus.allow_update=true` admits one corpus change, not every later one. When
+an `upgrade`, or an `install` run again over the installed release, admitted
+the change — the installed record named another corpus than this release's —
+then once that operation, or the `resume` or `repair` that finished it, is
+recorded complete, the installer sets
 `corpus.allow_update` back to `false` in the site file you gave it, in the
 operation's saved site and in the installed record, and says so in one line:
 *"The corpus change this operation admitted is complete (fingerprint … to …);
@@ -3284,7 +3293,14 @@ admitted is complete (fingerprint … to …), but … is a symbolic link or no
 longer a regular file, so corpus.allow_update stays true there and in the
 installed record: set it to false in the file the link names, or a later
 release's corpus change is admitted without being asked for"*; set it there
-yourself. A `true` with no corpus change, and a restore, leave it as it is.
+yourself. A `true` with no corpus change, and a restore, leave it as it is,
+and so does the repair after a `corpus-update-required` stop
+([below](#where-the-corpus-artifact-comes-from)): no upgrade or install
+admitted that change, so once the repair completes, set `corpus.allow_update`
+back to `false` yourself in the site file you gave it, then run `install`
+again from that file with the same installer, so that the installed record
+says `false` as well — until then a `backup` refuses the file as a settings
+change.
 
 The reset survives a stop. The installer marks it in the operation's record
 before it writes any of the three, so a run stopped after the operation is
@@ -3394,8 +3410,9 @@ recorded as its result; if it ever does not, it writes the
 **complete merged** site instead — every default spelled out — and logs that it
 did. (Releases before this one always wrote the complete site, and the
 interactive wizard still writes a complete file, because it builds the file for
-you.) A repair that completes a corpus change also sets `corpus.allow_update`
-back to `false` there, as above. The number is written *before* Helm applies the generation, so a repair
+you.) A repair that completes a corpus change an upgrade or an install admitted
+also sets `corpus.allow_update` back to `false` there, as above; the repair
+after a `corpus-update-required` stop does not. The number is written *before* Helm applies the generation, so a repair
 that stops ahead of the apply leaves your file naming a
 `corpus.repair_generation` the cluster is not yet running. Continue it with
 `resume --operation ID` and that file, which is exactly the saved configuration
@@ -3437,8 +3454,10 @@ storage identity…"*). If a later release changes a default
 inside one of them, write the installed value into your file explicitly.
 
 The installer stops waiting as soon as corpus initialization reports a
-terminal code, and prints the command to run. For an install or upgrade
-operation, `terminal-budget-exhausted`, `deadline-exceeded`,
+terminal code, and prints the command to run. It judges a code only from a
+Pod the release owns: a Pod it does not own that reports one is named in a log
+line on each poll, and that verdict is not judged; the wait goes on. For an
+install or upgrade operation, `terminal-budget-exhausted`, `deadline-exceeded`,
 `checkpoint-identity-mismatch` and `gsj-corpus:source-verification-failed`
 need the named repair above, without `--to`.
 `gsj-copy:source-verification-failed` means the release's corpus image
@@ -3570,8 +3589,10 @@ re-derive these vectors, refreshing a corpus means a new tag here, a new
 manifest, and every site re-importing from it.
 `corpus-update-required` means the stored corpus differs from this release:
 after a verified backup, set `corpus.allow_update=true` in the saved site and
-run the same repair; once the change completes, the installer sets it back to
-`false` ([Upgrade and recover](#upgrade-and-recover-a-named-operation)).
+run the same repair. The installer does not set it back afterwards — it does
+that only after a change an upgrade or an install admitted — so once the
+repair completes, set it back to `false` yourself ([Upgrade and
+recover](#upgrade-and-recover-a-named-operation) says how).
 `model-change-blocked` means the stored index uses another
 embedding model: keep the previous release or restore its verified backup.
 `manifest-mismatch`, `core-mismatch` and `invalid-settings` are release defects
@@ -3718,7 +3739,7 @@ corpus text, paths or credentials. The installer reads them while it waits:
 | `terminal-budget-exhausted`, `deadline-exceeded`, `checkpoint-identity-mismatch` | The persisted retry or time budget is spent, or the checkpoint belongs to another corpus identity | Named `repair`; it bumps the corpus repair generation and verified shards re-verify without re-embedding |
 | `gsj-corpus:source-verification-failed` | A copied shard no longer matches the signed manifest | Named `repair`; the copier quarantines and recopies damaged copies on the next start |
 | `gsj-copy:source-verification-failed` | The release's corpus image payload itself fails its signed hashes | Repair cannot help: re-pull from the trusted registry or select a verified signed release |
-| `corpus-update-required` | The stored corpus differs from this release | After a verified backup, set `corpus.allow_update=true`, then run the named repair |
+| `corpus-update-required` | The stored corpus differs from this release | After a verified backup, set `corpus.allow_update=true`, then run the named repair; once it completes, set it back to `false` yourself ([how](#upgrade-and-recover-a-named-operation)) |
 | `model-change-blocked` | The stored index uses another embedding model | Blocked until case and decision index migration exists; keep the previous release or restore its backup |
 | `manifest-mismatch`, `core-mismatch`, `invalid-settings` | The release payload or settings contradict its signed manifest or core | Use a corrected signed release |
 | `released-vectors-missing` | The site declared a released vector sidecar (`corpus.vectors_url` or `vectors_path`) and none arrived in the source volume within the initializer's wait; it refused rather than embed | Stage the sidecar (the installer's own staging step normally fails first and names why), or clear the declaration, then the named `repair` |
@@ -3871,13 +3892,19 @@ machine you install from (on a single-node box, the same machine) — each
 `0700` and owned by the user who runs the installer. On a data disk whose
 directories pass a setgid bit or a default ACL down to new directories, strip
 both, or the private directories the installer makes there inherit a group or
-an access entry they were meant to exclude:
+an access entry they were meant to exclude. On a single-node box the block
+below does both halves at once; where the storage node is another machine, the
+transfer half — each line with `$TRANSFER` alone — runs on the storage node,
+and the backup half — each line with `$BACKUPS` alone — here. `mkdir -p -m 700`
+sets the mode only of a directory it creates, so the `chmod 700` after it is
+what makes one that already existed private:
 
 ```sh
 if [ -z "${TRANSFER:-}" ] || [ -z "${BACKUPS:-}" ]; then
   echo 'set first, then paste this block again -- TRANSFER=<your storage.transfer_path, made on the storage node>; BACKUPS=<your backup.directory, made on this machine>' >&2
 else
   mkdir -p -m 700 "$TRANSFER" "$BACKUPS"
+  chmod 700 "$TRANSFER" "$BACKUPS"                                   # mkdir -p leaves an existing directory's mode alone
   chmod g-s "$TRANSFER" "$BACKUPS"                                   # a setgid bit inherited from the disk's directory
   if command -v setfacl >/dev/null; then setfacl -b -k "$TRANSFER" "$BACKUPS"; fi   # every ACL entry, the default ACL included
   ls -ld "$TRANSFER" "$BACKUPS"                                      # drwx------, your user, no + after the mode
@@ -4405,7 +4432,7 @@ first install, or its recovery, realistically meets:
 | `requires helm >= …`, `requires kubectl >= …`, `requires jq >= …` | that client is missing, reported no version, or is below its floor | install or upgrade it, or re-run with the `--fetch-tools=TOOL` the refusal names |
 | `kubectl version skew` | an `install` or `upgrade` would run on a kubectl that `--fetch-tools` downloaded, more than one minor from the server | run without `--fetch-tools`, or with `--fetch-tools=helm`, to keep your own kubectl |
 | `TLS Secret is unavailable` | under `tls.profile=existing`, `tls.secret` is not in the target namespace — or, *… could not be read*, your kubeconfig could not read it there | create it there, the namespace first (the refusal names the commands), or correct the access; then the same command |
-| `TLS Secret is incomplete` | `tls.secret` is not of type `kubernetes.io/tls`, lacks `tls.crt` or `tls.key`, or its `tls.crt` is not a PEM certificate | replace it with one that is (the refusal names the commands) |
+| `TLS Secret is incomplete` | `tls.secret` is not of type `kubernetes.io/tls`, lacks `tls.crt` or `tls.key`, or its `tls.crt` is not a PEM certificate | replace it with one that is (the refusal about the type and the keys names the commands; the one about the certificate names its host) |
 | `TLS certificate host mismatch` | under `tls.profile=files`, the certificate in `tls.certificate_file` does not name `public_url`'s host. Under `existing`, a certificate in `tls.secret` for another host, or past its expiry date, is said in a log line ending *"The run goes on"*, not refused | a certificate for that host, or the right `public_url` |
 | `tls.certificate_file is not a readable PEM certificate` | under `tls.profile=files`; the host was not checked | point it at the PEM certificate for the host |
 | `Secret … differs from supplied credential` | a Secret of that name is already in the namespace — the operator Secret, or the `files` profile's TLS Secret — and holds other bytes than your file. The installer never overwrites one | put back the file that matches the Secret, then the same command |
@@ -4494,14 +4521,18 @@ helm -n "$NAMESPACE" uninstall "$RELEASE" --wait --timeout 10m
 "$GSJ" sweep --config "$SITE" --reason "decommissioning" --non-interactive
 ```
 
-After step 3 the namespace still holds what the installer never deletes: the
-three PersistentVolumeClaims — **they still hold every case, note, conversation
-and the whole decisions index** — and, where your site had them, the pull
-Secret `registry.pull_secret` (created from `registry.config_file`, or the one
-you made), the TLS Secret `tls.secret` of the `existing` or `files` profile
-(yours, or created from your files), and `<release>-trust` and
-`<release>-proxy`, the CA bundle and the proxy settings that `trust.ca_file`
-and `trust.proxy_file` put there. Deleting the namespace removes all of it.
+After step 3 the namespace still holds what the installer never deletes, among
+them: the three PersistentVolumeClaims — **they still hold every case, note,
+conversation and the whole decisions index** — and, where your site had them,
+the pull Secret `registry.pull_secret` (created from `registry.config_file`, or
+the one you made), the TLS Secret `tls.secret` of the `existing` or `files`
+profile (yours, or created from your files), `managed-acme`'s Issuer
+(`tls.issuer`), its Certificate and the Secret it issued (both `tls.secret`)
+and the ACME account key `<issuer>-account`, the credential Secrets
+`llm.credential.secret` and `ocr.credential.secret` name, and `<release>-trust`
+and `<release>-proxy`, the CA bundle and the proxy settings that
+`trust.ca_file` and `trust.proxy_file` put there. Deleting the namespace
+removes all of it.
 Deleting the claims is the irreversible step and is deliberately not part of
 any verb:
 
