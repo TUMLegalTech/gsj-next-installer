@@ -12,8 +12,9 @@ release's first step, and this script makes it mechanical:
 
   - it refuses to START when a prerequisite it knows is missing: the four
     packages (gsj_deploy, gsj_web, agent_runner, gsj), a chromadb-client still
-    installed, a Git directory carrying the pinned product commit, bash, jq
-    and openssl on PATH, THE ENGINEERED HELM -- the catalog's exact version
+    installed, a Git directory carrying the pinned product commit, the
+    previous release's tag in this repository (the site continuity test reads
+    it), bash, jq and openssl on PATH, THE ENGINEERED HELM -- the catalog's exact version
     (ops/installer/clients.json), since two modules render releases offline,
     which Helm 3 cannot do, and a gate that can pass on the wrong client is
     not a gate -- the two staged add-on archives, an interpreter that is not
@@ -49,6 +50,7 @@ ADDON_FILES = ("traefik-41.5.0.tgz", "cert-manager-v1.21.2.tgz")     # the two t
 PRODUCT_PACKAGES = ("gsj_deploy", "gsj_web", "agent_runner", "gsj")
 TOOLS = ("bash", "jq", "openssl")
 CLIENTS = ROOT / "ops/installer/clients.json"
+CONTRACT_TESTS = ROOT / "tests/test_contract.py"
 
 
 def engineered_helm_version():
@@ -77,6 +79,13 @@ def helm_version_found():
 CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem")
 
 
+def previous_release_tag():
+    """The previous release the site continuity test reads its installer
+    files from: tests/test_contract.py's PREVIOUS, the one place it is named,
+    so a later release moves the test and this check together."""
+    return re.search(r'^PREVIOUS = "([^"]+)"$', CONTRACT_TESTS.read_text(), re.M).group(1)
+
+
 def missing_prerequisites():
     """The prerequisites this check knows -- each one a skip or a setup error
     the suite has produced -- so the run is refused before it starts rather
@@ -98,6 +107,14 @@ def missing_prerequisites():
     for tool in TOOLS:
         if shutil.which(tool) is None:
             missing.append(f"`{tool}` is not on PATH")
+    # The site continuity test reads the previous release's defaults, schema and
+    # validator from its tag here and skips without it: a shallow clone, or a
+    # clone or fetch that took no tags, was found short only at the run's end.
+    tag = previous_release_tag()
+    if shutil.which("git") is None or subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", tag + "^{commit}"],
+                                                     capture_output=True).returncode != 0:
+        missing.append(f"this repository does not carry the previous release's tag {tag}, which the site continuity test "
+                       "(tests/test_contract.py) reads; it skips without it (README: git fetch --tags origin)")
     # The gate once admitted any helm -- Helm 3.22, a fake reporting
     # v0.0.1 -- and under Helm 3 two modules failed on the offline render
     # only Helm 4 performs. The client is the catalog's exact version, named

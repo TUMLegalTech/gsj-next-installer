@@ -76,6 +76,30 @@ def test_check_only_names_what_is_missing_or_confirms_every_prerequisite():
         assert "every prerequisite of the full run is present" in result.stdout
 
 
+def test_the_gate_names_the_previous_release_tag_the_continuity_test_reads(tmp_path, monkeypatch):
+    """The site continuity test (tests/test_contract.py) reads the previous
+    release's defaults, schema and validator from that release's tag in this
+    repository, and skips where the tag is absent -- a shallow clone, or a
+    clone or fetch that took no tags -- so the full run found the skip only
+    at its end. The gate names the tag and the fetch that brings it before
+    anything runs. Asserted against what this repository carries, and then
+    against a Git directory with no tags at all."""
+    from tests.test_contract import PREVIOUS
+    assert full_suite.previous_release_tag() == PREVIOUS
+
+    def tag_lines():
+        return [line for line in full_suite.missing_prerequisites() if PREVIOUS in line]
+    present = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "--quiet", PREVIOUS + "^{commit}"],
+                             capture_output=True).returncode == 0
+    assert bool(tag_lines()) != present, tag_lines()
+    bare = tmp_path / "no-tags.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(bare))
+    lines = tag_lines()
+    assert len(lines) == 1, lines
+    assert "tests/test_contract.py" in lines[0] and "git fetch --tags" in lines[0], lines[0]
+
+
 def test_an_explicitly_named_file_is_collected_despite_collect_ignore(tmp_path):
     """The script names every test file to pytest explicitly because
     conftest's `collect_ignore` applies only while pytest recurses into a

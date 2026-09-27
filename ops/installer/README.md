@@ -402,9 +402,12 @@ no private input.
    `.venv/bin/python -B ops/installer/ci/full-suite.py --report /release-output/full-suite.json`.
    It refuses to start when a prerequisite it knows is missing — the four
    packages (`gsj_deploy`, `gsj_web`, `agent_runner`, `gsj`), a
-   `chromadb-client` still installed, the pinned Git objects, `bash`, `helm`,
-   `jq` and `openssl`, the two add-on archives, an interpreter that is not
-   X.509-strict, a missing system CA bundle — names every test file to pytest
+   `chromadb-client` still installed, the pinned Git objects, the previous
+   release's tag in this repository (`v0.10.0-beta.6`, whose installer files
+   the site continuity test in `tests/test_contract.py` reads; a clone or
+   fetch that took no tags gets it with `git fetch --tags origin`), `bash`,
+   `helm`, `jq` and `openssl`, the two add-on archives, an interpreter that is
+   not X.509-strict, a missing system CA bundle — names every test file to pytest
    so the modules the public CI ignores cannot be left out, and fails on any
    skip whatever its reason, expected failure, deselection, collection error
    or file that contributed no test. A release whose full run is not green is
