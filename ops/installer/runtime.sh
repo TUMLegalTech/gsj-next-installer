@@ -1332,10 +1332,11 @@ preflight_site_checks() {
  # hours in, at the acceptance check: an expired or foreign certificate, a
  # controller namespace with no controller, a host another Ingress serves.
  # Every call here is a get. A refusal is a fixed sentence and the names
- # involved; what kubectl said on a failed read is kept in the state
- # directory and never repeated. A read this credential may not make is
- # logged and passed, as the capacity check does: a namespace-scoped operator
- # is a supported shape, and the later checks still stand.
+ # involved; what kubectl said on a failed read, and what jq said of a site
+ # file, is kept in the state directory and never repeated. A read this
+ # credential may not make is logged and passed, as the capacity check does:
+ # a namespace-scoped operator is a supported shape, and the later checks
+ # still stand.
  local versions=$1 host secret existing crt key ca ns found pods controller counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
  host=$(j '.public_url // ""' | sed -nE 's#^https://([^/:]+).*#\1#p')
  # kubectl is supported within one minor of the server (init's kubectl-skew
@@ -1354,12 +1355,17 @@ preflight_site_checks() {
  # The operator Secret, when it exists, must hold this password file's
  # password under secret_file's normalization (trailing newlines dropped, a
  # control character refused), refused in secret_file's words. Compared
- # inside jq: the password reaches no argument and no file.
+ # inside jq: the password reaches no argument and no file. jq -e fails alike
+ # on a false verdict and on a file it cannot open, so a file this account
+ # cannot read is refused as that first, with its remedy, and never as a
+ # control character or a differing Secret; what jq says (the path and the
+ # system's words) is kept in the state directory, never printed.
  secret=$(j '.operator.secret // ""')
  if [[ -n $secret ]]; then
-   jq -e -Rs 'sub("\\n+$";"")|length>0 and (any(explode[]; .<32 or .==127)|not)' "$OP_PASSWORD" >/dev/null || fail "operator.password_file holds a control character (a tab, a carriage return or another byte below 32) or nothing but newlines: write the password as one line of printable characters, then run the same command again"
+   [[ -r $OP_PASSWORD ]] || fail "operator.password_file ($(j .operator.password_file)) cannot be read by the account that runs the installer; make that account its owner, with mode 0600 or 0400, then run the same command again"
+   jq -e -Rs 'sub("\\n+$";"")|length>0 and (any(explode[]; .<32 or .==127)|not)' "$OP_PASSWORD" >/dev/null 2> "$STATE_DIR/preflight-operator-password.err" || fail "operator.password_file holds a control character (a tab, a carriage return or another byte below 32) or nothing but newlines: write the password as one line of printable characters, then run the same command again"
    existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-operator-secret.err") || fail "the operator Secret $secret in namespace $NAMESPACE could not be read: $(kubectl_failure_condition "$STATE_DIR/preflight-operator-secret.err"). kubectl's output is kept in $STATE_DIR/preflight-operator-secret.err; correct the access and run the same command again"
-   [[ -z $existing ]] || jq -e --rawfile password "$OP_PASSWORD" '.data.password == ($password|sub("\\n+$";"")|@base64)' <<< "$existing" >/dev/null || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite"
+   [[ -z $existing ]] || jq -e --rawfile password "$OP_PASSWORD" '.data.password == ($password|sub("\\n+$";"")|@base64)' <<< "$existing" >/dev/null 2> "$STATE_DIR/preflight-operator-password.err" || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite"
  fi
  case $(j '.tls.profile // ""') in
  existing)
@@ -1392,11 +1398,16 @@ preflight_site_checks() {
    fi;;
  files)
    # Compared, never written here: creating the Secret stays under the Lease.
+   # Readable first, as the password file is: a key jq cannot open would read
+   # as a differing Secret, and a certificate openssl cannot open as no
+   # certificate at all. A missing certificate file is left to that verdict.
    secret=$(j .tls.secret); crt=$(resolve_file "$(j .tls.certificate_file)"); key=$(resolve_file "$(j .tls.private_key_file)"); private_file "$key"
+   [[ -r $key ]] || fail "tls.private_key_file ($(j .tls.private_key_file)) cannot be read by the account that runs the installer; make that account its owner, with mode 0600 or 0400, then run the same command again"
+   [[ ! -e $crt || -r $crt ]] || fail "tls.certificate_file ($(j .tls.certificate_file)) cannot be read by the account that runs the installer; make it readable by that account, then run the same command again"
    openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "tls.certificate_file is not a readable PEM certificate ($(j .tls.certificate_file)); the host was not checked. Point it at the PEM certificate for $host"
    certificate_names_host "$crt" "$host" || fail "TLS certificate host mismatch: tls.certificate_file ($(j .tls.certificate_file)) does not name public_url's host $host. Supply a certificate for $host, or correct public_url"
    existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-tls-secret.err") || fail "TLS Secret $secret in namespace $NAMESPACE could not be read ($(kubectl_failure_condition "$STATE_DIR/preflight-tls-secret.err")). kubectl's output is kept in $STATE_DIR/preflight-tls-secret.err; correct the access and run the same command again"
-   [[ -z $existing ]] || jq -e --rawfile crt "$crt" --rawfile key "$key" '.data["tls.crt"]==($crt|@base64) and .data["tls.key"]==($key|@base64)' <<< "$existing" >/dev/null || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite";;
+   [[ -z $existing ]] || jq -e --rawfile crt "$crt" --rawfile key "$key" '.data["tls.crt"]==($crt|@base64) and .data["tls.key"]==($key|@base64)' <<< "$existing" >/dev/null 2> "$STATE_DIR/preflight-tls-files.err" || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite";;
  esac
  # ingress.profile managed-traefik: managed_helm_addon installs Traefik only
  # in a namespace of its own, and refused this one after the Lease.

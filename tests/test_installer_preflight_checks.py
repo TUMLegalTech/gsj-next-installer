@@ -358,6 +358,26 @@ def test_an_unreadable_certificate_file_is_refused_before_the_lease(runtime, tmp
     _refusal(_checks(run), state, "tls.certificate_file is not a readable PEM certificate")
 
 
+@pytest.mark.parametrize("existing", ["absent", "equal"])
+@pytest.mark.parametrize("field, name", [("tls.certificate_file", "tls.crt"), ("tls.private_key_file", "tls.key")])
+def test_a_certificate_or_key_file_this_account_cannot_read_is_refused_by_name(runtime, tmp_path, field, name, existing):
+    """Refused as unreadable, with the remedy, rather than as no certificate or
+    as a Secret that differs; and jq's words about the file are not printed."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "files")
+    _files_site(work, crt, key)
+    _cluster(state, CONTROLLER, *([_tls_secret(crt, key)] if existing == "equal" else []))
+    (work / name).chmod(0)
+    result = _checks(run)
+    line = _refusal(result, state, f"{field} ({name}) cannot be read by the account that runs the installer",
+                    "run the same command again")
+    if field == "tls.private_key_file":
+        assert "0600 or 0400" in line, line
+    assert "not a readable PEM certificate" not in result.stderr and "differs from supplied credential" not in result.stderr
+    assert "jq:" not in result.stderr and "Permission denied" not in result.stderr, result.stderr
+
+
 def test_a_certificate_file_for_another_host_is_refused_before_the_lease(runtime, tmp_path):
     run, state, work = runtime
     _baseline(tmp_path, state, work)
@@ -596,6 +616,33 @@ def test_an_operator_password_with_a_control_character_is_refused(runtime, tmp_p
     result = _checks(run)
     _refusal(result, state, "operator.password_file", "control character")
     assert "\tpassword" not in result.stderr
+
+
+def test_an_operator_password_file_this_account_cannot_read_is_refused_by_name(runtime, tmp_path):
+    run, state, work = runtime
+    _baseline(tmp_path, state, work, _operator_secret(PASSWORD))
+    (work / "operator-password").chmod(0)
+    result = _checks(run)
+    _refusal(result, state, "operator.password_file (operator-password) cannot be read by the account that runs the installer",
+             "0600 or 0400", "run the same command again")
+    assert "control character" not in result.stderr and "differs from supplied credential" not in result.stderr
+    assert "jq:" not in result.stderr and "Permission denied" not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("read, kept", [("-Rs", "preflight-operator-password.err"), ("--rawfile crt", "preflight-tls-files.err")])
+def test_what_jq_says_about_a_site_file_is_kept_in_the_state_directory_not_printed(runtime, tmp_path, read, kept):
+    """A jq that fails on a file it could open (a stand-in here) prints its
+    words into a private file, not onto the terminal."""
+    run, state, work = runtime
+    _baseline(tmp_path, state, work)
+    crt, key = _self_signed(tmp_path, "files")
+    _files_site(work, crt, key)
+    _cluster(state, CONTROLLER, _tls_secret(crt, key))
+    result = _checks(run, before=f'jq() {{ if [[ " $* " == *" {read} "* ]]; then echo "jq: crafted text" >&2; return 2; fi; command jq "$@"; }}\n')
+    _refusal(result, state)
+    assert "crafted text" not in result.stderr, result.stderr
+    assert "crafted text" in (work / kept).read_text()
+    assert (work / kept).stat().st_mode & 0o777 == 0o600
 
 
 # --- leftover managed add-on CRDs ------------------------------------------------------
