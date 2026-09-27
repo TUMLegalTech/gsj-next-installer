@@ -693,6 +693,10 @@ def _restore_fixture(runtime, tmp_path, damage=None, fallback=False, password_ne
 SITE="$TEST_WORK/target-site.json"; GSJ_PAYLOAD="$TEST_PAYLOAD"
 ARCHIVE="$TEST_ARCHIVE"; BACKUP_PASSWORD="$TEST_BACKUP_PASSWORD"; OP_PASSWORD="$TEST_WORK/operator-password"
 managed_dependencies() { :; }
+# The image pull probe runs for every site and polls its Pod's container
+# statuses, which this fake does not serve; test_installer_registry_base.py
+# drives it.
+relocated_images_probe() { :; }
 # This fixture tests Kubernetes/credential reconciliation. File extraction and
 # its killed-process replay are exercised with real archives in their own tests.
 restore_files() {

@@ -16,6 +16,7 @@ def test_resume_promotes_only_after_winning_cas_then_continues_same_install(runt
     state.write_text(json.dumps(cluster))
     result = invoke('''RESUME_ID="$ID"; COMMAND=resume
 compatibility() { : > "$GSJ_WORK/installed.json"; }
+relocated_images_probe() { :; }
 secret_inputs() { printf 'credentials\n' >> "$GSJ_WORK/actions"; }
 managed_dependencies() { printf 'dependencies\n' >> "$GSJ_WORK/actions"; }
 storage_probe() { printf 'storage\n' >> "$GSJ_WORK/actions"; }

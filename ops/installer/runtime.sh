@@ -66,7 +66,7 @@ pull_failure_condition() {
  local m; m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
  case $m in
    *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'the registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
-   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'the registry does not hold that name and digest (not found: the digest was not copied there unchanged, or the prefix is not exact)';;
+   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'the registry does not hold that name and digest (not found)';;
    *"no such host"*|*"server misbehaving"*|*"lookup "*|*"i/o timeout"*|*"connection refused"*|*"no route"*|*"dial tcp"*|*"network is unreachable"*|*"connection reset"*) printf 'the node could not connect to the registry (DNS, a route, a proxy, or a refused or timed-out connection)';;
    *x509*|*certificate*|*"tls handshake"*) printf 'the node does not trust the registry'"'"'s certificate (a CA the container runtime does not know)';;
    *toomanyrequests*|*"too many requests"*|*"rate limit"*) printf 'the registry rate-limited the pull (a limit or an outage on its side)';;
@@ -2634,11 +2634,14 @@ PY
  while (( SECONDS < end )); do phase=$(k get pod "$name" -o jsonpath='{.status.phase}'); [[ $phase == Succeeded || $phase == Failed ]] && break; sleep 3; done
  # The check's Pod never ran to an end: the disk was never tested, and the
  # verdict at the bottom must not call it a storage failure. Read what the
- # Pod reported while it still exists. Measured: with no registry.base the
- # pull probe does not run, so a pull Secret that is wrong, an expired token
- # or a node that cannot reach the registry is first met HERE -- the Pod sat
+ # Pod reported while it still exists. Measured, when the pull probe still
+ # ran only with registry.base: a pull Secret that is wrong, an expired token
+ # or a node that cannot reach the registry was first met HERE -- the Pod sat
  # in ImagePullBackOff for 300 s and the run ended `storage WAL/locking/
  # fsync/free-space qualification failed`, sending the operator to the disk.
+ # The probe now meets those first on every site; this Pod still pulls on its
+ # own (a token that expired in between, an image the node has evicted), so a
+ # pull that fails here is still named for what it is.
  # The operation's recorded status decides every hint of this check: "owned"
  # is a first install (nothing applied, nothing quiesced: resume repeats this
  # check, and abandon then install again takes a changed site value); after
@@ -3089,23 +3092,31 @@ relocated_images_probe() {
  # run: their command does not exist, and a container that fails to START has
  # already been PULLED, which is the whole question.
  #
- # WHEN. Whenever the location is site-chosen OR has CHANGED: registry.base is
- # set, or it differs from the base the installed deployment was recorded with.
- # The second half matters most. An upgrade that loses the base -- a stale copy
- # of site.json, a deleted line -- would otherwise render the release's original
- # repositories, the ones this site said its nodes cannot reach, with nothing
- # to catch it until the quiesced application failed to come back.
+ # WHEN. Always. It used to run only when registry.base was set or had changed
+ # from the base the installed deployment was recorded with; without one, a
+ # first install pulled only the web image before the Helm apply (the storage
+ # check's), so a pull credential that could not read the other five was first
+ # met by the provisioning hook, stalled for its whole timeout, or by the
+ # corpus initializer, hours into the initialization deadline. A changed base
+ # still matters most: an upgrade that loses it -- a stale copy of site.json, a
+ # deleted line -- renders the release's original repositories, the ones this
+ # site said its nodes cannot reach, and the words say so.
  #
  # WHERE IN THE CHAIN. Before backup quiesces a running deployment: a refusal
  # here leaves whatever was running, running.
  local base recorded='' pod spent=0 failing_since=-1 status verdict words='' where deadline want
  base=$(j '.registry.base // ""')
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
- [[ -n $base || $base != "$recorded" ]] || return 0
  # registry.base has no scheme (the schema holds it to host[:port][/path]), so
  # url_origin_only prints it as it is: routed like every printed address, so
  # the URL scan's alias rule sees the wrapper [review B2]
- if [[ -n $base ]]; then where="registry.base ($(url_origin_only "$base"))"; else where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"; fi
+ if [[ -n $base ]]; then where="registry.base ($(url_origin_only "$base"))"
+ elif [[ -n $recorded ]]; then where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"
+ else where="the release's own repositories"; fi
+ # What a failed pull asks the operator to check: a relocation is a copy and a
+ # prefix; the release's own repositories are the credential alone.
+ local advice="The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host."
+ [[ -n $base || -n $recorded ]] || advice="The repositories and digests are the signed release's own. Check that registry.pull_secret (or the registry.config_file it is made from) carries a credential that can read every one of them; a node that cannot reach those registries at all needs a mirror it can reach, named in registry.base."
  deadline=$(j .deadlines.dependencies_seconds)
  want=$(jq '.images|length' "$GSJ_PAYLOAD/release.json")
  pod="gsj-pull-${OPERATION:0:12}"
@@ -3203,7 +3214,7 @@ relocated_images_probe() {
      else
        RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
      fi
-     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host. The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
+     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. $advice The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
    fi
    if (( spent >= deadline )); then
      RECOVERY_HINT="resume --operation $OPERATION once the registry answers, or repair --operation $OPERATION --config $CONFIG --non-interactive after raising deadlines.dependencies_seconds"

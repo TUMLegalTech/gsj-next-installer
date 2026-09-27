@@ -292,11 +292,24 @@ def _probe(run, work, tmp_path, base=BASE):
     return release, run(PROBE_PRELUDE.format(payload=payload) + "relocated_images_probe")
 
 
-def test_without_a_base_the_probe_creates_nothing(runtime, tmp_path):
+def test_without_a_base_the_probe_proves_the_release_s_own_repositories_by_digest(runtime, tmp_path):
+    """A first install without registry.base pulled only the web image before
+    the Helm apply (the storage check's), so a pull credential that cannot read
+    the other five stalled the provisioning hook for its whole timeout or waited
+    out the initialization deadline, hours in. The probe asks the node first,
+    for every site."""
     run, _, work = runtime
-    _, result = _probe(run, work, tmp_path, base="")
+    (work / "status.json").write_text(_statuses([PULLED] * 6))
+    release, result = _probe(run, work, tmp_path, base="")
     assert result.returncode == 0, result.stderr
-    assert not (work / "probe-pod.json").exists() and not (work / "polls").exists()
+    pod = json.loads((work / "probe-pod.json").read_text())
+    assert sorted(c["image"] for c in pod["spec"]["containers"]) == sorted(
+        v["repository"] + "@" + v["digest"] for v in release["images"].values()), "the six release repositories, by digest"
+    assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
+    assert pod["spec"]["nodeSelector"] == {"kubernetes.io/hostname": "synthetic-node"}
+    assert "Proving node synthetic-node can pull all 6 images from the release's own repositories" in result.stderr
+    assert "All 6 images pulled from the release's own repositories" in result.stderr
+    assert "registry.base" not in result.stderr, "a site that never set it is not told about it"
 
 
 def test_the_probe_names_all_six_relocated_digests_on_the_storage_node_with_the_pull_secret(runtime, tmp_path):
@@ -406,12 +419,23 @@ def test_a_base_that_is_REMOVED_on_upgrade_is_probed_not_waved_through(runtime, 
     assert "no longer sets registry.base" in result.stderr and BASE in result.stderr
 
 
-def test_an_unchanged_empty_base_still_creates_nothing(runtime, tmp_path):
+def test_an_unchanged_empty_base_is_probed_and_a_failure_names_the_release_s_own_repositories(runtime, tmp_path):
     run, _, work = runtime
     _installed(work, None)                                   # recorded before the field existed
-    _, result = _probe(run, work, tmp_path, base="")
-    assert result.returncode == 0, result.stderr
-    assert not (work / "probe-pod.json").exists()
+    (work / "status.json").write_text(_statuses([PULLED] * 5 + [BACKOFF]))
+    release, result = _probe(run, work, tmp_path, base="")
+    assert result.returncode != 0, "an upgrade of a plain site proves its pulls before the backup quiesces it"
+    pod = json.loads((work / "probe-pod.json").read_text())
+    assert sorted(c["image"] for c in pod["spec"]["containers"]) == sorted(
+        v["repository"] + "@" + v["digest"] for v in release["images"].values())
+    assert pod["spec"]["imagePullSecrets"] == [{"name": "corp-pull"}]
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert "cannot pull this release from the release's own repositories: 1 of 6 images" in refusal
+    assert "no longer sets registry.base" not in refusal, "the base did not change"
+    # nothing was relocated: the advice is the credential and the node, not a prefix or a copy
+    assert "prefix" not in refusal and "copied there" not in refusal
+    assert "registry.pull_secret" in refusal and "node's side" in refusal
+    assert "Helm has applied nothing in this run" in refusal
 
 
 def test_a_short_dependency_deadline_still_gets_the_named_refusal(runtime, tmp_path):
