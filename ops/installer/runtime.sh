@@ -1391,8 +1391,11 @@ preflight_site_checks() {
    # without both keys, or without a certificate. Its host and its expiry are
    # said, not refused: where a proxy in front of the cluster terminates TLS
    # with its own certificate, this Secret may hold a placeholder no client
-   # there sees, and a refusal would stop a site that works.
-   certificate_names_host "$crt" "$host" || log "The certificate in Secret $secret (namespace $NAMESPACE) does not name public_url's host $host. Where the ingress controller terminates TLS for $host, browsers refuse it and the acceptance check inside the application Pod stops at origin-tls-failed; where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a certificate for $host in that Secret, or correct public_url, unless such a proxy serves $host. The run goes on"
+   # there sees, and a refusal would stop a site that works. Where the
+   # controller serves it, public_verify's curl, which verifies the host and
+   # the expiry, meets it before the Pod's acceptance check runs, and its
+   # refusal is the one that stops the install.
+   certificate_names_host "$crt" "$host" || log "The certificate in Secret $secret (namespace $NAMESPACE) does not name public_url's host $host. Where the ingress controller terminates TLS for $host, browsers refuse it, and the install stops, hours in, at the installer's own public HTTPS check (public HTTPS route is unreachable); where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a certificate for $host in that Secret, or correct public_url, unless such a proxy serves $host. The run goes on"
    # The acceptance check verifies public_url from inside the application Pod
    # with Python's default context against verification.ca_file: X.509-strict,
    # and from 3.13 partial-chain too, so a CA file holding the intermediate
@@ -1404,7 +1407,7 @@ preflight_site_checks() {
    # CA, so it is said once, as that.
    ca=$(j .verification.ca_file)
    if ! openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
-     log "The certificate in Secret $secret (namespace $NAMESPACE) is past its expiry date. Where the ingress controller terminates TLS for $host, browsers refuse it and the acceptance check inside the application Pod stops at origin-tls-failed; where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a current certificate for $host in that Secret, unless such a proxy serves $host. The run goes on"
+     log "The certificate in Secret $secret (namespace $NAMESPACE) is past its expiry date. Where the ingress controller terminates TLS for $host, browsers refuse it, and the install stops, hours in, at the installer's own public HTTPS check (public HTTPS route is unreachable); where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a current certificate for $host in that Secret, unless such a proxy serves $host. The run goes on"
    elif [[ -n $ca ]] && ! openssl verify -x509_strict -partial_chain -CAfile "$(resolve_file "$ca")" -untrusted "$crt" "$crt" >/dev/null 2>&1; then
      log "The certificate in Secret $secret does not pass strict verification (openssl verify -x509_strict) against verification.ca_file ($ca). The acceptance check inside the application Pod verifies strictly and would stop at origin-tls-failed; supply the CA that issued it, or a certificate whose chain passes strict verification. The run goes on"
    fi;;

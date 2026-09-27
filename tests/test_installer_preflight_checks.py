@@ -255,7 +255,11 @@ def test_an_incomplete_tls_secret_is_refused(runtime, tmp_path, change):
 # type and with both keys. A site whose TLS terminates at a proxy in front of
 # the cluster may keep a placeholder certificate in it, for another host or
 # long expired, and must keep installing and upgrading: those two are said,
-# and the run goes on.
+# and the run goes on. Where the controller does serve that certificate, the
+# installer's own public HTTPS check (curl, verifying) meets it before the
+# Pod's acceptance check does, and stops the run with its own refusal.
+PUBLIC_CHECK = ("the install stops, hours in, at the installer's own public HTTPS check",
+                "public HTTPS route is unreachable")
 
 def test_a_tls_secret_for_another_host_is_warned_about_without_repeating_the_certificate(runtime, tmp_path):
     run, state, work = runtime
@@ -264,8 +268,9 @@ def test_a_tls_secret_for_another_host_is_warned_about_without_repeating_the_cer
     _cluster(state, _tls_secret(crt, key), CONTROLLER)
     result = _checks(run)
     _admitted(result, state)
-    _logged(result, "does not name public_url's host", "Secret gsj-tls", "synthetic-namespace", HOST,
-            "origin-tls-failed", "a proxy in front of the cluster", "The run goes on")
+    line = _logged(result, "does not name public_url's host", "Secret gsj-tls", "synthetic-namespace", HOST,
+                   *PUBLIC_CHECK, "a proxy in front of the cluster", "The run goes on")
+    assert "origin-tls-failed" not in line, line
     assert "other.example" not in result.stderr
 
 
@@ -277,8 +282,9 @@ def test_an_expired_tls_secret_is_warned_about_and_not_also_as_a_chain(runtime, 
     _site(work, lambda s: s["verification"].update(ca_file=str(crt)))
     result = _checks(run)
     _admitted(result, state)
-    _logged(result, "is past its expiry date", "Secret gsj-tls", "synthetic-namespace", HOST,
-            "origin-tls-failed", "a proxy in front of the cluster", "The run goes on")
+    line = _logged(result, "is past its expiry date", "Secret gsj-tls", "synthetic-namespace", HOST,
+                   *PUBLIC_CHECK, "a proxy in front of the cluster", "The run goes on")
+    assert "origin-tls-failed" not in line, line
     assert "2020" not in result.stderr, "the certificate's own dates are not repeated"
     assert "strict verification" not in result.stderr, "an expired certificate needs a current one, not another CA"
 
