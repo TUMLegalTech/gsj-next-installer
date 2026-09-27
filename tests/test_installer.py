@@ -3030,18 +3030,21 @@ def test_the_restart_recreates_the_pod_that_reported_the_verdict_never_the_first
     assert "restarting it once on the staged blocks" in result.stderr
 
 
-def test_the_restart_refuses_a_verdict_pod_whose_owner_chain_is_not_the_release_deployment(runtime):
+def test_the_restart_never_takes_a_verdict_pod_whose_owner_chain_is_not_the_release_deployment(runtime):
     """The Pod with the verdict is recreated only when its owner chain leads
     to this release's own workload: Pod -> its controller ReplicaSet (by name
     and uid) -> the Deployment $RELEASE-web with the uid the wait just read.
     A chain that ends elsewhere (here: the ReplicaSet's controller is another
-    Deployment's uid) is a named refusal, no deletion at all."""
+    Deployment's uid) is no deletion at all; the verdict is named as not the
+    release's, like any other such Pod's, and the wait goes on (it used to
+    end the operation, while the same verdict outside the restart was only
+    named)."""
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
                                         replicaset=_replicaset(owner_uid="another-deployment-uid"))
-    assert result.returncode == 1, result.stderr
+    assert result.returncode == 97, result.stderr                     # every poll ran: the wait went on
     assert deletes == [], deletes
-    assert "synthetic-release-web-7c9d8-abcde" in result.stderr and "not the application Pod of release synthetic-release" in result.stderr
-    assert "stopped terminally" not in result.stderr
+    assert "Pod synthetic-release-web-7c9d8-abcde reported an initializer verdict but is not owned by release synthetic-release" in result.stderr
+    assert "stopped terminally" not in result.stderr and "restarting" not in result.stderr
 
 
 def test_a_refused_or_failed_recreation_is_an_error_never_a_restart_that_happened(runtime):
@@ -3086,3 +3089,50 @@ def test_a_terminal_verdict_from_the_releases_own_pod_stops_the_wait_after_a_for
     assert result.returncode == 1, result.stderr
     assert "stopped terminally (deadline-exceeded)" in result.stderr and "checkpoint-identity-mismatch" not in result.stderr.split("GSJ:")[-1]
     assert deletes == []
+
+
+# --- the restart and the stop act on one verdict: the release's own ---
+
+FOREIGN_NOT_OWNED = f"Pod {FOREIGN_POD} reported an initializer verdict but is not owned by release synthetic-release"
+OWN_PROGRESS = '"pod":"synthetic-release-web-7c9d8-abcde"'
+
+
+@pytest.mark.parametrize("own", ["waiting", "running"])
+def test_a_foreign_source_verification_verdict_listed_first_neither_restarts_nor_ends_the_wait(runtime, own):
+    """The restart on the staged blocks read only the FIRST verdict line
+    while the stop below it judged only the release's own Pods: a foreign Pod
+    listed first with the source-verification verdict ended the operation
+    through the restart's refusal. The verdict both act on is chosen once,
+    the first from a Pod the release owns, and the foreign one is named once
+    per poll: the release's own Pod gets its restart when it reported the
+    verdict (waiting), and the wait goes on when it reported none (running)."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
+                                        waiting=[_with_verdict(_foreign_pod(), "source-verification-failed"),
+                                                 _application_pod(own)])
+    assert "not the application Pod" not in result.stderr and "stopped terminally" not in result.stderr, result.stderr
+    assert result.stderr.count(FOREIGN_NOT_OWNED) == result.stdout.count(OWN_PROGRESS) >= 1, result.stderr
+    if own == "waiting":
+        assert result.returncode == 0, result.stderr
+        assert deletes == [_recreate(work)], deletes
+        assert "restarting it once on the staged blocks" in result.stderr
+    else:
+        assert result.returncode == 97, result.stderr                 # every poll ran: the wait went on
+        assert deletes == [] and "restarting" not in result.stderr
+
+
+def test_the_releases_own_source_verification_verdict_gets_its_restart_behind_a_foreign_verdict(runtime):
+    """A foreign Pod listed first with another verdict hid the release's own
+    source-verification verdict from its one restart: the restart read the
+    foreign code and passed, and the stop then judged the release's verdict
+    terminal, although it may predate the staging. The release's own verdict
+    gets its restart; the foreign one is named, never judged."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
+                                        waiting=[_with_verdict(_foreign_pod(), "deadline-exceeded"),
+                                                 _application_pod("waiting")])
+    assert result.returncode == 0, result.stderr
+    assert deletes == [_recreate(work)], deletes
+    assert "restarting it once on the staged blocks" in result.stderr and "stopped terminally" not in result.stderr
+    assert result.stderr.count(FOREIGN_NOT_OWNED) == 1, result.stderr
+

@@ -4220,7 +4220,7 @@ initializer_stop() {
  esac
 }
 wait_application() {
- local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod pod_uid state deploy_uid verdicts code verdict_pod verdict_uid
+ local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod pod_uid state deploy_uid verdicts code verdict_pod verdict_uid line_code line_pod line_uid
  while (( SECONDS < end )); do
    assert_owner
    helm_application_validate
@@ -4237,7 +4237,21 @@ wait_application() {
      k logs "$pod" -c corpus-initialize --tail=3 2>/dev/null || true
    done < <(jq -r '.items[]|select(.metadata.deletionTimestamp==null)|[.metadata.name,.metadata.uid]|@tsv' "$GSJ_WORK/application-pods.json")
    verdicts=$(initializer_failure "$GSJ_WORK/application-pods.json") || verdicts=''
-   IFS=$'\t' read -r code verdict_pod verdict_uid <<< "$verdicts"
+   # A verdict is judged only from this release's own Pod, by name, uid and
+   # owner chain: a foreign controller's Pod can carry the two labels and a
+   # crafted verdict. The restart and the stop below act on ONE verdict,
+   # chosen here: the first from a Pod the release owns. The restart read the
+   # first line alone, so a foreign verdict listed first ended the operation
+   # through its refusal, or hid the release's own verdict from it. A Pod not
+   # owned by this release that reports one is named once per poll, and the
+   # wait goes on.
+   code=''; verdict_pod=''; verdict_uid=''
+   while IFS=$'\t' read -r line_code line_pod line_uid; do
+     [[ -n $line_code ]] || continue
+     if ! initializer_pod_owned "$GSJ_WORK/application-pods.json" "$line_pod" "$line_uid" "$deploy_uid"; then
+       log "Pod $line_pod reported an initializer verdict but is not owned by release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); the verdict is not judged and the wait goes on"
+     elif [[ -z $code ]]; then code=$line_code; verdict_pod=$line_pod; verdict_uid=$line_uid; fi
+   done <<< "$verdicts"
    if [[ $code == corpus:source-verification-failed && ${VECTORS_STAGED_IN_THIS_RUN:-} == true && ${STAGED_RESTART:-} != done ]]; then
      # The initializer started at helm_apply and may have judged the released
      # vectors BEFORE stage_vectors put them in place [review, the major]:
@@ -4247,15 +4261,11 @@ wait_application() {
      # came. ONE fresh attempt on the staged bytes decides: the Pod is
      # recreated now (the Deployment brings it back; the checkpoint is on the
      # volume); a second such verdict is on the staged bytes and terminal.
-     # The Pod recreated is exactly the one whose verdict was read -- by name
-     # AND uid, as the API's precondition, so a replacement under the same
-     # name is never touched -- and only when its owner chain leads to this
-     # release's own Deployment: the two labels alone also list a foreign
-     # controller's Pod, and the first Pod listed is not the verdict's. A
-     # deletion the API refuses or that fails is an error, never a restart
-     # that is counted: the next verdict would be read as the terminal second.
-     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$deploy_uid" \
-       || fail "Pod $verdict_pod reported the initializer's verdict but is not the application Pod of release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); it is not recreated and the verdict is not judged"
+     # The Pod recreated is exactly the release's own Pod whose verdict was
+     # chosen above -- by name AND uid, as the API's precondition, so a
+     # replacement under the same name is never touched. A deletion the API
+     # refuses or that fails is an error, never a restart that is counted:
+     # the next verdict would be read as the terminal second.
      log "corpus-initialize refused the released vectors with a verdict that may predate their staging in this run; restarting it once on the staged blocks"
      jq -n --arg uid "$verdict_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$GSJ_WORK/initializer-delete.json"
      if ! k delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$verdict_pod" -f "$GSJ_WORK/initializer-delete.json" >/dev/null 2>&1; then
@@ -4265,16 +4275,7 @@ wait_application() {
      STAGED_RESTART=done
      sleep 20; continue
    fi
-   # A verdict is judged only from this release's own Pod, by name, uid and
-   # owner chain as the restart above: a foreign controller's Pod can carry
-   # the two labels and a crafted verdict, and listed first it stopped the
-   # operation. The first owned verdict decides; a Pod not owned by this
-   # release that reports one is named, and the wait goes on.
-   while IFS=$'\t' read -r code verdict_pod verdict_uid; do
-     [[ -n $code ]] || continue
-     if initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$deploy_uid"; then initializer_stop "$code"; break; fi
-     log "Pod $verdict_pod reported an initializer verdict but is not owned by release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); the verdict is not judged and the wait goes on"
-   done <<< "$verdicts"
+   [[ -z $code ]] || initializer_stop "$code"
    sleep 20
  done
  fail 'initialization/startup deadline exceeded; checkpoint and operation remain available for resume'
