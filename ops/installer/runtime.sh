@@ -1271,9 +1271,11 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  if (( literal )); then
    [[ $host =~ $ipv4 || ( $host =~ $ipv6 && $host == *:* ) ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
    if [[ $host == *:* ]] && command -v getent >/dev/null 2>&1; then
-     # the resolver parses the literal into its canonical form; what it
-     # cannot parse is no address a policy can be written for
-     local parsed; parsed=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}')
+     # the resolver parses the literal into its canonical form (its IPv6
+     # database, which does not narrow the family to what this machine has
+     # configured); what it cannot parse is no address a policy can be
+     # written for
+     local parsed; parsed=$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1}')
      [[ -n $parsed ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
      host=$parsed
    fi
@@ -4322,11 +4324,14 @@ endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s,
  # the pod never trusts that CA, so this probe builds its own bundle from
  # the system's and trust.ca_file and runs curl without the export
  local code rc=0 file proxy='' args=(--silent --show-error --max-time 10 -o /dev/null -w '%{http_code}')
- CURL_CA_BUNDLE='' system_ca_bundle > "$GSJ_WORK/answers-here-ca.path" 2>/dev/null || return 1
+ # looked up in a subshell: a machine without a bundle keeps the endpoint's
+ # skip instead of ending the operation
+ local bundle; bundle=$(CURL_CA_BUNDLE='' system_ca_bundle 2>/dev/null) || return 1
+ printf '%s\n' "$bundle" > "$GSJ_WORK/answers-here-ca.path"
  # written afresh each time: a copy of the system bundle would keep its
  # read-only mode and refuse the next write
  rm -f "$GSJ_WORK/answers-here-ca.pem"
- cat "$(cat "$GSJ_WORK/answers-here-ca.path")" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null || return 1
+ cat "$bundle" > "$GSJ_WORK/answers-here-ca.pem" 2>/dev/null || return 1
  chmod 600 "$GSJ_WORK/answers-here-ca.pem"
  file=$(j '.trust.ca_file // ""'); [[ -z $file ]] || { file=$(resolve_file "$file"); [[ -r $file ]] && cat "$file" >> "$GSJ_WORK/answers-here-ca.pem"; }
  args+=(--cacert "$GSJ_WORK/answers-here-ca.pem")
@@ -4340,7 +4345,9 @@ endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s,
      [[ -z $bypass ]] || args+=(--noproxy "$bypass")
    fi
  fi
- code=$(env -u CURL_CA_BUNDLE curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
+ # the shell's own proxy variables never route this probe: only the site's
+ # proxy file does, as in the pod
+ code=$(env -u CURL_CA_BUNDLE -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
  (( rc == 0 )) || return 1
  [[ $code =~ ^[1-5][0-9][0-9]$ ]] || return 1
  case $code in 407|502|503|504) [[ -z $proxy ]];; *) return 0;; esac

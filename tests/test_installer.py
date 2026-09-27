@@ -285,7 +285,8 @@ url = next((v for i, v in enumerate(a) if (v.startswith("https://") or v.startsw
 if url and "/api/" not in url and "-w" in a and ("/models" in url or "/chat/completions" in url or "/v1" in url):
     # the network check's host-side endpoint probe: the state's "silent" list names endpoints that answer nothing
     p = pathlib.Path(os.environ["TEST_KUBECTL_STATE"]); s = json.loads(p.read_text())
-    s.setdefault("host_probes", []).append(a); s.setdefault("host_probe_ca_env", []).append(os.environ.get("CURL_CA_BUNDLE", "unset")); p.write_text(json.dumps(s))
+    s.setdefault("host_probes", []).append(a); s.setdefault("host_probe_ca_env", []).append(os.environ.get("CURL_CA_BUNDLE", "unset"))
+    s.setdefault("host_probe_proxy_env", []).append([k for k in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY") if k in os.environ]); p.write_text(json.dumps(s))
     if any(part in url for part in s.get("silent_endpoints", [])): sys.exit(7)
     if any(part in url for part in s.get("tls_endpoints", [])): sys.exit(60)
     if any(part in url for part in s.get("proxy_status_endpoints", [])): sys.stdout.write("502"); sys.exit(0)
@@ -3615,3 +3616,22 @@ def test_the_host_side_probe_trusts_the_system_bundle_and_the_sites_ca_never_the
     assert set(s["host_probe_ca_env"]) == {"unset"}, s["host_probe_ca_env"]
     bundle = (work / "answers-here-ca.pem").read_bytes()
     assert bundle and bundle == Path((work / "answers-here-ca.path").read_text().strip()).read_bytes(), "the system bundle alone, byte for byte"
+
+
+def test_the_host_side_probe_ignores_the_shells_proxy_variables_and_survives_a_machine_without_a_bundle(runtime):
+    """The operator's shell may carry proxy variables; the pod does not, so
+    the probe runs without them and only the site's proxy file routes it.
+    A machine without a CA bundle keeps the endpoint's skip instead of
+    ending the operation at verifying."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    result = run(NETWORK_VERIFY, HTTPS_PROXY="http://shell-proxy.example:3128", http_proxy="http://shell-proxy.example:3128", NO_PROXY="llm.example")
+    assert result.returncode == 0, result.stderr
+    s = json.loads(state.read_text())
+    assert s["host_probe_proxy_env"] == [[], []], s["host_probe_proxy_env"]
+    assert not any("--proxy" in p for p in s["host_probes"])
+    _network_cluster(state, deny_code=1)
+    result = run("system_ca_bundle() { fail 'system CA bundle is unavailable'; }\n" + NETWORK_VERIFY)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((work / "network-check.json").read_text())
+    assert record["egress"]["asserted"] == {"llm": False, "ocr": False, "isolation": True}, "no bundle: the endpoints keep their skip, the rest is held"

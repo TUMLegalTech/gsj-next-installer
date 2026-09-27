@@ -2861,7 +2861,7 @@ cluster's service translation (a Service's Pod, the controller's Pod, never a
 ClusterIP or a node port): measured on k3s (kube-router) for the NodePort,
 the load-balancer and the servicelb shapes; no other CNI was measured, and a
 CNI that evaluates before the translation would need `ipBlock` entries for
-those addresses instead — a CNI that enforces nothing (step 0's probe) leaves
+those addresses instead — a CNI that enforces nothing (step 4's probe) leaves
 the list as documentation. A public address that is not translated to a Pod
 at all (a load balancer outside the cluster) is not admitted: an address
 rule for it would admit everything behind that address; point

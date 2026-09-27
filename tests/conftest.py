@@ -45,14 +45,17 @@ import tempfile
 _SYNTHETIC_GETENT = """#!/usr/bin/env python3
 import ipaddress, json, os, pathlib, sys
 a = sys.argv[1:]
-if a[:1] != ["ahosts"] or len(a) != 2: sys.exit(1)
+if a[:1] not in (["ahosts"], ["ahostsv6"]) or len(a) != 2: sys.exit(1)
 name = a[1]
 state = os.environ.get("TEST_KUBECTL_STATE")
 s = json.loads(pathlib.Path(state).read_text()) if state and os.path.exists(state) else {}
 if state and os.path.exists(state):
     s.setdefault("resolved", []).append(name); pathlib.Path(state).write_text(json.dumps(s))
 try:
-    ip = ipaddress.ip_address(name); print(f"{ip} STREAM {name}"); sys.exit(0)
+    ip = ipaddress.ip_address(name)
+    # an IPv4-mapped address is printed as glibc prints it, in dotted form, whatever this Python prints
+    mapped = getattr(ip, "ipv4_mapped", None)
+    print(f"{('::ffff:' + str(mapped)) if mapped else ip} STREAM {name}"); sys.exit(0)
 except ValueError: pass
 # a colon is no part of a name: the resolver answers nothing for it (a bracketed string that is no address)
 if ":" in name: sys.exit(2)
