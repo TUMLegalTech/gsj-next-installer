@@ -4153,7 +4153,8 @@ or resume for application startup"*). Restore the same verified
 archive into an empty namespace of the same name (restore keeps the archive's
 namespace and release names) from a new site directory: on another cluster,
 keeping this namespace too, or, with one cluster, on this one once the
-deployment is removed (`abandon --operation`, `helm uninstall` of the release,
+deployment is removed (`abandon --operation`, `helm -n NAMESPACE uninstall` of
+the release and, with a managed profile, its managed add-ons and their CRDs,
 `sweep`, then delete the namespace; under a class that deletes on release that
 erases the claims' data), in the order
 [Restore onto the same cluster](#restore-onto-the-same-cluster) gives:
@@ -4495,8 +4496,10 @@ at any time and re-fetchable.
 A fresh restore goes into an empty namespace of the same name, from a new
 site directory, and the installer's refusals name both places it can be:
 *"… into an empty namespace … from a new site directory: on another cluster,
-or on this one once the deployment is removed (abandon --operation …, helm
-uninstall …, sweep, then delete namespace …)"*. This section is the second.
+or on this one once the deployment is removed (abandon --operation …, helm -n
+… uninstall …, sweep, then delete namespace …)"* — with *"… uninstall … and
+its managed add-ons with their CRDs (see the guide), …"* when the site selects
+a managed profile. This section is the second.
 With one cluster, the namespace is emptied by removing the deployment first.
 That takes the deployment's data off the cluster before the restore puts it
 back, so it has an order, and the first step is the one that makes the others

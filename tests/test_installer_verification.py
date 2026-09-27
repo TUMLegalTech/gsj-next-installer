@@ -500,7 +500,7 @@ def test_a_run_for_another_origin_keeps_its_original_route(verification):
 
 RESTORE_FRESH=('restore its verified archive with the exact source installer into an empty namespace synthetic-namespace '
                'from a new site directory: on another cluster, or on this one once the deployment is removed '
-               f"(abandon --operation {'a'*24}, helm uninstall gsj, sweep, then delete namespace synthetic-namespace)")
+               f"(abandon --operation {'a'*24}, helm -n synthetic-namespace uninstall gsj, sweep, then delete namespace synthetic-namespace)")
 
 
 @pytest.mark.parametrize('continuation,older,resume,fresh',[

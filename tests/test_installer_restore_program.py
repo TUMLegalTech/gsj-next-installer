@@ -749,7 +749,7 @@ install_exit_traps
         assert reason in result.stderr and 'stay retained for inspection' in result.stderr, result.stderr
         assert 'repair --operation' not in result.stderr and 'Use resume' not in result.stderr, result.stderr
         # The message and RECOVERY_HINT name the same fresh restore, never a corrected release.
-        route = (f'{FRESH} (abandon --operation {operation}, helm uninstall synthetic-release, sweep, '
+        route = (f'{FRESH} (abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release, sweep, '
                  'then delete namespace synthetic-namespace)')
         assert (f'; keep operation {operation} retained with this site directory as it is, and restore {fresh} {route}\n'
                 in result.stderr), result.stderr

@@ -558,7 +558,7 @@ restore_fresh_fail 'the restored evidence changed'
 ''')
     assert result.returncode != 0
     route = ("into an empty namespace synthetic-namespace from a new site directory: on another cluster, or on this one "
-             f"once the deployment is removed (abandon --operation {operation}, helm uninstall synthetic-release, sweep, "
+             f"once the deployment is removed (abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release, sweep, "
              "then delete namespace synthetic-namespace)")
     fresh = "its verified archive with the exact source installer"
     assert (f"GSJ: the restored evidence changed; keep operation {operation} retained with this site directory as it is, "
@@ -566,3 +566,27 @@ restore_fresh_fail 'the restored evidence changed'
     assert (f"Use restore of {fresh} {route}; keep operation {operation} retained with this site directory as it is."
             ) in result.stderr, result.stderr
     assert "Kubernetes context" not in result.stderr
+    assert "managed add-ons" not in result.stderr, "this site selects none"
+
+
+@pytest.mark.parametrize("key, profile", [("ingress", "managed-traefik"), ("tls", "managed-acme"), ("storage", "managed-local-path")])
+def test_the_one_cluster_route_removes_the_managed_add_ons_a_recreated_namespace_would_refuse(runtime, key, profile):
+    """Each managed add-on's owner record hashes the namespace's uid: once the
+    namespace is deleted and made again, the restore's add-on step refuses
+    the add-ons the old identity owns. The route named only the application's
+    release, and spelled its uninstall without the namespace it lives in."""
+    run, _, work = runtime
+    site = json.loads((work / "site.json").read_text())
+    site[key]["profile"] = profile
+    (work / "site.json").write_text(json.dumps(site))
+    operation = "a" * 24
+    result = run(f'''OPERATION={operation}; LEASE_ACQUIRED=true; GSJ_WORK="$TEST_WORK/throwaway"; mkdir -p "$GSJ_WORK"
+install_exit_traps
+restore_fresh_fail 'the restored evidence changed'
+''')
+    assert result.returncode != 0
+    route = (f"(abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release and its managed "
+             "add-ons with their CRDs (see the guide), sweep, then delete namespace synthetic-namespace)")
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert route in refusal, refusal
+    assert route in result.stderr.rsplit("Use restore of", 1)[1], "the closing line names the same route"
