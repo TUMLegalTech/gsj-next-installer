@@ -421,7 +421,8 @@ requires it to have passed, alongside the fifteen application checks. `inspect`
 will not probe it for you (it would have to create Pods). You
 cannot settle it from a `kubectl get` either: enforcement is a property of your
 CNI, not of any object you can read. **Step 4 carries a sixty-second probe that
-answers it** -- it lives there and not here because it needs an image your
+answers its ingress half** (step 9 also holds egress enforcement, from inside
+the release's own Pods) -- it lives there and not here because it needs an image your
 nodes can actually pull, which is exactly what step 4 establishes. Run it
 before step 5.
 
@@ -825,7 +826,8 @@ Pod spec, where the credential has already been chosen.
 
 **Now prove NetworkPolicy**, with the image you have just proved pullable. Step
 0 said step 9 requires it and that nothing you can read settles it. This
-settles it, in about a minute.
+settles its ingress half in about a minute; egress enforcement is held by
+step 9 itself, from inside the release's Pods.
 
 **[if]** a private registry, the Pods below need the pull Secret as well,
 and the credentialed probe above deleted its copy. Before you paste the block,
@@ -2874,7 +2876,12 @@ controller's labels, so a controller that shares its namespace with other
 workloads (k3s's bundled Traefik in `kube-system`) shares this admission with
 them — run the controller in a namespace of its own; on k3s the servicelb
 peer is keyed by namespace alone, so every klipper-lb Pod fronting a
-LoadBalancer Service of that namespace is admitted. (3) DNS is admitted to
+LoadBalancer Service of that namespace is admitted. And the controller is a
+proxy for every route it serves: every Ingress of its class, an ExternalName
+backend that points outside the cluster included, is reachable through it,
+so the list is only as closed as the controller's routing table — give this
+release a controller or class of its own, with no ExternalName backend on
+it. (3) DNS is admitted to
 the CoreDNS Pods of `kube-system`; a cluster whose Pods resolve through
 NodeLocal DNSCache (a link-local address served from the node) is not
 supported by this release's list. (4) DNS lookups still leave the cluster:

@@ -1883,13 +1883,16 @@ def test_the_site_endpoints_are_asserted_only_when_they_answer_this_machine_now(
         assert "did not reach ocr" in result.stderr
 
 
-def test_a_proxy_file_that_names_no_proxy_leaves_the_panel_held(runtime):
-    """NO_PROXY alone is not a proxy: the panel's probes dial directly, so
-    every verdict must read blocked, as on a site without the file."""
+@pytest.mark.parametrize("proxies", [{"HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": "localhost"},
+                                     {"HTTP_PROXY": "http://proxy.example:3128", "HTTPS_PROXY": "", "NO_PROXY": ""}])
+def test_a_proxy_file_that_names_no_https_proxy_leaves_the_panel_held(runtime, proxies):
+    """The panel's canaries are https: NO_PROXY alone, or HTTP_PROXY alone,
+    leaves them dialling directly, so every verdict must read blocked, as
+    on a site without the file."""
     run, state, work = runtime
     _network_cluster(state, deny_code=1)
     site = json.loads((work / "site.json").read_text()); site["trust"]["proxy_file"] = str(work / "proxies.json")
-    (work / "proxies.json").write_text(json.dumps({"HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": "localhost"}))
+    (work / "proxies.json").write_text(json.dumps(proxies))
     (work / "site.json").write_text(json.dumps(site))
     result = run(NETWORK_VERIFY)
     assert result.returncode == 0 and "recorded, not held" not in result.stderr, result.stderr
@@ -3541,3 +3544,38 @@ def test_the_host_side_endpoint_probe_dials_as_the_pod_dials_and_a_tls_failure_k
     result = run(NETWORK_VERIFY)
     assert result.returncode == 0, result.stderr
     assert json.loads((work / "network-check.json").read_text())["egress"]["asserted"]["llm"] is False
+
+
+@pytest.mark.parametrize("url,entry,words", [
+    ("https://api.svc.example/v1", {"cidr": "203.0.113.%d/32" % (sum(b"api.svc.example") % 200 + 10), "port": 443}, ""),
+    ("http://llm.models.svc.cluster.local:8000/v1", None, "llm.base_url (http://llm.models.svc.cluster.local:8000) names an in-cluster Service"),
+    ("https://xn--mnchen-3ya.example/v1", {"cidr": "203.0.113.%d/32" % (sum("xn--mnchen-3ya.example".encode()) % 200 + 10), "port": 443}, ""),
+    ("https://münchen.example/v1", {"cidr": "203.0.113.%d/32" % (sum("münchen.example".encode()) % 200 + 10), "port": 443}, ""),
+    ("http://[64:ff9b::10.0.0.5]:8000/v1", {"cidr": "64:ff9b::10.0.0.5/128", "port": 8000}, ""),
+])
+def test_a_name_is_resolved_before_it_is_called_in_cluster_and_any_host_byte_is_admitted(runtime, tmp_path, url, entry, words):
+    """The resolver is asked first: a public name that carries a `svc` label
+    gets its rule, and only a name that resolves nowhere is said as an
+    in-cluster Service when it is shaped like one. A hostname is refused
+    for nothing a host cannot carry — a Unicode name is handed to the
+    resolver as it is, whatever the operator's locale — and an IPv6 literal
+    with an embedded IPv4 is an address."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    site = json.loads((work / "site.json").read_text()); site["llm"]["base_url"] = url
+    (work / "site.json").write_text(json.dumps(site, ensure_ascii=False))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload), LC_ALL="C.UTF-8")
+    assert result.returncode == 0, result.stderr
+    endpoints = json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+    ocr = {"cidr": "203.0.113.%d/32" % (sum(b"ocr.example") % 200 + 10), "port": 443}
+    assert endpoints == sorted([e for e in (entry, ocr) if e], key=lambda e: (e["cidr"], e["port"])), result.stderr
+    if words: assert words in result.stderr, result.stderr
+
+
+def test_the_startup_source_proof_pod_switches_onnx_telemetry_off():
+    """The source-proof Pod runs the predecessor's web image and opens an
+    ONNX Runtime session; its own spec carries the switch, since the image
+    it runs may predate the one baked in."""
+    text = (INSTALLER / "startup-recovery.sh").read_text()
+    line = next(l for l in text.splitlines() if "startup-data-pod.json" in l and 'name:"source-proof"' in l)
+    assert 'env:[{name:"ORT_DISABLE_TELEMETRY",value:"1"}]' in line

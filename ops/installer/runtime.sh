@@ -1240,8 +1240,11 @@ egress_endpoint_urls() { # merged site file -> "site key<TAB>url" lines, every a
  fi
 }
 resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what cannot be resolved here is said, not refused
- local key=$1 url=$2 scheme='' rest authority host port address shown ports p cidr cidrs=()
- local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:]+$' local_answer='^(127\.|169\.254\.|::1$|[fF][eE]80:|0\.0\.0\.0$)'
+ local key=$1 url=$2 scheme='' rest authority host port address shown ports p cidr cidrs=() literal=0
+ # the character tests below read bytes, whatever the operator's locale: a
+ # name is refused only for what no host can carry
+ local LC_ALL=C
+ local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' ipv4 ipv6='^[0-9A-Fa-f:.]+$' local_answer='^(127\.|169\.254\.|::1$|[fF][eE]80:|0\.0\.0\.0$)'
  ipv4="^$octet\.$octet\.$octet\.$octet$"
  # what a refusal or a log line names: the site key and, for the LLM, the OCR
  # and an origin, the URL's origin; never a proxy URL (its file may carry what
@@ -1250,7 +1253,7 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  if [[ $url == *://* ]]; then scheme=${url%%://*}; rest=${url#*://}; else rest=$url; fi
  scheme=$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')
  authority=${rest%%[/?#]*}; authority=${authority##*@}
- if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; port=${authority##*]}; port=${port#:}
+ if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; port=${authority##*]}; port=${port#:}; literal=1
  elif [[ $authority == *:* ]]; then host=${authority%%:*}; port=${authority##*:}
  else host=$authority; port=''; fi
  if [[ -n $port ]]; then ports=$port
@@ -1261,21 +1264,24 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
    case $scheme in https) ports=443;; socks5|socks5h|socks4|socks4a) ports=1080;; *) ports=80;; esac
    [[ $key != trust.proxy_file || $ports == 1080 ]] || { ports="$ports 1080"; log "$shown names no port; the gsj pod gets a rule on the scheme's port and on 1080 (curl's proxy default); name the port in the proxy file to admit one"; }
  fi
- # an IPv4-mapped IPv6 literal is its IPv4 address; a zone-scoped literal
- # (fe80::1%eth0) is no address a policy can name and fails the check below
+ # an IPv4-mapped IPv6 literal is its IPv4 address; a bracketed literal is
+ # hex, colons and dots (an embedded IPv4 as in 64:ff9b::10.0.0.5 included),
+ # a zone-scoped literal (fe80::1%eth0) is no address a policy can name; a
+ # name may carry any byte a host can, and the resolver says what it is
  if [[ $host =~ ^::[fF]{4}:(.*)$ ]]; then local mapped=${BASH_REMATCH[1]}; [[ $mapped =~ $ipv4 ]] && host=$mapped; fi
- [[ $host =~ ^[A-Za-z0-9._~-]+$ || $host =~ $ipv6 ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+ if (( literal )); then [[ $host =~ $ipv6 || $host =~ $ipv4 ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+ else [[ -n $host && ! $host =~ [[:space:][:cntrl:]/@?#\[\]] ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"; fi
  for p in $ports; do
    { [[ $p =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )); } || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
  done
  if [[ $host =~ $ipv4 ]]; then cidrs=("$host/32")
  elif [[ $host == *:* ]]; then cidrs=("$host/128")
- elif [[ $host == *.svc || $host == *.svc.* ]]; then
-   log "$shown names an in-cluster Service; this release's outbound list admits addresses outside the cluster only, so the gsj pod gets no rule for it"; return 0
  elif ! command -v getent >/dev/null 2>&1; then log "getent is not available on this machine; $shown gets no outbound rule"; return 0
  else
    # a dotted quad that is no address (999.1.1.1, 010.0.0.7) is a name here,
-   # and the resolver says what it is
+   # and the resolver says what it is; a name this machine cannot resolve is
+   # said as an in-cluster Service when it is shaped like one (…svc…), which
+   # this release's list cannot admit, and as unresolvable otherwise
    while read -r address; do
      [[ -n $address ]] || continue
      if [[ $address =~ $local_answer ]]; then
@@ -1283,7 +1289,14 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
      fi
      if [[ $address == *:* ]]; then cidrs+=("$address/128"); else cidrs+=("$address/32"); fi
    done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
-   (( ${#cidrs[@]} )) || { log "$shown names a host this machine cannot resolve to an address the pod could reach; the gsj pod gets no outbound rule for it (fix this machine's DNS for that name, or name the address in the site file, and run again)"; return 0; }
+   if (( ! ${#cidrs[@]} )); then
+     if [[ $host == *.svc || $host == *.svc.* ]]; then
+       log "$shown names an in-cluster Service; this release's outbound list admits addresses outside the cluster only, so the gsj pod gets no rule for it"
+     else
+       log "$shown names a host this machine cannot resolve to an address the pod could reach; the gsj pod gets no outbound rule for it (fix this machine's DNS for that name, or name the address in the site file, and run again)"
+     fi
+     return 0
+   fi
  fi
  for cidr in "${cidrs[@]}"; do for p in $ports; do jq -n --arg cidr "$cidr" --argjson port "$((10#$p))" '{cidr:$cidr,port:$port}'; done; done
 }
@@ -4272,10 +4285,11 @@ network_verify() {
  connected=$(tr ' ' '\n' <<< "$chroma_report" | awk -F= '$2=="connected" && $1!="control" {print $1}' | paste -sd ',' - | sed 's/,/, /g')
  [[ -z $connected ]] || fail "NetworkPolicy outbound deny was not enforced on Chroma: it connected to $connected, and Chroma may reach nothing but DNS"
  [[ $chroma_report == *"dns=ok"* ]] || fail "cluster DNS did not answer from the Chroma pod, which its outbound policy must admit (the probe reported: $chroma_report)"
- # the panel's probes honour a proxy the site names; a proxy file that names
- # none (NO_PROXY alone) leaves them dialling directly, and the panel is held
+ # the panel's canaries are https, so only HTTPS_PROXY takes them through a
+ # proxy; a file naming HTTP_PROXY alone, or none, leaves them dialling
+ # directly, and the panel is held
  local proxied=false pfile; pfile=$(j '.trust.proxy_file // ""')
- if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && jq -e '((.HTTP_PROXY // "") != "") or ((.HTTPS_PROXY // "") != "")' "$pfile" >/dev/null 2>&1 && proxied=true; fi
+ if [[ -n $pfile ]]; then pfile=$(resolve_file "$pfile"); [[ -r $pfile ]] && jq -e '(.HTTPS_PROXY // "") != ""' "$pfile" >/dev/null 2>&1 && proxied=true; fi
  isolation_verify "$proxied"
  jq -n --arg source "$forge" --argjson seconds "$elapsed" --slurpfile probe "$STATE_DIR/egress-probe.json" --arg chroma "$chroma_report" --arg llm_ok "$llm_state" --arg ocr_ok "$ocr_state" --argjson proxied "$proxied" --slurpfile isolation "$STATE_DIR/isolation.json" \
    '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,

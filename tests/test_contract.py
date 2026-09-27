@@ -103,9 +103,9 @@ def web_deployment(docs, release="gsj"):
 @pytest.mark.parametrize("example", EXAMPLES, ids=[p.name for p in EXAMPLES])
 def test_every_example_site_validates_compiles_and_renders_with_the_pinned_chart(tmp_path, example):
     site = validated(merged(example))
-    # the runtime passes the resolved outbound list; here a stand-in address
-    # stands for the examples' hostnames, so a chart that refuses a hostname
-    # with an empty list still renders them
+    # the runtime always passes the resolved outbound list; here a stand-in
+    # address stands for the examples' hostnames (the chart refuses a
+    # hostname only while the key is unset)
     values = compiled(tmp_path, site, "--argjson", "egress_endpoints", json.dumps(STAND_IN_ENDPOINTS))
     release = site["target"]["release"]
     docs = rendered(tmp_path, values, release=release)

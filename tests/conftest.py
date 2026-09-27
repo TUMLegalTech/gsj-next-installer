@@ -56,7 +56,8 @@ try:
 except ValueError: pass
 # a name the test's state lists as loopback answers as /etc/hosts would on a machine that maps it locally
 if name in s.get("loopback", []): print(f"127.0.0.1 STREAM {name}"); sys.exit(0)
-if name.endswith(".invalid") or name in s.get("unresolvable", []): sys.exit(2)
+# an in-cluster Service name resolves nowhere outside its cluster
+if name.endswith(".invalid") or name.endswith(".svc") or name.endswith(".svc.cluster.local") or name in s.get("unresolvable", []): sys.exit(2)
 n = sum(name.encode()) % 200 + 10
 print(f"203.0.113.{n} STREAM {name}"); print(f"203.0.113.{n} DGRAM {name}")
 """
