@@ -407,3 +407,66 @@ def test_an_unmeasured_transfer_directory_is_refused_before_the_stream(runtime, 
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
     assert refusal.startswith("GSJ: restore staging space is unmeasured"), refusal
     assert "nothing was streamed" in refusal
+
+
+PRIOR = "b" * 24
+
+
+def _prior_restore(work, checkpoint, canonical):
+    """The site directory of a deployment an earlier restore made: its
+    checkpoint, and the canonical record as abandon, sweep or a later
+    operation left it (None: no canonical record at all)."""
+    (work / "restoration.json").write_text(json.dumps({
+        "format": "gsj.restore/1", "archive": "/earlier/snapshot.tar.gz.enc", "archive_sha256": "e" * 64,
+        "operation": PRIOR, "release_identity": "synthetic-release", "target_namespace_uid": "replaced-namespace-uid",
+        "status": checkpoint}))
+    if canonical is None:
+        return
+    operation, status = canonical
+    (work / "operation.json").write_text(json.dumps({"operation": operation, "kind": "restore",
+                                                     "target": "synthetic-release", "status": status}))
+    if status == "abandoned":
+        (work / f"abandoned-{operation}.json").write_text(json.dumps({"format": "gsj.operation-abandoned/1", "operation": operation}))
+    if status == "swept":
+        (work / f"swept-20260101T000000Z-{operation}.json").write_text(json.dumps({"format": "gsj.target-swept/1"}))
+
+
+@pytest.mark.parametrize("canonical", [(PRIOR, "complete"), (PRIOR, "abandoned"), (PRIOR, "swept"), ("c" * 24, "backup-complete")])
+def test_a_fresh_restore_retires_the_completed_checkpoint_of_an_ended_restore(runtime, tmp_path, canonical):
+    # One cluster: the namespace was deleted and is restored again from the
+    # same site directory, where the restore that made the deployment left its
+    # completed checkpoint. Retired beside that operation's evidence, it no
+    # longer refuses the fresh restore, which records its own.
+    invoke, _ = _restore_fixture(runtime, tmp_path)
+    _, state, work = runtime
+    _prior_restore(work, "complete", canonical)
+    original = (work / "restoration.json").read_bytes()
+    result = invoke()
+    assert result.returncode == 0, result.stderr
+    retired = work / f"restore-{PRIOR}" / "retired-restoration.json"
+    assert retired.read_bytes() == original
+    assert f"Retired the completed restore checkpoint of ended operation {PRIOR}" in result.stderr
+    current = json.loads((work / "restoration.json").read_text())
+    assert current["operation"] not in (PRIOR, "c" * 24) and current["status"] == "complete"
+    assert json.loads((work / "operation.json").read_text())["operation"] == current["operation"]
+
+
+@pytest.mark.parametrize("checkpoint,canonical", [
+    ("files-restored", (PRIOR, "abandoned")),   # an unfinished restore: its own evidence
+    ("restoring-files", (PRIOR, "swept")),
+    ("complete", (PRIOR, "verifying")),         # its operation has not ended
+    ("complete", None),                         # nothing proves it ended
+])
+def test_any_other_restore_checkpoint_still_refuses_a_fresh_restore(runtime, tmp_path, checkpoint, canonical):
+    invoke, _ = _restore_fixture(runtime, tmp_path)
+    _, state, work = runtime
+    _prior_restore(work, checkpoint, canonical)
+    original = (work / "restoration.json").read_bytes()
+    result = invoke()
+    assert result.returncode != 0
+    assert "restore checkpoint already exists; use restore-repair --operation ID" in result.stderr, result.stderr
+    assert (work / "restoration.json").read_bytes() == original
+    assert not (work / f"restore-{PRIOR}").exists()
+    assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
+                   for call in json.loads(state.read_text())["calls"])
+

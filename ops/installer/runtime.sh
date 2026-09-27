@@ -4410,11 +4410,34 @@ verification_bot_step() {
 }
 verify_application() {
  assert_owner
- local pod run generation remote staged settings rc existing old_binding mode control nsuid active="$STATE_DIR/verification-active.json"
+ local pod run generation remote staged settings rc existing old_binding mode control nsuid prior recorded retire=false active="$STATE_DIR/verification-active.json"
  pod=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gsj" -o json | jq -er '[.items[]|select(.status.phase=="Running")]|if length==1 then .[0].metadata.name else error("one application pod required") end')
  generation=$(k get cm "$RELEASE-provisioned" -o json | jq -er .data.generation)
  jq '.status="verifying"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
  public_verify; network_verify
+ # Another operation's run is resumed under its old binding only where its
+ # ledger can still be. A restore rebuilt every claim from its archive, so a
+ # finished run (complete or cleaned: its owned resources are already clean)
+ # has nothing left to resume; a namespace replaced since that operation (on
+ # one cluster: deleted, recreated, then installed or restored afresh from the
+ # same site directory) took any run's ledger with its claims. Resumed, both
+ # stopped with 'verification ownership ledger is missing after launch' after
+ # everything was rebuilt. Such a record is retired beside its run's evidence
+ # and this operation starts its own run; any other keeps its reconciliation.
+ # That operation ended: this one was admitted after it.
+ if [[ -f $active && ! -L $active ]] && jq -e --arg op "$OPERATION" '.operation!=$op and (.operation|test("^[a-f0-9]{24}$")) and (.run_id|test("^[a-f0-9]{12}$")) and (.status|IN("active","complete","cleaned"))' "$active" >/dev/null 2>&1; then
+   run=$(jq -r .run_id "$active"); prior=$(jq -r .operation "$active")
+   recorded=$(jq -r '.namespace_uid//""' "$STATE_DIR/operation-intents/$prior/intent.json" 2>/dev/null) || recorded=''
+   if [[ -n $recorded ]]; then
+     nsuid=$(k get namespace "$NAMESPACE" -o json | jq -er '.metadata.uid|select(type=="string" and length>0)') || fail 'operation namespace identity is unavailable'
+     [[ $recorded == "$nsuid" ]] || retire=true
+   fi
+   if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null && jq -e '.status|IN("complete","cleaned")' "$active" >/dev/null; then retire=true; fi
+   if $retire; then
+     mkdir -p "$STATE_DIR/verification/$run"; mv "$active" "$STATE_DIR/verification/$run/retired-verification-active.json"
+     log "Retired verification run $run of ended operation $prior to $STATE_DIR/verification/$run/retired-verification-active.json: its ledger went with the claims this operation replaced; this operation starts its own run"
+   fi
+ fi
  while true; do
    old_binding=false
    if [[ -f $active ]] && jq -e '.status|IN("active","complete","cleaned")' "$active" >/dev/null; then
@@ -5514,6 +5537,20 @@ restore_archive() {
      ARCHIVE=$(jq -r .archive "$STATE_DIR/restoration.json")
    fi
  else
+   # One cluster restores into its recreated namespace from the site directory
+   # of the deployment it replaces, where that deployment's restore left its
+   # completed checkpoint, which refused this restore. Once that operation has
+   # ended, the checkpoint is retired beside its evidence: the canonical record
+   # names it complete, abandoned or swept (abandon and sweep mark it after
+   # writing their own records), or names a later operation, which acquire
+   # admits only after this one ended. Any other checkpoint keeps the refusal.
+   local prior
+   prior=$(jq -r 'select(.status=="complete")|.operation|select(type=="string" and test("^[a-f0-9]{24}$"))' "$STATE_DIR/restoration.json" 2>/dev/null) || prior=''
+   if [[ -n $prior && -f $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json && -f $STATE_DIR/operation.json && ! -L $STATE_DIR/operation.json && ! -L $STATE_DIR/restore-$prior ]] &&
+     jq -e --arg op "$prior" '.operation!=$op or (.status|IN("complete","abandoned","swept"))' "$STATE_DIR/operation.json" >/dev/null 2>&1; then
+     mkdir -p "$STATE_DIR/restore-$prior"; mv "$STATE_DIR/restoration.json" "$STATE_DIR/restore-$prior/retired-restoration.json"
+     log "Retired the completed restore checkpoint of ended operation $prior to $STATE_DIR/restore-$prior/retired-restoration.json; this restore records its own"
+   fi
    [[ ! -e $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json ]] || fail 'restore checkpoint already exists; use restore-repair --operation ID for its recorded resource/file phase or resume for application startup'
  fi
  [[ -n $ARCHIVE ]] || fail 'restore requires --archive BACKUP.tar.gz.enc'

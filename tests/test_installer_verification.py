@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -553,3 +554,50 @@ def test_a_continued_operation_names_no_route_correction(verification,continuati
             assert hint(result)==(f'resume --operation {operation} {resume} once the route is reachable, if the failure was transient; '
                                   f'otherwise keep operation {operation} retained and {fresh}')
     assert json.loads((work/'verification-active.json').read_text())['release']==('older-release' if older else 'synthetic-release')
+
+
+PRIOR='b'*24
+
+
+@pytest.mark.parametrize('kind,status,namespace,retired',[
+    # A restore rebuilt every claim from its archive: a finished run of an
+    # ended operation has nothing left to resume, wherever it ran.
+    ('restore','complete',None,True),
+    ('restore','cleaned',None,True),
+    # The namespace the ended operation ran in was deleted, and its ledger with
+    # its claims: an install or restore into the recreated one starts afresh.
+    ('install','complete','replaced-namespace-id',True),
+    ('install','active','replaced-namespace-id',True),
+    ('restore','active','replaced-namespace-id',True),
+    # Same namespace: an unfinished run, or any run of an upgrade, keeps its
+    # reconciliation under the original binding, and its missing ledger its refusal.
+    ('restore','active','namespace-id',False),
+    ('upgrade','complete','namespace-id',False),
+])
+def test_a_run_of_an_ended_operation_whose_ledger_went_with_its_claims_is_retired(verification,kind,status,namespace,retired):
+    run,state,work,root=verification
+    if status=='complete': assert run([75]).returncode==0
+    elif status=='cleaned': assert run([75],77).returncode!=0
+    else: assert run([1]).returncode!=0
+    active_path=work/'verification-active.json';old=json.loads(active_path.read_text());rid=old['run_id']
+    assert old['status']==status and old['launched'] is True
+    old['operation']=PRIOR;active_path.write_text(json.dumps(old));before=active_path.read_bytes()
+    shutil.rmtree(root/'remote/data/verification'/rid)
+    (work/'operation.json').write_text(json.dumps({'operation':'a'*24,'kind':kind,'target':'synthetic-release','status':'initializing'}))
+    if namespace:
+        (work/'operation-intents'/PRIOR).mkdir(parents=True)
+        (work/'operation-intents'/PRIOR/'intent.json').write_text(json.dumps({'format':'gsj.operation-intent/1',
+            'record':{'operation':PRIOR,'target':'synthetic-release','kind':'restore','status':'owned'},'namespace_uid':namespace}))
+    state.write_text(json.dumps({'codes':[],'calls':[]}))
+    result=run([75])
+    if retired:
+        assert result.returncode==0,result.stderr
+        assert f'Retired verification run {rid} of ended operation {PRIOR}' in result.stderr
+        assert (work/'verification'/rid/'retired-verification-active.json').read_bytes()==before
+        assert json.loads(state.read_text())['calls']==['initial','cleanup']
+        current=json.loads(active_path.read_text())
+        assert current['run_id']!=rid and current['operation']=='a'*24 and current['status']=='complete'
+        assert json.loads((work/'operation.json').read_text())['verification_attempts']==1
+    else:
+        assert result.returncode!=0 and 'verification ownership ledger is missing after launch' in result.stderr
+        assert active_path.read_bytes()==before and not (work/'verification'/rid/'retired-verification-active.json').exists()
