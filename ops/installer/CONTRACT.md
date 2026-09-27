@@ -124,9 +124,13 @@ removes the door from the Service. The same check runs a probe program in the
 stdin: httpx GETs that must answer — Forgejo, Chroma, and the LLM's
 `/v1/models` and the OCR route when they answer the installer's machine at
 that moment with an HTTP status of their own, dialled as the pod dials them:
-the site's CA file, its proxy and its NO_PROXY names; a TLS failure or a
-status the proxy itself answers with keeps the endpoint's skip — and socket
-connects that must fail within 10 s), a bash `/dev/tcp` probe in the Chroma container (a positive control
+the site's CA file, its proxy and its NO_PROXY names, nothing of the shell's;
+a TLS failure or a status the proxy itself answers with keeps the endpoint's
+skip, and so does an endpoint the applied values carry no rule for (a name
+curl resolved here but `getent` could not) — and socket connects, to the
+hubs, the package index, the agent runtime's hosts, the telemetry collector,
+a public address, the node's :22 and the Kubernetes API's ClusterIP, that
+must fail within 10 s), a bash `/dev/tcp` probe in the Chroma container (a positive control
 against the cluster DNS the policy admits, then Forgejo, the door, a public
 address, `github.com` and the Kubernetes API's ClusterIP, which must be
 blocked — the API is what any unpoliced Pod reaches, so a missing policy

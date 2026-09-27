@@ -1239,6 +1239,17 @@ egress_endpoint_urls() { # merged site file -> "site key<TAB>url" lines, every a
    fi
  fi
 }
+ipv6_literal_ok() { # an IPv6 literal, an IPv4 octet regex -> 0 when the literal's grammar holds: at most one "::", at most eight groups of up to four hex digits (an embedded IPv4 tail counts as two), nothing else
+ local body=$1 ipv4=$2 tail g n=0 double=0
+ if [[ $body == *.* ]]; then tail=${body##*:}; [[ $tail =~ $ipv4 ]] || return 1; body="${body%"$tail"}0:0"; fi
+ [[ $body != *:::* ]] || return 1
+ case $body in *::*::*) return 1;; *::*) double=1;; esac
+ [[ $body != :* || $body == ::* ]] || return 1
+ [[ $body != *: || $body == *:: ]] || return 1
+ local IFS=':'
+ for g in $body; do [[ -z $g ]] && continue; [[ $g =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1; n=$((n+1)); done
+ if (( double )); then (( n <= 7 )); else (( n == 8 )); fi
+}
 resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what cannot be resolved here is said, not refused
  local key=$1 url=$2 scheme='' rest authority host port address shown ports p cidr cidrs=() literal=0
  # the character tests below read bytes, whatever the operator's locale: a
@@ -1270,14 +1281,15 @@ resolve_endpoint() { # site key, URL -> one {cidr, port} per address; what canno
  # name may carry any byte a host can, and the resolver says what it is
  if (( literal )); then
    [[ $host =~ $ipv4 || ( $host =~ $ipv6 && $host == *:* ) ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
-   if [[ $host == *:* ]] && command -v getent >/dev/null 2>&1; then
-     # the resolver parses the literal into its canonical form (its IPv6
-     # database, which does not narrow the family to what this machine has
-     # configured); what it cannot parse is no address a policy can be
-     # written for
-     local parsed; parsed=$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1}')
-     [[ -n $parsed ]] || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
-     host=$parsed
+   if [[ $host == *:* ]]; then
+     # the literal's grammar is checked here, not by the resolver: a machine
+     # without IPv6 answers nothing for any IPv6 query, literal or not; what
+     # the resolver does answer is the canonical form, and is taken
+     ipv6_literal_ok "$host" "$ipv4" || fail "$shown is not a host and a port (1-65535) a NetworkPolicy can be written for"
+     if command -v getent >/dev/null 2>&1; then
+       local parsed; parsed=$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+       [[ -z $parsed ]] || host=$parsed
+     fi
    fi
  fi
  if [[ $host =~ ^::[fF]{4}:(.*)$ ]]; then local mapped=${BASH_REMATCH[1]}; [[ $mapped =~ $ipv4 ]] && host=$mapped; fi
@@ -4184,7 +4196,9 @@ public_verify() {
 # network_verify. A refused target is "no connection" whatever the CNI's way
 # of refusing — an immediate reset (kube-router), a hang to the timeout
 # (Calico, kindnet) or a name that did not resolve — and only the arbitrary
-# public ADDRESS, which needs no name, must be a real refusal or timeout.
+# public ADDRESS, which needs no name, counts as blocked on any outcome but a
+# completed connection, like every other canary; the Kubernetes API's
+# ClusterIP is among them, the canary any unpoliced pod reaches.
 GSJ_EGRESS_PROBE_PY='import json, socket, sys, time
 import httpx
 spec = json.load(sys.stdin)
@@ -4269,8 +4283,11 @@ network_verify() {
  # what answers THIS machine now (any HTTP status within 10 s) is held to an
  # answer from the pod; an endpoint that answers nowhere keeps its
  # acceptance skip, as the preflight said
- [[ -z $llm ]] || { endpoint_answers_here "${llm%/}/models" && llm_state=working || llm_state=silent; }
- [[ -z $ocr ]] || { endpoint_answers_here "$ocr" && ocr_state=working || ocr_state=silent; }
+ # ... and only for an endpoint the applied values admit: a name curl
+ # resolves here but the resolver could not is on no list, so the pod's
+ # silence is the list's honesty, said in the log, not a policy failure
+ [[ -z $llm ]] || { llm_state=silent; if endpoint_answers_here "${llm%/}/models"; then if endpoint_admitted llm.base_url "$llm"; then llm_state=working; else log "llm.base_url ($(url_origin_only "$llm")) answers this machine, but the applied outbound list carries no rule for it; the pod's answer is not held"; fi; fi; }
+ [[ -z $ocr ]] || { ocr_state=silent; if endpoint_answers_here "$ocr"; then if endpoint_admitted ocr.url "$ocr"; then ocr_state=working; else log "ocr.url ($(url_origin_only "$ocr")) answers this machine, but the applied outbound list carries no rule for it; the pod's answer is not held"; fi; fi; }
  jq -n --arg release "$RELEASE" --arg node "$node" --arg llm "$llm" --arg ocr "$ocr" '
    {answer:({forgejo:"http://\($release)-forgejo:3000/api/healthz", chroma:"http://\($release)-chroma:8000/api/v2/heartbeat"}
             + (if $llm != "" then {llm:(($llm|sub("/+$";""))+"/models")} else {} end)
@@ -4278,7 +4295,8 @@ network_verify() {
     refuse:({"huggingface.co":{host:"huggingface.co",port:443}, "pypi.org":{host:"pypi.org",port:443}, "github.com":{host:"github.com",port:443},
              "api.github.com":{host:"api.github.com",port:443}, "pi.dev":{host:"pi.dev",port:443},
              "mobile.events.data.microsoft.com":{host:"mobile.events.data.microsoft.com",port:443},
-             "public-address":{host:"1.1.1.1",port:443}, "node-ssh":{host:$node,port:22}}),
+             "public-address":{host:"1.1.1.1",port:443}, "node-ssh":{host:$node,port:22},
+             "kubernetes-api":{host:"kubernetes.default.svc",port:443}}),
     resolve:{cluster:"\($release)-forgejo"}}' > "$GSJ_WORK/egress-spec.json"
  probe=$(k exec -i "$pod" -c gsj-web -- python -c "$GSJ_EGRESS_PROBE_PY" egress-probe < "$GSJ_WORK/egress-spec.json") || fail "the outbound probe did not run in the application pod (exit $?)"
  jq -e 'type=="object" and (.answer|type=="object") and (.refuse|type=="object") and (.resolve|type=="object")' <<< "$probe" >/dev/null 2>&1 || fail 'the outbound probe in the application pod reported nothing readable'
@@ -4314,6 +4332,15 @@ network_verify() {
      egress:{gsj:$probe[0],asserted:{llm:($llm_ok=="working"),ocr:($ocr_ok=="working"),isolation:($proxied|not)},chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries),
              isolation:{targets:$isolation[0].targets,server:[$isolation[0].server[]?.verdict],runner:[$isolation[0].runner[]?.verdict]}}}' > "$STATE_DIR/network-check.json"
 }
+endpoint_admitted() { # site key, URL -> 0 when the applied values carry a rule for it, or the chart derives one (an IPv4 literal)
+ local rest authority host want
+ rest=${2#*://}; authority=${rest%%[/?#]*}; authority=${authority##*@}
+ if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; else host=${authority%%:*}; fi
+ [[ ! $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+ want=$(resolve_endpoint "$1" "$2" 2>/dev/null | jq -s '.') || return 1
+ [[ $want != '[]' ]] || return 1
+ jq -e --argjson want "$want" '(.networkPolicy.egress.endpoints // []) as $l | all($want[]; . as $e | ($l|index($e)) != null)' "$GSJ_WORK/values.pending.json" >/dev/null 2>&1
+}
 endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s, dialled as the pod dials it
  # the pod dials it with the site's CA bundle, through the site's proxy and
  # past it for NO_PROXY names, so this machine dials it the same way; what
@@ -4347,7 +4374,8 @@ endpoint_answers_here() { # a URL -> 0 when it answers this machine within 10 s,
  fi
  # the shell's own proxy variables never route this probe: only the site's
  # proxy file does, as in the pod
- code=$(env -u CURL_CA_BUNDLE -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY curl "${args[@]}" "$1" 2>/dev/null) || rc=$?
+ # (-q first: the operator's .curlrc must not route or trust for it either)
+ code=$(env -u CURL_CA_BUNDLE -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY curl -q "${args[@]}" "$1" 2>/dev/null) || rc=$?
  (( rc == 0 )) || return 1
  [[ $code =~ ^[1-5][0-9][0-9]$ ]] || return 1
  case $code in 407|502|503|504) [[ -z $proxy ]];; *) return 0;; esac

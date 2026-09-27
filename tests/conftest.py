@@ -46,6 +46,10 @@ _SYNTHETIC_GETENT = """#!/usr/bin/env python3
 import ipaddress, json, os, pathlib, sys
 a = sys.argv[1:]
 if a[:1] not in (["ahosts"], ["ahostsv6"]) or len(a) != 2: sys.exit(1)
+# a machine without IPv6 answers nothing for any IPv6 query, a literal included, when a test's state says so
+if a[0] == "ahostsv6":
+    _state = os.environ.get("TEST_KUBECTL_STATE")
+    if _state and os.path.exists(_state) and json.loads(pathlib.Path(_state).read_text()).get("no_ipv6"): sys.exit(2)
 name = a[1]
 state = os.environ.get("TEST_KUBECTL_STATE")
 s = json.loads(pathlib.Path(state).read_text()) if state and os.path.exists(state) else {}

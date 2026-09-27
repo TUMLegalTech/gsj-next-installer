@@ -2779,7 +2779,7 @@ browser or host trust store is modified automatically.
 
 ## Outgoing connections
 
-The chart closes the outbound traffic of the two Pods that hold case data.
+The chart closes the outbound traffic of the gsj Pod and of Chroma (Forgejo's outbound traffic was already pinned by its own policy).
 The gsj Pod — gsj-web, the MCP door, the agent runner and their init
 containers share one network namespace, so one list serves all of them — may
 reach exactly:
@@ -2807,10 +2807,13 @@ reach exactly:
   reachable from the Pod under this release. A continued, resumed or repaired
   operation, and every command that applies nothing (`backup`, `sweep`,
   `abandon`, the named repairs), keep the addresses the operation recorded:
-  they never ask this machine's resolver again, so a backup runs on a machine
-  without the site's DNS and an interrupted operation resumes whatever the
-  resolver answers today. An operation that recorded nothing (one that began
-  before this list existed) resolves once and keeps the answer in its state.
+  once the operation has recorded its list they never ask this machine's
+  resolver again, so a backup runs on a machine without the site's DNS and an
+  interrupted operation resumes whatever the resolver answers today. A
+  continued operation that recorded nothing (one that began before this list
+  existed) resolves once and keeps the answer in its state; a command that
+  continues nothing and finds none recorded resolves what it can at each run,
+  never refusing an unresolvable name.
   A restore to a machine that does not carry the proxy file yet takes the
   proxy from the archive once it is open. A name your cluster's DNS
   answers with another address than this machine's DNS is yours to

@@ -1750,6 +1750,9 @@ def _network_cluster(state, *, deny_code, deny_delay=0.0, egress_rules=None):
     state.write_text(json.dumps(s))
     work = state.parent / "work"
     (work / "op.pass").write_text("synthetic-operator-password\n"); (work / "op.pass").chmod(0o600)
+    # the applied values: the site's two endpoints resolved into the outbound list, as the compile writes them
+    (work / "values.pending.json").write_text(json.dumps({"networkPolicy": {"egress": {"endpoints": [
+        {"cidr": "203.0.113.%d/32" % (sum(b"llm.example") % 200 + 10), "port": 443}, {"cidr": "203.0.113.%d/32" % (sum(b"ocr.example") % 200 + 10), "port": 443}]}}}))
     (work / "manifest.yaml").write_text("---\n# Source: gsj/templates/networkpolicy.yaml\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
                                         "metadata:\n  name: synthetic-release-gsj-egress\nspec:\n  podSelector:\n    matchLabels:\n      app.kubernetes.io/name: gsj\n"
                                         "---\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: synthetic-release-chroma-egress\n")
@@ -1765,7 +1768,7 @@ def _closed_egress_probe(**changes):
     report = {"answer": {"forgejo": {"http": 200}, "chroma": {"http": 200}, "llm": {"http": 200}, "ocr": {"http": 405}},
               "refuse": {name: {"connected": False, "outcome": "ConnectionRefusedError", "seconds": 0.0}
                          for name in ("huggingface.co", "pypi.org", "github.com", "api.github.com", "pi.dev",
-                                      "mobile.events.data.microsoft.com", "public-address", "node-ssh")},
+                                      "mobile.events.data.microsoft.com", "public-address", "node-ssh", "kubernetes-api")},
               "resolve": {"cluster": True}}
     for section, entries in changes.items():
         report[section].update(entries)
@@ -1825,7 +1828,8 @@ def test_networkpolicy_check_records_the_closed_outbound_list_from_inside_both_p
     assert spec["answer"]["llm"] == "https://llm.example/v1/models" and spec["answer"]["ocr"] == "https://ocr.example/v1/chat/completions"
     assert spec["refuse"]["node-ssh"] == {"host": "192.0.2.10", "port": 22}
     assert set(spec["refuse"]) == {"huggingface.co", "pypi.org", "github.com", "api.github.com", "pi.dev",
-                                   "mobile.events.data.microsoft.com", "public-address", "node-ssh"}
+                                   "mobile.events.data.microsoft.com", "public-address", "node-ssh", "kubernetes-api"}
+    assert spec["refuse"]["kubernetes-api"] == {"host": "kubernetes.default.svc", "port": 443}
     calls = json.loads(state.read_text())["calls"]
     probe = next(c for c in calls if "egress-probe" in c)
     assert probe[:5] == ["exec", "-i", "gsj-0", "-c", "gsj-web"] and probe[5:7] == ["--", "python"]
@@ -3629,9 +3633,48 @@ def test_the_host_side_probe_ignores_the_shells_proxy_variables_and_survives_a_m
     assert result.returncode == 0, result.stderr
     s = json.loads(state.read_text())
     assert s["host_probe_proxy_env"] == [[], []], s["host_probe_proxy_env"]
-    assert not any("--proxy" in p for p in s["host_probes"])
+    assert not any("--proxy" in p for p in s["host_probes"]) and all(p[0] == "-q" for p in s["host_probes"]), "no proxy, and no rc file of the operator's"
     _network_cluster(state, deny_code=1)
     result = run("system_ca_bundle() { fail 'system CA bundle is unavailable'; }\n" + NETWORK_VERIFY)
     assert result.returncode == 0, result.stderr
     record = json.loads((work / "network-check.json").read_text())
     assert record["egress"]["asserted"] == {"llm": False, "ocr": False, "isolation": True}, "no bundle: the endpoints keep their skip, the rest is held"
+
+
+@pytest.mark.parametrize("literal,ok", [("2001:db8::5", True), ("::1", True), ("64:ff9b::10.0.0.5", True), ("fe80::1", True), ("1:2:3:4:5:6:7:8", True),
+                                        ("dead:beef", False), ("1:2:3:4:5:6:7:8:9", False), ("::1::2", False), ("1:::2", False), ("12345::1", False), ("::ffff:300.1.1.1", False), (":1", False)])
+def test_an_ipv6_literal_is_judged_by_its_grammar_not_by_this_machines_resolver(runtime, tmp_path, literal, ok):
+    """A machine without IPv6 answers nothing for any IPv6 query, a literal
+    included: the literal's grammar is checked here, the resolver only
+    canonicalises what it happens to answer, and what it does not answer is
+    emitted as written."""
+    run, state, work = runtime
+    payload = _payload_for_compile(tmp_path)
+    s = json.loads(state.read_text()); s["no_ipv6"] = True; state.write_text(json.dumps(s))
+    site = json.loads((work / "site.json").read_text()); site["llm"]["base_url"] = f"http://[{literal}]:8000/v1"
+    (work / "site.json").write_text(json.dumps(site))
+    result = run('COMMAND=install; GSJ_PAYLOAD="$TEST_PAYLOAD"; compile_values "$SITE" > "$TEST_WORK/out.json"\n', TEST_PAYLOAD=str(payload))
+    if not ok:
+        assert result.returncode != 0 and "is not a host and a port (1-65535)" in result.stderr, result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    endpoints = json.loads((work / "out.json").read_text())["networkPolicy"]["egress"]["endpoints"]
+    assert {"cidr": f"{literal}/128", "port": 8000} in endpoints, endpoints
+
+
+def test_the_pod_side_answer_is_held_only_for_an_endpoint_the_applied_values_admit(runtime):
+    """A name curl resolves here but the resolver could not is on no list:
+    the endpoint answers this machine, the pod is refused by its own policy,
+    and that is the list's honesty, said in the log — not a NetworkPolicy
+    failure. An endpoint the list carries is held as before."""
+    run, state, work = runtime
+    _network_cluster(state, deny_code=1)
+    llm = "203.0.113.%d/32" % (sum(b"llm.example") % 200 + 10)
+    values = json.loads((work / "values.pending.json").read_text())
+    values["networkPolicy"]["egress"]["endpoints"] = [e for e in values["networkPolicy"]["egress"]["endpoints"] if e["cidr"] != llm]
+    (work / "values.pending.json").write_text(json.dumps(values))
+    result = run(NETWORK_VERIFY)
+    assert result.returncode == 0, result.stderr
+    assert "llm.base_url (https://llm.example) answers this machine, but the applied outbound list carries no rule for it; the pod's answer is not held" in result.stderr
+    record = json.loads((work / "network-check.json").read_text())
+    assert record["egress"]["asserted"] == {"llm": False, "ocr": True, "isolation": True}
