@@ -40,7 +40,12 @@ install and when you would find out.
   volumes you make yourself — and a single node that can hold the three
   volumes (the deployment is single-node, ReadWriteOnce). An ingress
   controller and a TLS route, or the installer's managed Traefik and ACME
-  profiles. A CNI that enforces NetworkPolicy, if the isolation is to be real.
+  profiles. A CNI that enforces NetworkPolicy: on one that does not, the
+  install does not complete — it stops at its own network check, after the
+  corpus import and before any acceptance check has run. Every pull of the
+  release's images is proven on the storage node before anything is applied,
+  for every site, so nodes that cannot pull stop an install in its first
+  minutes.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has
@@ -51,9 +56,13 @@ install and when you would find out.
   LibreSSL or an OpenSSL below the floor, are named with the tool, the floor
   and what was found; an `openssl` absent from the PATH altogether is refused
   by name alone, as a required utility. `--fetch-tools` downloads its own
-  pinned clients instead (it does not supply OpenSSL). `init` is the one
-  command that does not stop at the first: it names them all at once, in its
-  report (below).
+  pinned clients instead (it does not supply OpenSSL); `--fetch-tools=helm`
+  downloads Helm alone — the pinned Helm 4 that four recovery paths need —
+  and keeps your own kubectl and jq, floors still checked. A kubectl more
+  than one minor from the API server is warned about before the operation
+  Lease, and refused when it is the one `--fetch-tools` brought. `init` is the
+  one command that does not stop at the first: it names them all at once, in
+  its report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible
   chat-completions route whose model can read an image. Step 0 of the guide
   has a probe you can run with `curl` and `jq` before you start, and the
@@ -72,7 +81,9 @@ install and when you would find out.
   registry auth file you point it at. TUM Legal Tech hands the token over
   directly, with the release; it never travels through this repository.
 - About 3.5 GB free on the machine you install from (the corpus vectors and
-  their envelope), and the volume sizes in the guide on the cluster.
+  their envelope, under the cache directory and `TMPDIR` — on a box with a
+  small root filesystem, both belong on the data disk: step 1 of the guide),
+  and the volume sizes in the guide on the cluster.
 
 ## `init`: one file, one command, one report
 
