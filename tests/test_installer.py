@@ -2231,15 +2231,22 @@ def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path
 
 
 # The label families that have reached shipped text: review rounds, phase and
-# record names, and the words that name one machine. A reader of this public
+# record names, and an address that names a machine. A reader of this public
 # repository, of the installer it ships or of the chart inside it can resolve
 # none of them. The product's reserved account name is legitimate prose (the
 # schema and the guide's login rules name it) and is deliberately not here.
-# Every alternative is spelled apart by concatenation, so this file never
-# matches itself; the three scans below import this one list.
+# An address is a dotted quad outside the ranges an example may use because
+# they reach no one's machine (unspecified, loopback, the private RFC 1918 and
+# the documentation RFC 5737 ranges), or four number groups, dotted or dashed,
+# that open a host name: a wildcard-DNS host, whatever address it carries.
+# Every alternative is spelled apart by concatenation or by escaped dots, so
+# this file never matches itself; the three scans below import this one list.
 INTERNAL_LABEL = re.compile(
     "(?i:" + "|".join(["audit" + r" rounds?", "misattribution" + "[- ]pass", "FIX" + "-PASS", "PR" + "-FIXES",
-                       "PR" + "-DISSECT", "SAFETY" + "-FIVE", "INSTALLER" + "-SNOWFLAKE", "INSTALL" + "-GSJ-ADMIN"]) + ")|"
+                       "PR" + "-DISSECT", "SAFETY" + "-FIVE", "INSTALLER" + "-SNOWFLAKE", "INSTALL" + "-GSJ-ADMIN",
+                       r"\b(?!(?:0|10|127)\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)"
+                       r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b",
+                       r"\b[0-9]{1,3}(?:[.-][0-9]{1,3}){3}\.[a-z]"]) + ")|"
     + "|".join([r"\bPROMO" + r"TION\b", r"\bWEB" + r"NEXT\b", r"\bINIT" + r"-VERB\b", r"\bPILOT" + r"-MOVE\b",
                 r"\bRELEASE" + "-BETA", r"\bBETA" + "[0-9]", r"\bQA" + r"D\b", r"\bPATCH" + "-?[0-9]"]))
 
@@ -2247,6 +2254,37 @@ INTERNAL_LABEL = re.compile(
 def internal_labels(name, text):
     """NAME:LINE for every line of TEXT that carries an internal label."""
     return [f"{name}:{n}" for n, line in enumerate(text.splitlines(), 1) if INTERNAL_LABEL.search(line)]
+
+
+def test_the_label_guard_finds_an_address_and_a_host_built_on_one():
+    """An address outside the ranges an example may use names a machine, and
+    so does a wildcard-DNS host whatever address it carries: four number
+    groups, dotted or dashed, opening the host name. Each is found. The
+    addresses are joined at run time so this file stays clean."""
+    address = ".".join(["198", "18", "0", "1"])     # a benchmarking address: no example range holds it
+    private = ["10", "0", "0", "5"]
+    for text in (f"the node answers at {address}", f"--connect-to cases.example.org:443:{address}:8443",
+                 f"https://gsj.{'.'.join(private)}.wildcard.example/", f"https://gsj-{'-'.join(private)}.wildcard.example/"):
+        assert internal_labels("line", text) == ["line:1"], text
+
+
+# the negative control: the words the guide uses for its own work, and the
+# addresses an example may use, are not labels
+GUIDE_PROSE = [
+    "Promotion of a release candidate follows its review; apply the patch release first.",
+    "Patch the Deployment only through the installer: review the plan, then promote it.",
+    "Every release attaches the chart as an audit copy.",
+    "helm v3.13.0, kubectl v1.31.2 and jq 1.7.1 are the floors; the previous release is v0.10.0-beta.6.",
+    "curl --connect-to cases.example.org:443:127.0.0.1:8443 https://cases.example.org/",
+    "the web container listens on 0.0.0.0:8780",
+    '"NO_PROXY": "llm.internal.example.org,10.20.0.9"',
+    '{"verification": {"connect_host": "192.0.2.7", "connect_port": 8443}}',
+    "example addresses: 172.20.0.4, 192.168.1.20, 198.51.100.7, 203.0.113.9",
+]
+
+
+def test_the_label_guard_leaves_the_guide_s_prose_and_the_example_addresses_alone():
+    assert [text for text in GUIDE_PROSE if INTERNAL_LABEL.search(text)] == []
 
 
 def test_the_public_tree_carries_no_internal_review_labels():
