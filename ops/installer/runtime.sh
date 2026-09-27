@@ -3883,14 +3883,15 @@ helm_apply() {
 initializer_failure() {
  # A failed corpus-copy/corpus-initialize leaves one allowlisted
  # code as its termination message. A running retry is still in progress.
- # One tab-separated line: KIND:CODE, then the name and the uid of the Pod
- # whose verdict it is -- whatever acts on the verdict acts on THAT Pod, never
- # on the first Pod the labels list (a foreign controller's Pod can carry them).
- jq -r '[.items[]|select(.metadata.deletionTimestamp==null)|. as $pod|.status.initContainerStatuses[]?|
+ # One tab-separated line per verdict, in the order the Pods are listed:
+ # KIND:CODE, then the name and the uid of the Pod whose verdict it is --
+ # whatever acts on a verdict acts on THAT Pod, never on the first Pod the
+ # labels list (a foreign controller's Pod can carry them).
+ jq -r '.items[]|select(.metadata.deletionTimestamp==null)|. as $pod|.status.initContainerStatuses[]?|
    select(.name=="corpus-copy" or .name=="corpus-initialize")|
    (if .state.terminated then (if .state.terminated.exitCode!=0 then .state.terminated.message else null end)
     elif .state.waiting then .lastState.terminated.message else null end)//""|
-   capture("^gsj-(?<kind>corpus|copy):(?<code>[a-z0-9]+(-[a-z0-9]+)*)\\s*$")|[.kind+":"+.code,$pod.metadata.name,$pod.metadata.uid]][0]//empty|@tsv' "$1"
+   capture("^gsj-(?<kind>corpus|copy):(?<code>[a-z0-9]+(-[a-z0-9]+)*)\\s*$")|[.kind+":"+.code,$pod.metadata.name,$pod.metadata.uid]|@tsv' "$1"
 }
 initializer_pod_owned() {
  # The Pod named in $2 with the uid in $3, as listed in the Pod list $1, is
@@ -3956,19 +3957,24 @@ initializer_stop() {
  esac
 }
 wait_application() {
- local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod state code verdict_pod verdict_uid
+ local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod pod_uid state deploy_uid verdicts code verdict_pod verdict_uid
  while (( SECONDS < end )); do
    assert_owner
    helm_application_validate
    state=$(k get deploy "$RELEASE-web" -o json)
    if jq -e '.status.observedGeneration >= .metadata.generation and .status.updatedReplicas==1 and .status.availableReplicas==1 and .status.readyReplicas==1' <<< "$state" >/dev/null; then return; fi
+   deploy_uid=$(jq -r '.metadata.uid//""' <<< "$state")
    k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gsj" -o json > "$GSJ_WORK/application-pods.json"
-   pod=$(jq -r '.items[0].metadata.name // empty' "$GSJ_WORK/application-pods.json")
-   if [[ -n $pod ]]; then
-     jq -c '.items[0]|{pod:.metadata.name,phase:.status.phase,init:[.status.initContainerStatuses[]?|{name,state}],containers:[.status.containerStatuses[]?|{name,ready,state}]}' "$GSJ_WORK/application-pods.json"
+   # The progress line and the initializer's log come from this release's own
+   # Pods, each named: the two labels also list a foreign controller's Pod,
+   # and the first Pod listed need not be the release's.
+   while IFS=$'\t' read -r pod pod_uid; do
+     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$pod" "$pod_uid" "$deploy_uid" || continue
+     jq -c --arg uid "$pod_uid" '.items[]|select(.metadata.uid==$uid)|{pod:.metadata.name,phase:.status.phase,init:[.status.initContainerStatuses[]?|{name,state}],containers:[.status.containerStatuses[]?|{name,ready,state}]}' "$GSJ_WORK/application-pods.json"
      k logs "$pod" -c corpus-initialize --tail=3 2>/dev/null || true
-   fi
-   IFS=$'\t' read -r code verdict_pod verdict_uid <<< "$(initializer_failure "$GSJ_WORK/application-pods.json")"
+   done < <(jq -r '.items[]|select(.metadata.deletionTimestamp==null)|[.metadata.name,.metadata.uid]|@tsv' "$GSJ_WORK/application-pods.json")
+   verdicts=$(initializer_failure "$GSJ_WORK/application-pods.json") || verdicts=''
+   IFS=$'\t' read -r code verdict_pod verdict_uid <<< "$verdicts"
    if [[ $code == corpus:source-verification-failed && ${VECTORS_STAGED_IN_THIS_RUN:-} == true && ${STAGED_RESTART:-} != done ]]; then
      # The initializer started at helm_apply and may have judged the released
      # vectors BEFORE stage_vectors put them in place [review, the major]:
@@ -3985,7 +3991,7 @@ wait_application() {
      # controller's Pod, and the first Pod listed is not the verdict's. A
      # deletion the API refuses or that fails is an error, never a restart
      # that is counted: the next verdict would be read as the terminal second.
-     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$(jq -r '.metadata.uid//""' <<< "$state")" \
+     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$deploy_uid" \
        || fail "Pod $verdict_pod reported the initializer's verdict but is not the application Pod of release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); it is not recreated and the verdict is not judged"
      log "corpus-initialize refused the released vectors with a verdict that may predate their staging in this run; restarting it once on the staged blocks"
      jq -n --arg uid "$verdict_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$GSJ_WORK/initializer-delete.json"
@@ -3996,7 +4002,16 @@ wait_application() {
      STAGED_RESTART=done
      sleep 20; continue
    fi
-   [[ -z $code ]] || initializer_stop "$code"
+   # A verdict is judged only from this release's own Pod, by name, uid and
+   # owner chain as the restart above: a foreign controller's Pod can carry
+   # the two labels and a crafted verdict, and listed first it stopped the
+   # operation. The first owned verdict decides; a Pod not owned by this
+   # release that reports one is named, and the wait goes on.
+   while IFS=$'\t' read -r code verdict_pod verdict_uid; do
+     [[ -n $code ]] || continue
+     if initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$deploy_uid"; then initializer_stop "$code"; break; fi
+     log "Pod $verdict_pod reported an initializer verdict but is not owned by release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); the verdict is not judged and the wait goes on"
+   done <<< "$verdicts"
    sleep 20
  done
  fail 'initialization/startup deadline exceeded; checkpoint and operation remain available for resume'

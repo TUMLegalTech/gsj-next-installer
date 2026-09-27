@@ -980,14 +980,17 @@ def test_acquire_refuses_a_running_or_backing_off_initializer(runtime, status, r
         assert lease["spec"]["holderIdentity"]
 
 
+# the Pods are this release's own: each one's controller is the ReplicaSet
+# below, whose controller is the Deployment the wait reads (by name and uid)
 _WAIT_BODY = '''OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; CONFIG=/secure/site.json
 assert_owner() { :; }; helm_application_validate() { :; }; sleep() { :; }
 k() {
  case "$1 $2" in
   "get deploy")
-   if [[ -f $TEST_WORK/ready ]]; then printf '%s' '{"metadata":{"generation":1},"status":{"observedGeneration":1,"updatedReplicas":1,"availableReplicas":1,"readyReplicas":1}}'
-   else touch "$TEST_WORK/ready"; printf '%s' '{"metadata":{"generation":1},"status":{}}'; fi;;
+   if [[ -f $TEST_WORK/ready ]]; then printf '%s' '{"metadata":{"generation":1,"uid":"synthetic-deploy-uid"},"status":{"observedGeneration":1,"updatedReplicas":1,"availableReplicas":1,"readyReplicas":1}}'
+   else touch "$TEST_WORK/ready"; printf '%s' '{"metadata":{"generation":1,"uid":"synthetic-deploy-uid"},"status":{}}'; fi;;
   "get pods") cat "$TEST_WORK/pods.json";;
+  "get replicasets") [[ $3 == synthetic-web-rs ]] && printf '%s' '{"metadata":{"name":"synthetic-web-rs","uid":"synthetic-web-rs-uid","ownerReferences":[{"kind":"Deployment","name":"synthetic-release-web","uid":"synthetic-deploy-uid","controller":true}]}}';;
   *) :;;
  esac
 }
@@ -999,7 +1002,8 @@ def _initializer_pods(name, state, last=None, deleting=False):
     status = {"name": name, "state": state}
     if last is not None:
         status["lastState"] = {"terminated": {"exitCode": 1, "message": last}}
-    metadata = {"name": "synthetic-web"}
+    metadata = {"name": "synthetic-web", "uid": "synthetic-web-uid",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "synthetic-web-rs", "uid": "synthetic-web-rs-uid", "controller": True}]}
     if deleting:
         metadata["deletionTimestamp"] = "2026-09-14T00:00:00Z"
     return {"items": [{"metadata": metadata, "status": {"phase": "Pending", "initContainerStatuses": [status]}}]}
@@ -2807,6 +2811,13 @@ def _foreign_pod():
             "status": {"phase": "Running", "containerStatuses": [{"name": "other", "ready": True, "state": {"running": {}}}]}}
 
 
+def _with_verdict(pod, code):
+    """the Pod with corpus-initialize backing off after the verdict CODE"""
+    pod["status"]["initContainerStatuses"] = [{"name": "corpus-initialize", "state": BACKING_OFF,
+                                               "lastState": {"terminated": {"exitCode": 1, "message": "gsj-corpus:" + code}}}]
+    return pod
+
+
 def _replicaset(owner_uid=DEPLOY_UID):
     return {"metadata": {"name": "synthetic-release-web-7c9d8", "uid": "rs-uid-0001",
                          "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "synthetic-release-web",
@@ -2839,7 +2850,7 @@ k() {{
     "get replicasets") [[ $3 == synthetic-release-web-7c9d8 ]] || return 1; cat "$TEST_WORK/replicaset.json";;
     "delete --raw") printf '%s %s\\n' "$*" "$(jq -c . "$5")" >> "$TEST_WORK/kubectl-deletes"; [[ {deletion} == ok ]] || return 1; : > "$TEST_WORK/deleted";;
     "delete pod") printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-deletes"; : > "$TEST_WORK/deleted";;
-    "logs "*) :;;
+    "logs "*) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-logs";;
     *) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-other";;
   esac
 }}
@@ -2942,3 +2953,35 @@ def test_a_refused_or_failed_recreation_is_an_error_never_a_restart_that_happene
     assert deletes == [_recreate(runtime[2])], deletes
     assert "could not be recreated" in result.stderr and "resume --operation aaaaaaaaaaaaaaaaaaaaaaaa" in result.stderr
     assert "stopped terminally" not in result.stderr
+
+
+# --- a verdict is judged only from this release's own Pod ---
+
+def test_a_terminal_verdict_from_a_pod_the_release_does_not_own_never_stops_the_wait(runtime):
+    """The two labels also list a foreign controller's Pod. One listed FIRST
+    with a terminal verdict stopped the operation as terminal (its code
+    judged, the named repair demanded) although this release's own Pod was
+    healthy: the verdict is judged only when the Pod that reported it is the
+    release's own by name, uid and owner chain -- otherwise that is logged,
+    and the wait goes on. The progress line and the initializer's log come
+    from the release's own Pod, never from the first one listed."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_foreign_pod(), "deadline-exceeded"), _application_pod("running")])
+    assert result.returncode == 97, result.stderr                     # every poll ran: the wait went on
+    assert "stopped terminally" not in result.stderr and deletes == []
+    assert f"Pod {FOREIGN_POD} reported an initializer verdict but is not owned by release synthetic-release" in result.stderr, result.stderr
+    assert '"pod":"synthetic-release-web-7c9d8-abcde"' in result.stdout and FOREIGN_POD not in result.stdout, result.stdout
+    logs = (work / "kubectl-logs").read_text().splitlines()
+    assert logs and all("synthetic-release-web-7c9d8-abcde" in line for line in logs), logs
+
+
+def test_a_terminal_verdict_from_the_releases_own_pod_stops_the_wait_after_a_foreign_one(runtime):
+    """The release's own Pod with a terminal verdict stops the wait with its
+    own code, listed after a foreign Pod carrying another terminal verdict."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_foreign_pod(), "checkpoint-identity-mismatch"),
+                                                 _with_verdict(_application_pod("running"), "deadline-exceeded")])
+    assert result.returncode == 1, result.stderr
+    assert "stopped terminally (deadline-exceeded)" in result.stderr and "checkpoint-identity-mismatch" not in result.stderr.split("GSJ:")[-1]
+    assert deletes == []
