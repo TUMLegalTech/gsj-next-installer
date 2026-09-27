@@ -169,9 +169,12 @@ included: run ingress-nginx in the cluster yourself, send your load
 balancer's traffic to it, and `reuse` it — `ingress.class` its IngressClass,
 `ingress.namespace` the namespace its Pods run in. What the installer checks
 of a reused class is that an IngressClass of that name exists and, before the
-Lease of an `install` or `upgrade`, that `ingress.namespace` exists and runs a
-Pod it recognizes as an ingress controller by its name or its image; it does
-not check that this controller is the one behind the class.
+Lease of an `install` or `upgrade`, that `ingress.namespace` exists and holds a
+Running Pod. It recognizes a controller among those Pods by its name or its
+image (ingress-nginx, Traefik, HAProxy, Contour, Istio) or by the controller
+your IngressClass names (OpenShift's router, Kong); Running Pods none of which
+it recognizes are said in a log line, and the run goes on. It does not check
+that a controller there is the one behind the class.
 
 **A stock k3s box is the common case of this**, because k3s ships Traefik.
 `managed-traefik` is *not* your way out: it installs a second Traefik from a
@@ -258,14 +261,20 @@ what we measured:
   controller's Pods; a controller in a namespace of its own is the narrower
   choice. `kubectl get pods -A | grep -i traefik` names it in its first column.
   An `install` or `upgrade` refuses, before its Lease, a namespace that does
-  not exist (*"ingress.namespace … does not exist"*) and one where none of the
-  Running Pods is an ingress controller by its name or its image — ingress,
-  traefik, nginx, haproxy, contour, istio (*"ingress.namespace … runs no
-  ingress controller: it holds … Pod(s), … of them Running, …"*). A namespace
-  that runs some other controller passes that check. (Read from the chart and
-  the installer, not measured: get it wrong that way on a CNI that enforces
-  policy and the install stops at its own public-route probe, after the corpus
-  import and before any acceptance check has run.)
+  not exist (*"ingress.namespace … does not exist"*) and one that holds no
+  Running Pod (*"ingress.namespace … runs no ingress controller: it holds no
+  Running Pod (… Pod(s) in all)"*). A Running Pod is enough to pass. When none
+  of them is a controller the check recognizes — by its name or its image
+  (ingress, traefik, nginx, haproxy, contour, istio), or by the controller the
+  IngressClass `ingress.class` names (OpenShift's `router-*` Pods, Kong's
+  images) — it is said, and the run goes on: *"ingress.namespace … holds …
+  Running Pod(s), and none of them is an ingress controller this check
+  recognizes by its name, its image or the controller IngressClass … names. …
+  The run goes on"*. So a namespace that runs other workloads and no
+  controller passes this check with only that line to show for it. (Read from
+  the chart and the installer, not measured: get it wrong that way on a CNI
+  that enforces policy and the install stops at its own public-route probe,
+  after the corpus import and before any acceptance check has run.)
 
 Traefik has no default request-body limit and does not buffer responses, so the
 other two behaviours hold unless you have added a buffering middleware. What
@@ -1003,7 +1012,7 @@ report; it is marked `you` in the table.
 | `storage.transfer_path` | `storage.claim_backing`, `host.filesystems` | a filesystem that is **not** the claims'; or leave empty to stage in an `emptyDir`, which is still the node's ephemeral filesystem — and a `backup` stages its archive through it twice, budgeted at about 2.5× your data ([why](#two-site-values-that-are-about-your-machine-not-gsjs)). Nothing but its shape is checked before a Pod mounts it — absolute, its first segment not beginning with a dot; you make the directory beforehand, `0700` ([why](#preserve-and-restore-backups)). It is one of the two storage values that may change later — a later `install`, `upgrade` or `backup` adopts a changed `transfer_path` or `storage.minimum_free_bytes` — while the class, the node, `backend_path`, the sizes and `existing_claim` stay what the first install made them |
 | which filesystem the claims land on | `storage.claim_backing` | `profile=reuse` takes whatever directory your existing class already writes to — it does **not** let you choose, and `storage.node` picks a node, not a disk. To place the data yourself: repoint the directory your own provisioner writes to — that is its configuration, not a site value; this installer never writes it, and reads it only to report `storage.claim_backing` and `storage.local_path_node_paths` (run `inspect` again afterwards) — or use `profile=managed-local-path` with `storage.backend_path` (default `/var/local-path-provisioner/gsj-managed`) after reading step 0's warning about disposable nodes — it does **not** collide with a local-path provisioner you already run, because it builds its own in namespace `gsj-storage` under provisioner `rancher.io/gsj-local-path`, `WaitForFirstConsumer`, `Retain`, with a node path map of exactly your `storage.node` and that one path — or bring claims of your own: [Installing onto claims that already exist](#installing-onto-claims-that-already-exist) |
 | whether `public_url` resolves **inside** the cluster | you | The acceptance check dials it from the `gsj-web` container. Where a cloud load balancer's public name does not resolve or hairpin from inside the cluster — the normal case on managed Kubernetes — set `verification.connect_host` and `verification.connect_port` to a host and port the Pod can reach — one address that the machine you install from can reach as well, because the installer's own HTTPS check is redirected to it too. The complete example carries no `verification` block; add one. [The five values only you can supply](#the-five-values-only-you-can-supply) dials this route from a Pod before you install |
-| ingress class and namespace | `ingress.classes` | `reuse` the ingress-nginx step 0 qualified; `namespace` is the namespace that controller runs in — an `install` refuses, before its Lease, one that does not exist or runs no controller Pod. If step 0 ruled your controller out, this row is where that verdict lands |
+| ingress class and namespace | `ingress.classes` | `reuse` the ingress-nginx step 0 qualified; `namespace` is the namespace that controller runs in — an `install` refuses, before its Lease, one that does not exist or holds no Running Pod, and logs one whose Running Pods it does not recognize as a controller. If step 0 ruled your controller out, this row is where that verdict lands |
 | TLS profile | `networking.tls.cert_manager_present` | four choices, below |
 
 **The TLS rule.** `cert_manager_present` **true** and you already issue
@@ -1251,11 +1260,12 @@ it, some of them hours in. Each refusal begins with the words quoted here:
 - the certificate. Under `tls.profile=existing`, a Secret that is missing
   (*"TLS Secret is unavailable: tls.profile existing serves the Secret …"*,
   with the commands that create it) or could not be read (*"TLS Secret is
-  unavailable: … could not be read"*), one not of type `kubernetes.io/tls` or
-  without both keys (*"TLS Secret is incomplete: …"*) or whose `tls.crt` is no
-  PEM certificate (*"TLS Secret is incomplete: the tls.crt of …"*), a
-  certificate that does not name `public_url`'s host (*"TLS certificate host
-  mismatch: …"*), and one that has expired (*"TLS certificate expired: …"*).
+  unavailable: … could not be read"*), and one not of type `kubernetes.io/tls`
+  or without both keys (*"TLS Secret is incomplete: …"*) or whose `tls.crt` is
+  no PEM certificate (*"TLS Secret is incomplete: the tls.crt of …"*). A
+  certificate in it that does not name `public_url`'s host, or has expired, is
+  said in a log line ending *"The run goes on"*, not refused: a proxy in front
+  of the cluster may terminate TLS for that host with a certificate of its own.
   Under `tls.profile=files`, a certificate file that is no PEM certificate
   (*"tls.certificate_file is not a readable PEM certificate …"*) or does not
   name the host (*"TLS certificate host mismatch: tls.certificate_file …"*),
@@ -1264,13 +1274,20 @@ it, some of them hours in. Each refusal begins with the words quoted here:
   ([A certificate you already issue](#a-certificate-you-already-issue-tlsprofileexisting));
 - the controller namespace. Under `ingress.profile=reuse`, an
   `ingress.namespace` that does not exist (*"ingress.namespace … does not
-  exist"*) or holds no running ingress controller Pod (*"ingress.namespace …
-  runs no ingress controller"*); under `managed-traefik`, one that is the
+  exist"*) or holds no Running Pod (*"ingress.namespace … runs no ingress
+  controller: it holds no Running Pod …"*). Running Pods none of which the
+  check recognizes as a controller are said, and the run goes on
+  (*"ingress.namespace … holds … Running Pod(s), and none of them is an ingress
+  controller this check recognizes …"*); under `managed-traefik`, one that is the
   deployment's own namespace (*"ingress.namespace … is the namespace this
   deployment is installed in (target.namespace)"*), since Traefik gets a
   namespace of its own;
 - another Ingress on the cluster that already serves `public_url`'s host
-  (*"public_url's host … is already served by Ingress …"*), naming it;
+  (*"public_url's host … is already served by Ingress …"*), naming it. Not
+  counted: this deployment's own Ingress (an upgrade's), an Ingress already
+  being deleted, and one labelled `acme.cert-manager.io/http01-solver=true` —
+  cert-manager's HTTP-01 solver, which serves the host while a renewal is
+  pending, so that an upgrade during a renewal is not refused;
 - the operator password: an operator Secret already in the namespace whose
   password differs from `operator.password_file` (*"Secret … differs from
   supplied credential; use explicit credential repair/rotation, never implicit
@@ -1287,7 +1304,8 @@ it, some of them hours in. Each refusal begins with the words quoted here:
   selected add-on creates;
 - a kubectl that `--fetch-tools` downloaded for this run and that is more than
   one minor from the server (*"kubectl version skew: the kubectl --fetch-tools
-  downloaded for this run is …"*). Your own kubectl, skewed the same way, is
+  downloaded for this run is …"*) — on `upgrade --to` as well, whose verified
+  target installer is handed the clients this run fetched. Your own kubectl, skewed the same way, is
   named in a log line and the run goes on with it (*"kubectl … is more than one
   minor from the server (…), and kubectl is supported within one minor of the
   server. The run goes on with it; …"*).
@@ -1549,11 +1567,20 @@ minute; `inspect` deliberately will not probe it (it would have to create Pods).
 **What your kubeconfig must be allowed.** In the target namespace the installer
 asks in its first seconds (`kubectl auth can-i`) for what it creates there —
 Pods, Secrets, ConfigMaps, Leases, Jobs, PersistentVolumeClaims and
-NetworkPolicies, and patching Deployments — and refuses by name
-(*"missing deployment permission: …"*). Beyond the namespace it needs, and does
-not ask beforehand: `get` nodes; `get` storageclasses and ingressclasses;
-`create` namespaces (the application namespace when it is missing, and a
-managed add-on's); `get` and `patch` persistentvolumes (the storage check marks
+NetworkPolicies, and patching Deployments — and for `get` on ReplicaSets, and
+refuses by name (*"missing deployment permission: …"*, for example
+*"missing deployment permission: get replicasets.apps"*). The ReplicaSet read
+is how the wait for the corpus initializer proves that a Pod whose verdict it
+judges is this release's own: the Pod's ReplicaSet must belong to the
+release's Deployment. If that read is refused all the same once the wait has
+begun, the wait says so once — *"This kubeconfig may not get replicasets.apps
+in namespace …, so an application Pod's owner chain to Deployment …-web cannot
+be proven; the wait judges a Pod that a ReplicaSet controls, carries release
+…'s labels and is not being deleted. Grant get on replicasets.apps to restore
+the proof"* — and goes on judging the Pod by those labels. Beyond the
+namespace it needs, and does not ask beforehand: `get` and `list` nodes; `get`
+storageclasses and ingressclasses; `create` namespaces (the application
+namespace when it is missing, and a managed add-on's); `get` and `patch` persistentvolumes (the storage check marks
 the volume its temporary claim bound as `Delete`, and a restore reads the
 volumes its claims bind); and, for the checks an `install` or `upgrade` makes
 before the Lease, `get` the namespace `ingress.namespace` names and `list` its
@@ -1700,6 +1727,12 @@ this machine's kubectl
 
 Your own kubectl, skewed the same way, is only warned about, in the log line
 the kubectl row quotes. Upgrade your own kubectl rather than fetching that one.
+`upgrade --to` and `repair --to` hand the clients this run fetched on to the
+target release's installer they verify and run — the bare `--fetch-tools` when
+all three were fetched, `--fetch-tools=` with the set otherwise — so that
+installer takes them as fetched, not as your machine's own, and on an upgrade
+its preflight refuses the skew the same way. The same pins come from the cache
+by their checksums; nothing is downloaded twice.
 
 **`--fetch-tools=TOOL[,TOOL]`** fetches only the clients it names —
 `helm`, `kubectl`, `jq`, comma-separated — and keeps the others on your
@@ -1712,7 +1745,11 @@ Helm 4 — and keeps the kubectl and jq on your machine. It is the form for the
 four recovery paths that require Helm 4: it brings the one client they need
 and leaves your kubectl, matched to your cluster, in place. Every form
 downloads before the site file is read, so a proxy or custom CA needed for it
-must already be available to `curl`.
+must already be available to `curl`. A target release older than this form
+does not know it: handed `--fetch-tools=TOOL` by an `upgrade --to` or a
+`repair --to`, it refuses it in its own argument parsing, before it reads the
+cluster (*"unknown argument: --fetch-tools=…"*). Run that `--to` again with the
+bare `--fetch-tools`, which an older release parses too, or without the flag.
 
 ## Obtain and verify a release
 
@@ -1913,12 +1950,28 @@ runs **before** the backup quiesces your application, so what was running is
 still running. Correct `registry.base`, the registry's contents or the
 credential, wait the 180 s the operation's Lease needs to go stale, and run the
 command the installer names: on an upgrade the `repair --operation ID --config
-...`, on a first install `abandon` and then `install` again from the corrected
+...` (or `abandon` and `upgrade --to VERSION` again from the corrected file),
+on a first install `abandon` and then `install` again from the corrected
 file (a repair would complete a first install without its storage check).
 `resume` would refuse, because the cure is a changed site file. A cause on the
 node's side — a registry CA it does not trust, its DNS or proxy, a full disk —
 needs no site change: the refusal names `resume --operation ID` for it, once the
 node can pull.
+
+**The probe Pod must be admitted first.** Its containers never run; each asks
+for `cpu: 10m` and `memory: 16Mi`, with its memory limit equal to that request,
+so the Pod asks for 60m and 96Mi in all. A namespace LimitRange or ResourceQuota
+that refuses it stops the run before any pull, named as a policy and not as
+your kubeconfig's permissions: *"the image pull probe could not be created in
+namespace …, so whether the node can pull from … is unproven: an admission
+policy (LimitRange or ResourceQuota) refused the Pod; kubectl's own words are
+kept in …/pull-probe-create.err. Each of its 6 containers requests cpu 10m and
+memory 16Mi with a memory limit of 16Mi: the namespace's LimitRange must admit
+that (its minimum, maximum and maxLimitRequestRatio) and its ResourceQuota must
+leave room for it"*. Any other admission policy is named *"an admission policy
+refused it"*, and the refusal ends *"If an admission policy refused it, admit
+Pods labelled gsj.io/pull-probe in this namespace"*. Correct the namespace's
+policy, then continue with the command the closing line names.
 
 **How long it waits depends on whether the image location moved.** An earlier
 installer ran this probe only for a site that set `registry.base` (or had just
@@ -1941,12 +1994,16 @@ GSJ: the node did not finish pulling this release's images from registry.base (r
 (*"… within deadlines.dependencies_seconds plus
 deadlines.initialization_seconds (87300 s)"* without `registry.base`.) Its
 closing line names the verbs the operation's state accepts, as for *cannot
-pull*: over an installed deployment `repair --operation ID … after raising
-deadlines.dependencies_seconds`, or `resume` once the registry answers; on a
-first install `abandon` and `install` again from the raised file (a repair
-would complete it without its storage check), or `resume`; for a restore,
-whose site is kept byte for byte and takes no raised deadline, the one verb its
-phase accepts, once the registry answers.
+pull*, with a raised deadline where that names a corrected site file: on a
+first install `abandon` and `install` again from the file *"after raising
+deadlines.dependencies_seconds"* (a repair would complete it without its
+storage check); on an upgrade `repair --operation ID … after raising
+deadlines.dependencies_seconds`, or `abandon` and `upgrade --to VERSION` again;
+in a later phase, that `repair`; and in each of them `resume --operation ID`
+*"once the registry answers and the probe Pod can be scheduled"*. A restore,
+whose site is kept byte for byte, names the one verb its phase accepts, for
+that same moment, and says that *"a raised deadlines.dependencies_seconds
+cannot continue this restore"*.
 On a slow link to a mirror, raise `deadlines.dependencies_seconds` in the site
 file before you install or upgrade, and nothing has to be recovered. A pull
 that reports a failure is refused as *cannot pull*, above, after 90 s of
@@ -2496,16 +2553,26 @@ holds none of that name"*, followed by the commands above), one it could not
 read (*"TLS Secret is unavailable: gsj-tls in namespace … could not be read"*),
 one not of type `kubernetes.io/tls` or lacking either key (*"TLS Secret is
 incomplete: gsj-tls in namespace … must be of type kubernetes.io/tls and hold a
-non-empty tls.crt and tls.key"*), a `tls.crt` that is no PEM certificate
-(*"TLS Secret is incomplete: the tls.crt of gsj-tls …"*), a certificate that
-does not name `public_url`'s host (*"TLS certificate host mismatch: the
-certificate in Secret gsj-tls … does not name public_url's host …"*), and one
-that has expired (*"TLS certificate expired: the certificate in Secret gsj-tls
-… is past its expiry date"*). A `tls.crt` that holds the leaf followed by its
-issuer is judged by the leaf. With `verification.ca_file` set it also verifies the
-certificate against that CA as strictly as the acceptance check will
-(`openssl verify -x509_strict`), and one that does not pass is said in a log
-line, not refused — *"The certificate in Secret gsj-tls does not pass strict
+non-empty tls.crt and tls.key"*), and a `tls.crt` that is no PEM certificate
+(*"TLS Secret is incomplete: the tls.crt of gsj-tls …"*). The certificate in
+it is not refused: where a proxy in front of the cluster terminates TLS for the
+host with a certificate of its own, this Secret may hold a placeholder that no
+client sees. What is wrong with it is said in a log line instead — one that
+does not name `public_url`'s host (*"The certificate in Secret gsj-tls
+(namespace …) does not name public_url's host …. Where the ingress controller
+terminates TLS for …, browsers refuse it and the acceptance check inside the
+application Pod stops at origin-tls-failed; where a proxy in front of the
+cluster terminates TLS with a certificate of its own, clients that reach …
+through it see that one instead. … The run goes on"*), and one that has
+expired (*"The certificate in Secret gsj-tls (namespace …) is past its expiry
+date. … The run goes on"*). Where your controller serves this Secret, either one stops the
+install at its acceptance check, hours in: replace it before you install. A
+`tls.crt` that holds the leaf followed by its issuer is judged by the leaf.
+With `verification.ca_file` set, a certificate that has not expired is also
+verified against that CA as strictly as the acceptance check will
+(`openssl verify -x509_strict -partial_chain`: a CA file that holds only the
+intermediate that issued the certificate is enough), and one that does not
+pass is said in a log line, not refused — *"The certificate in Secret gsj-tls does not pass strict
 verification (openssl verify -x509_strict) against verification.ca_file (…).
 … The run goes on"* — because the chain the controller serves, and the Pod's
 route to it, decide that, not the Secret alone. Whether a client trusts it is
@@ -2787,8 +2854,12 @@ name already exists, its content must equal your file, or the run is refused
 rather than the Secret overwritten.) Leave `config_file` empty, and
 `registry.pull_secret` instead **selects** a Docker registry Secret you made
 yourself: the installer checks that it exists, before its first write, and
-never creates it. `restore` and `restore-repair` skip that check: the source's
-pull Secret travels in the archive, and restore recreates it. A host Docker
+never creates it (*"registry.pull_secret must name an existing image pull
+Secret in namespace …; create it or set registry.config_file"*). `restore` and
+`restore-repair` skip that check: the source's pull Secret travels in the
+archive, and restore recreates it. So do `sweep`, `abandon` and
+`lease-repair`, which pull no image: a `sweep` clears a dead run's residue even
+once the namespace, and the pull Secret in it, is gone. A host Docker
 credential helper is not a node pull Secret.
 
 Initialization imports the complete raw corpus delivered by the sixth image
@@ -2913,7 +2984,7 @@ agent and never started).
 |---|---|
 | `storage.profile=reuse` | A qualified existing local-path or static-local StorageClass, selected Node, and optional existing claim names. Current installer admission permits `rancher.io/local-path`, `rancher.io/gsj-local-path`, and `kubernetes.io/no-provisioner`; other drivers need qualification. |
 | `storage.profile=managed-local-path` | Create the pinned provisioner and a `Retain`, `WaitForFirstConsumer` class at the explicit Node/backend path. Here **`storage.class` is not a class you pick from `inspect`'s list — it is the name of the class the installer creates**, so give it a name no existing StorageClass uses; `storage.node` and `storage.backend_path` say where that new class writes. An existing class of that name that this site does not already own is refused (*managed dependency differs or has another owner*) — including one an earlier GSJ install created for a different namespace or release name, because ownership is a hash of the namespace's UID and the release name; re-running this same site converges on the class it created. To keep using a class some other install made, name it under `storage.profile=reuse` instead: its provisioner, `rancher.io/gsj-local-path`, is admitted there, and that class's own node path map — not `storage.backend_path`, which `reuse` does not read — goes on deciding where it writes. Use `reuse` for an existing shared controller. |
-| `ingress.profile=reuse` | Supply the existing class and controller namespace. Its networking and TLS must support the configured public URL and the installer checks — see "What a reused controller must do" below. Before the Lease an `install` or `upgrade` refuses a namespace that does not exist (*"ingress.namespace … does not exist"*) or in which no Running Pod is an ingress controller by its name or its image (*"ingress.namespace … runs no ingress controller"*); one this kubeconfig may not read is logged as not checked (*"ingress.namespace … was not checked: …"*). |
+| `ingress.profile=reuse` | Supply the existing class and controller namespace. Its networking and TLS must support the configured public URL and the installer checks — see "What a reused controller must do" below. Before the Lease an `install` or `upgrade` refuses a namespace that does not exist (*"ingress.namespace … does not exist"*) or that holds no Running Pod (*"ingress.namespace … runs no ingress controller: it holds no Running Pod …"*). Running Pods none of which it recognizes as a controller — by name or image, or by the controller the IngressClass names — are logged and the run goes on (*"ingress.namespace … holds … Running Pod(s), and none of them is an ingress controller this check recognizes …"*); one this kubeconfig may not read is logged as not checked (*"ingress.namespace … was not checked: …"*). |
 | `ingress.profile=managed-traefik` | Create the pinned dedicated controller/class in `ingress.namespace`, a namespace of its own that it creates: `target.namespace` there is refused before the Lease (*"ingress.namespace … is the namespace this deployment is installed in (target.namespace), and ingress.profile managed-traefik installs Traefik in a namespace of its own, which it creates"*). Choose `LoadBalancer` with a working load-balancer implementation, or `NodePort` with explicit reachability. Kubernetes alone does not provide a public address. New installs' entrypoints allow 3,600 seconds to read one request, so an upload at the default 64 MiB cap needs about 19 KB/s, and never time out a streaming response. |
 | `tls.profile=existing` | An existing `kubernetes.io/tls` Secret with certificate and key, checked before the Lease ([A certificate you already issue](#a-certificate-you-already-issue-tlsprofileexisting)). |
 | `tls.profile=files` | Certificate chain and private-key files for the public hostname; the installer creates the selected TLS Secret. Before the Lease an `install` or `upgrade` refuses a certificate file that is no PEM certificate (*"tls.certificate_file is not a readable PEM certificate (…); the host was not checked"*) or does not name `public_url`'s host (*"TLS certificate host mismatch: tls.certificate_file (…) does not name public_url's host …"*), and a Secret of that name already there that holds another certificate or key (*"Secret … differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite"*). |
@@ -3214,6 +3285,22 @@ longer a regular file, so corpus.allow_update stays true there and in the
 installed record: set it to false in the file the link names, or a later
 release's corpus change is admitted without being asked for"*; set it there
 yourself. A `true` with no corpus change, and a restore, leave it as it is.
+
+The reset survives a stop. The installer marks it in the operation's record
+before it writes any of the three, so a run stopped after the operation is
+recorded complete and before your file and the saved site both say `false` is
+finished by `resume --operation ID` with the same file, once its Lease has gone
+180 s unrenewed: the `resume` rewrites what is left, says the first line
+quoted above, clears the mark and ends with *"Operation is already complete"*. It admits
+exactly that one difference between your file and the saved site,
+`corpus.allow_update`, while the mark is there, and refuses any other as it
+always does. A site file that has become a symbolic link by then is not
+written through; the saved site and the installed record say `false`, and the
+line says so instead: *"The corpus change this operation admitted is complete
+(fingerprint … to …) and corpus.allow_update is false in the operation's saved
+site and the installed record, but … is now a symbolic link or no longer a
+regular file and was not rewritten: set it to false in the file the link names,
+or every later backup is refused as a settings change"*.
 
 Sign-in sessions live only in the web process memory. An upgrade, repair,
 restore, backup or any Pod restart ends them, and users sign in again. Saved
@@ -4314,27 +4401,27 @@ first install, or its recovery, realistically meets:
 | `… is still live` — worded *the prior installer*, *the previous installer* or *the prior installer lease*, depending on the verb | the operation's Lease was renewed less than 180 s ago | make sure no installer process is still running against this target, wait out the 180 s, and run the same command again. With nothing running it is a clock, not a fault |
 | `resume configuration changed; use an explicit repair` | the site file differs from the one the operation was started with | `repair --operation ID --config …` — `repair` re-reads the file, `resume` never does. A `resume` refused for this reason has already renewed the Lease — it does so before it compares the file, and a failed run keeps its Lease. Measured: more than four minutes after the installer had exited, such a `resume` was refused, and a `repair` run straight after it was refused, nine seconds later, as *still live* with nothing running. Wait the 180 s again, from that refusal |
 | `target release does not declare this source-to-target transition` | this executable is a different release from the one that installed, or started the operation on, this target | use the executable that did; or `abandon`, `helm uninstall` (claims are kept), `sweep`, and install afresh onto the kept claims with `storage.*.existing_claim` |
-| `bootstrap utility required` | a utility every verb needs before anything else is missing — `curl`, `tar`, `gzip`, `base64`, `openssl`, `awk`, `cut`, `uname`, `mktemp`, `date` or `sync`, named — or, as *bootstrap utility required: sha256sum or shasum*, a SHA-256 tool | install it, then run the same command |
+| `bootstrap utility required` | a utility every verb needs before anything else is missing — `curl`, `tar`, `gzip`, `base64`, `openssl`, `awk`, `cut`, `uname`, `mktemp`, `date` or `sync`, named — or, as *bootstrap utility required: sha256sum or shasum*, a SHA-256 tool. `init` also needs `df`, `stat`, `id`, `dirname`, `basename`, `tr`, `head`, `tail`, `sed`, `wc`, `readlink` and `link` (the POSIX utility it publishes its checked files with) | install it, then run the same command |
 | `requires helm >= …`, `requires kubectl >= …`, `requires jq >= …` | that client is missing, reported no version, or is below its floor | install or upgrade it, or re-run with the `--fetch-tools=TOOL` the refusal names |
 | `kubectl version skew` | an `install` or `upgrade` would run on a kubectl that `--fetch-tools` downloaded, more than one minor from the server | run without `--fetch-tools`, or with `--fetch-tools=helm`, to keep your own kubectl |
 | `TLS Secret is unavailable` | under `tls.profile=existing`, `tls.secret` is not in the target namespace — or, *… could not be read*, your kubeconfig could not read it there | create it there, the namespace first (the refusal names the commands), or correct the access; then the same command |
 | `TLS Secret is incomplete` | `tls.secret` is not of type `kubernetes.io/tls`, lacks `tls.crt` or `tls.key`, or its `tls.crt` is not a PEM certificate | replace it with one that is (the refusal names the commands) |
-| `TLS certificate host mismatch` | the certificate — in `tls.secret`, or in `tls.certificate_file` — does not name `public_url`'s host | a certificate for that host, or the right `public_url` |
-| `TLS certificate expired` | the certificate in `tls.secret` is past its expiry date | a current certificate in that Secret, then the same command |
+| `TLS certificate host mismatch` | under `tls.profile=files`, the certificate in `tls.certificate_file` does not name `public_url`'s host. Under `existing`, a certificate in `tls.secret` for another host, or past its expiry date, is said in a log line ending *"The run goes on"*, not refused | a certificate for that host, or the right `public_url` |
 | `tls.certificate_file is not a readable PEM certificate` | under `tls.profile=files`; the host was not checked | point it at the PEM certificate for the host |
 | `Secret … differs from supplied credential` | a Secret of that name is already in the namespace — the operator Secret, or the `files` profile's TLS Secret — and holds other bytes than your file. The installer never overwrites one | put back the file that matches the Secret, then the same command |
 | `operator.password_file holds a control character` | the password file holds a tab, a carriage return or another byte below 32, or nothing but newlines | write the password as one line of printable characters, then the same command |
-| `ingress.namespace … does not exist`, `ingress.namespace … runs no ingress controller` | under `ingress.profile=reuse`, the namespace is missing, or none of its Running Pods is an ingress controller by its name or its image | set `ingress.namespace` to the namespace the controller's Pods run in — the first column of `kubectl get pods -A` — then the same command |
+| `ingress.namespace … does not exist`, `ingress.namespace … runs no ingress controller` | under `ingress.profile=reuse`, the namespace is missing, or it holds no Running Pod. Running Pods none of which is a controller the check recognizes are said in a log line (*"ingress.namespace … holds … Running Pod(s), and none of them is an ingress controller this check recognizes …"*), not refused | set `ingress.namespace` to the namespace the controller's Pods run in — the first column of `kubectl get pods -A` — then the same command |
 | `ingress.namespace … is the namespace this deployment is installed in` | under `managed-traefik`, `ingress.namespace` is `target.namespace`; Traefik gets a namespace of its own | another `ingress.namespace` (`gsj-ingress` is the default), or `ingress.profile` `reuse` for a controller that already runs |
-| `public_url's host … is already served by Ingress` | another deployment's Ingress serves that host, named in the refusal | remove that Ingress, or choose another `public_url` |
+| `public_url's host … is already served by Ingress` | another deployment's Ingress serves that host, named in the refusal. An Ingress being deleted and cert-manager's HTTP-01 solver (labelled `acme.cert-manager.io/http01-solver=true`) are not counted | remove that Ingress, or choose another `public_url` |
 | `managed add-on CustomResourceDefinitions are left without their owner record` | CRDs of an add-on this site selects, left by an earlier install of it without its owner record | the teardown the refusal names — this installer deletes nothing — then the same command |
 | `the operator Secret … could not be read`, `TLS Secret … could not be read` | your kubeconfig could not read that Secret in the target namespace | correct the access — kubectl's output is kept in the state-directory file the refusal names — then the same command |
 | `no node has room for this deployment` | the scheduler's arithmetic over what other Pods have *reserved* | free requests on a node or name another in `storage.node`; this is not about free memory |
 | `the corpus initializer needs …Mi` | `resources.initializer.limits.memory` is below what this release's corpus needs | raise it in the site file to at least the figure named |
 | `backup cannot change application settings` | the site file differs from the installed one outside its `backup`, `delivery` and `verification` blocks and `storage.transfer_path` and `storage.minimum_free_bytes` — an edited `registry.base` counts | put the installed values back, or run the operation that adopts the edit — an upgrade, or `install` again with the same installer — then back up |
 | `temporary storage backend cleanup incomplete` | the storage check's temporary claim bound a volume and marked it `Delete`, and 120 s after that claim was deleted the volume was still there. The message names the volume and its phase, and the phase is the whole difference | *…and it is now Failed*: nothing on this cluster deletes a volume of that class. Name your own claim in `storage.data.existing_claim`; wait until the operation's Lease has gone 180 s unrenewed, `abandon --operation ID --reason "…"`, install again. The volume it names accepts no claim until that PersistentVolume object is deleted and created again — do that only if you still want it. *…was still present (phase …)*, any other phase, `unknown` if it could not be read: whatever removes volumes of that class is slow or stuck. Do **not** delete the volume; look at that provisioner or deleter, then continue with the command the closing line names |
+| `the image pull probe could not be created in namespace` | the Pod that proves the pulls was refused before any pull — *an admission policy (LimitRange or ResourceQuota) refused the Pod*, *an admission policy refused it*, or your kubeconfig's permissions | admit it — each of its six containers requests `cpu: 10m` and `memory: 16Mi`, limit equal to request, and it is labelled `gsj.io/pull-probe` — then the command the closing line names |
 | `the node cannot pull this release from` | the pull proof failed: `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
-| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers |
+| `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers and the probe Pod can be scheduled |
 | `Helm provisioning failed; persistent state was retained` | the Helm apply of an install, upgrade or restore exited non-zero; the last 25 lines of Helm's log precede it. The operation stays in its Helm phase, where `resume` refuses | fix the cause, wait 180 s, then the `repair --operation ID --config … --non-interactive` the closing line names |
 | `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin (the refusal names the floor that set it); nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
 | `the operation Lease is already free; nothing to abandon` | `abandon` on a target with no live operation — normal after a completed install | carry on; it exits `1` while doing no harm, so do not let a script stop on it |
@@ -4538,7 +4625,13 @@ on another cluster. (Read from the installer, not run.)
 
 **3. Restore from a new site directory**, whose site file names the same
 namespace and release, with the exact source installer. The copy of the site
-file and the passphrase are all the directory needs: the restore writes the
+file and the passphrase are what the directory needs, and, when the site file
+sets them, the two release-delivery files `delivery.ca_file` and
+`delivery.auth_header_file`: the installer reads both as it loads the site,
+before the restore writes anything, and refuses one that is not there
+(*"invalid artifact CA certificate"*, *"protected input is not a regular file:
+…"*). The block copies them to the same place relative to the new site file;
+a path you gave as absolute is read where it is. The restore writes the other
 archived credentials back at the paths the site file declares.
 
 ```sh
@@ -4547,6 +4640,10 @@ if [ -z "${GSJ_BACKUP_ARCHIVE:-}" ] || [ -z "${RESTORE_DIR:-}" ]; then
 elif mkdir -m 700 "$RESTORE_DIR" "$RESTORE_DIR/credentials"; then
   cp "$HOME/gsj-operator/site.json" "$RESTORE_DIR/site.json" && chmod 600 "$RESTORE_DIR/site.json" &&
   cp "$HOME/gsj-operator/credentials/backup-passphrase" "$RESTORE_DIR/credentials/" &&
+  ( jq -r '.delivery // {} | .ca_file, .auth_header_file | select(. != null and . != "" and (startswith("/") | not))' \
+      "$RESTORE_DIR/site.json" | while IFS= read -r f; do
+        mkdir -p "$RESTORE_DIR/$(dirname "$f")" && cp -p "$HOME/gsj-operator/$f" "$RESTORE_DIR/$f" || exit 1
+      done ) &&
   bash "$HOME/gsj-operator/trust/verify-release.sh" source-gsj-install.sh source-installer-descriptor.json \
     source-installer-descriptor.sig "$HOME/gsj-operator/trust/release.pem" &&
   bash source-gsj-install.sh restore --archive "$GSJ_BACKUP_ARCHIVE" \

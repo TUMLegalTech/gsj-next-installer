@@ -45,10 +45,11 @@ install and when you would find out.
   corpus import and before any acceptance check has run. Every pull of the
   release's images is proven on the storage node before anything is applied,
   for every site, so nodes that cannot pull stop an install in its first
-  minutes. With `registry.base` all six must arrive within
-  `deadlines.dependencies_seconds` (900 s by default), which a slow link to
-  the mirror may need raised; without it a pull still under way then is
-  waited for up to `deadlines.initialization_seconds` more.
+  minutes. With `registry.base` (or on the upgrade that drops it) all six
+  must arrive within `deadlines.dependencies_seconds` (900 s by default),
+  which a slow link to the mirror may need raised; without it a pull still
+  under way then is waited for up to `deadlines.initialization_seconds` more.
+  A pull that reports a failure is refused after 90 s either way.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has
@@ -65,7 +66,8 @@ install and when you would find out.
   and keeps your own kubectl and jq, floors still checked. An `install` or
   `upgrade` warns, before the operation Lease, about a kubectl more than one
   minor from the API server, and refuses one that `--fetch-tools` brought
-  (*kubectl version skew*). `init` is the
+  (*kubectl version skew*) — on `upgrade --to` too, whose target installer
+  is handed the clients the run fetched. `init` is the
   one command that does not stop at the first: it names them all at once, in
   its report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible

@@ -25,14 +25,15 @@ seconds, if one is missing or below its floor (helm 3.13, kubectl 1.24,
 jq 1.6 — each measured against real binaries, see the comment block above
 `GSJ_HELM_FLOOR` in `runtime.sh`). OpenSSL has a floor of its own, checked in
 the same first seconds and never downloaded: OpenSSL 3.0 or newer, not LibreSSL
-(`GSJ_OPENSSL_FLOOR`; the certificate-hostname refusals read the verdict
+(`GSJ_OPENSSL_FLOOR`; the certificate-hostname checks read the verdict
 `openssl x509 -checkhost` prints, which LibreSSL does not implement). The
 refusal happens before the payload is unpacked, so it costs nothing and touches
 nothing. `--fetch-tools`, accepted by every command, restores the download:
 `gsj_client_info` then supplies the pinned URL and SHA256 per tool, and
 verified clients are cached in the runtime's private bin directory;
 `--fetch-tools=TOOL[,TOOL]` downloads only the clients it names and holds the
-others to their floors. Neither
+others to their floors; `upgrade --to` and `repair --to` pass the set they
+fetched on to the verified target's installer. Neither
 
 <!-- init: begin -->
 `init` is the one command that names every missing or too-old client at
