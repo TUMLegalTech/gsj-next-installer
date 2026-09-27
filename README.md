@@ -44,15 +44,18 @@ install and when you would find out.
   install does not complete — it stops at its own network check, after the
   corpus import and before any acceptance check has run. Every pull of the
   release's images is proven on the storage node before anything is applied,
-  for every site, so nodes that cannot pull stop an install in its first
-  minutes. With `registry.base` (or on the upgrade that drops it) all six
-  must arrive within `deadlines.dependencies_seconds` (900 s by default),
-  which a slow link to the mirror may need raised; without it a pull still
-  under way then is waited for up to `deadlines.initialization_seconds` more.
-  A pull that fails in a way no retry changes (a refused credential, a name
-  or digest the registry does not hold, an invalid name) is refused after
-  90 s either way; any other failure is waited out to the same bound, and
-  refused if it is still reported then.
+  for every site, so nodes that cannot pull stop an install at its start,
+  not hours in. A pull that fails in a way no retry changes (a refused
+  credential, a name or digest the registry does not hold, an invalid name)
+  is refused after 90 s; any other failure within
+  `deadlines.dependencies_seconds` (900 s by default) of its first report;
+  and a probe Pod the
+  scheduler cannot place — its six containers ask for 300m CPU and 384Mi in
+  all, beside the running deployment on an upgrade — after 300 s. With
+  `registry.base` (or on the upgrade that drops it) all six images must
+  arrive within `deadlines.dependencies_seconds`, which a slow link to the
+  mirror may need raised; without it a pull still under way then is waited
+  for up to `deadlines.initialization_seconds` more.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has
@@ -122,8 +125,9 @@ published with. Then the installer's own bytes are held to the signed
 descriptor (SHA-256 and length, under the embedded key), the published
 verifier is run over the same files from that private copy, and only when
 both pass are the downloaded files put beside the installer (or, when that
-folder cannot be written, in `$HOME/gsj-operator/releases/<version>/`); an
-unverified run keeps none.
+folder cannot be written or is on a file system without hard links, such as
+FAT, exFAT and some network shares, in
+`$HOME/gsj-operator/releases/<version>/`); an unverified run keeps none.
 
 Then it checks the box, all at once, and writes every result as PASS, FAIL
 or UNKNOWN with the reason and the fix: helm, kubectl (and its skew
