@@ -4731,13 +4731,16 @@ record_installed() {
  # rewrites are done left a Lease whose resume said "already complete" beside
  # a file that still said true, or refused the file it had rewritten as a
  # changed configuration; with the marker the resume finishes them
- # (corpus_reset_finish).
+ # (corpus_reset_finish). The merged site is rewritten before the marker: it
+ # is this run's own copy, so jq failing on it is not an operator's edit, and
+ # the stop leaves the operation incomplete with nothing changed.
  local corpus_reset=''
  if jq -e --slurpfile release "$GSJ_PAYLOAD/release.json" '(.kind//"")!="restore" and (.corpus_update_from//"")!="" and .corpus_update_from!=$release[0].corpus.fingerprint' "$STATE_DIR/operation.json" >/dev/null && [[ $(j .corpus.allow_update) == true ]]; then
    if [[ -f $CONFIG && ! -L $CONFIG ]]; then
      corpus_reset=rewrite
+     allow_update_false "$SITE"
      jq '.corpus_update_reset="pending"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
-     jq '.corpus.allow_update=false' "$SITE" | atomic "$SITE"
+     atomic "$SITE" < "$GSJ_WORK/corpus-reset.json"
    else corpus_reset=kept; fi
  fi
  storage_identity > "$GSJ_WORK/storage.json"
@@ -4755,6 +4758,15 @@ record_installed() {
  fi
  installation_summary
 }
+allow_update_false() {
+ # $1, a site file, with corpus.allow_update false, into
+ # $GSJ_WORK/corpus-reset.json for the caller to publish with atomic. Piped
+ # straight into atomic, a file jq could not read (the operator edited it into
+ # a syntax error during a day-long upgrade) was replaced by jq's EMPTY output.
+ # Only a JSON object is rewritten (-e fails an empty file); jq's own words go
+ # to $STATE_DIR/corpus-reset.err, never to the log: they can quote the file.
+ jq -e 'select(type=="object")|.corpus.allow_update=false' "$1" > "$GSJ_WORK/corpus-reset.json" 2> "$STATE_DIR/corpus-reset.err"
+}
 corpus_reset_finish() {
  # The rest of spending corpus.allow_update, once the operation is complete:
  # the operator's file and the operation's saved site, then the marker
@@ -4762,17 +4774,26 @@ corpus_reset_finish() {
  # does a resume of that complete operation while the marker is there; every
  # write is idempotent, so a stop anywhere here is finished the same way.
  assert_owner
- local change; change="$(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")"
- if [[ -f $CONFIG && ! -L $CONFIG ]]; then
-   # The file first: a stop between the two writes leaves the file and the
-   # installed record agreeing, which is what the next backup compares.
-   jq '.corpus.allow_update=false' "$CONFIG" | atomic "$CONFIG"
-   jq '.corpus.allow_update=false' "$STATE_DIR/site.pending.json" | atomic "$STATE_DIR/site.pending.json"
+ local change file files=("$CONFIG" "$STATE_DIR/site.pending.json"); change="$(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")"
+ # The file first: a stop between the two writes leaves the file and the
+ # installed record agreeing, which is what the next backup compares. A file
+ # that became a link after the records said false is not rewritten: those
+ # cannot be taken back, so the file the link names is the operator's to
+ # correct.
+ [[ -f $CONFIG && ! -L $CONFIG ]] || files=("$STATE_DIR/site.pending.json")
+ for file in "${files[@]}"; do
+   # A file jq cannot read keeps its bytes, and the marker stays to record
+   # that the reset is unfinished: the operation is complete either way, and
+   # the file is the operator's to correct.
+   if ! allow_update_false "$file"; then
+     log "The corpus change this operation admitted is complete (fingerprint $change), but corpus.allow_update is still true in $file: it does not read as a JSON object and was left as it is (jq's own words are kept in $STATE_DIR/corpus-reset.err). Correct it and set corpus.allow_update to false there; while $CONFIG says true, a later release's corpus change is admitted without being asked for"
+     return
+   fi
+   atomic "$file" < "$GSJ_WORK/corpus-reset.json"
+ done
+ if (( ${#files[@]} == 2 )); then
    log "The corpus change this operation admitted is complete (fingerprint $change); corpus.allow_update is set back to false in $CONFIG, the operation's saved site and the installed record, so a later release's corpus change is refused until it is admitted again after its own pre-migration backup"
  else
-   # It became a link after the records said false: those cannot be taken
-   # back, so the file the link names is the operator's to correct.
-   jq '.corpus.allow_update=false' "$STATE_DIR/site.pending.json" | atomic "$STATE_DIR/site.pending.json"
    log "The corpus change this operation admitted is complete (fingerprint $change) and corpus.allow_update is false in the operation's saved site and the installed record, but $CONFIG is now a symbolic link or no longer a regular file and was not rewritten: set it to false in the file the link names, or every later backup is refused as a settings change"
  fi
  jq 'del(.corpus_update_reset)' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"

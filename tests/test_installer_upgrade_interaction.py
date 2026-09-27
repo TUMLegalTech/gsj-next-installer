@@ -410,11 +410,15 @@ main upgrade --expected-version v1.2.3 --config "$SITE" --non-interactive
         "corpus_update_from": "c" * 64}
 
 
-def _record_installed(runtime, operation, link=False, stop=None):
+BROKEN = b'{"schema_version": "gsj.site/1",\n "corpus": {"vectors_url": "", "allow_update": true,}\n'
+
+
+def _record_installed(runtime, operation, link=False, stop=None, broken=None, prefix=""):
     """record_installed with the fake: the installed ConfigMap is rendered by a
     stand-in for `create --dry-run` and captured at apply. stop: the write the
     run is killed before -- "file" (the operator's site file) or "saved" (the
-    operation's saved site)."""
+    operation's saved site). broken: the one of those two an edit left
+    unreadable while the operation ran (BROKEN, a syntax error)."""
     run, _, work = runtime
     state = work / "state"
     state.mkdir()
@@ -440,6 +444,8 @@ def _record_installed(runtime, operation, link=False, stop=None):
         config.write_text(json.dumps(own))
     for name in ("verification.json", "public-check.json", "network-check.json"):
         (state / name).write_text("{}")
+    if broken:
+        {"file": config, "saved": state / "site.pending.json"}[broken].write_bytes(BROKEN)
     (state / "operation.json").write_text(json.dumps(
         {"operation": OPERATION, "target": "synthetic-release", "kind": "upgrade", "status": "verifying", **operation}))
     stopper = ""
@@ -451,7 +457,7 @@ def _record_installed(runtime, operation, link=False, stop=None):
 assert_owner() {{ :; }}
 storage_identity() {{ printf '[]\\n'; }}
 installation_summary() {{ :; }}
-{stopper}k() {{ case "$1" in
+{prefix}{stopper}k() {{ case "$1" in
   create) jq -n --arg name "$3" --rawfile record "${{4#--from-file=installed.json=}}" '{{apiVersion:"v1",kind:"ConfigMap",metadata:{{name:$name}},data:{{"installed.json":$record}}}}';;
   apply) cat > "$TEST_WORK/applied.json";;
   *) kubectl --context "$CONTEXT" --namespace "$NAMESPACE" "$@";;
@@ -462,12 +468,20 @@ record_installed
 
 
 def _places(runtime, config):
+    """corpus.allow_update in each place; a file that does not read as JSON
+    shows as its bytes."""
     _, _, work = runtime
     state = work / "state"
+
+    def flag(path):
+        try:
+            return json.loads(path.read_text())["corpus"]["allow_update"]
+        except ValueError:
+            return path.read_bytes()
     applied = json.loads(json.loads((work / "applied.json").read_text())["data"]["installed.json"])
-    return {"site file": json.loads(config.read_text())["corpus"]["allow_update"],
-            "merged site": json.loads((work / "site.json").read_text())["corpus"]["allow_update"],
-            "saved operation site": json.loads((state / "site.pending.json").read_text())["corpus"]["allow_update"],
+    return {"site file": flag(config),
+            "merged site": flag(work / "site.json"),
+            "saved operation site": flag(state / "site.pending.json"),
             "installed record": applied["site"]["corpus"]["allow_update"],
             "installed record kept here": json.loads((state / "installed.json").read_text())["site"]["corpus"]["allow_update"]}
 
@@ -510,6 +524,50 @@ def test_a_linked_site_file_keeps_allow_update_and_is_named(runtime):
     assert places == dict.fromkeys(places, True), places
     assert config.is_symlink()
     assert "is a symbolic link or no longer a regular file" in result.stderr and str(config) in result.stderr
+
+
+@pytest.mark.parametrize("broken, place, name", [
+    ("file", "site file", None),
+    ("saved", "saved operation site", "state/site.pending.json"),
+])
+def test_a_site_file_broken_during_the_operation_keeps_its_bytes_and_the_marker(runtime, broken, place, name):
+    """The operator edited the site file into a syntax error during a day-long
+    upgrade. jq could not read it, and atomic published jq's empty output over
+    it: the whole site file was gone and the run stopped. jq now writes into
+    the work directory and only a complete result is published, so the file
+    keeps its bytes, corpus.allow_update is still true in it, the log names it,
+    the operation carries its reset marker still, and it completes. The saved
+    site of the operation is written the same way."""
+    _, _, work = runtime
+    result, places, own, config = _record_installed(runtime, {"corpus_update_from": "c" * 64}, broken=broken)
+    assert result.returncode == 0, result.stderr
+    named = str(work / name) if name else str(config)
+    assert places[place] == BROKEN, places
+    assert places["installed record"] is False and places["merged site"] is False
+    if broken == "saved":
+        assert places["site file"] is False     # the file first: it was readable
+    else:
+        assert places["saved operation site"] is True
+    assert f"corpus.allow_update is still true in {named}" in result.stderr, result.stderr
+    assert "set back to false" not in result.stderr
+    recorded = json.loads((work / "state" / "operation.json").read_text())
+    assert recorded["status"] == "complete" and recorded.get("corpus_update_reset") == "pending", recorded
+    assert not list((work / "state").glob("*.pending.[0-9]*")) and not list(config.parent.glob("*.pending.[0-9]*"))
+
+
+def test_the_merged_site_is_published_only_from_a_complete_rewrite(runtime):
+    """The merged site went through the same pipe: had jq failed on it, atomic
+    would have published an empty file there too. A failure now publishes
+    nothing and stops before the operation is complete, with no marker, for
+    its resume to record again."""
+    _, _, work = runtime
+    failing = 'jq() { if [[ $* == *allow_update=false* && ${@: -1} == "$SITE" ]]; then return 5; fi; command jq "$@"; }\n'
+    with pytest.raises(FileNotFoundError):            # nothing was applied
+        _record_installed(runtime, {"corpus_update_from": "c" * 64}, prefix=failing)
+    assert (work / "site.json").read_bytes() != b"", "an empty merged site was published"
+    assert json.loads((work / "site.json").read_text())["corpus"]["allow_update"] is True
+    recorded = json.loads((work / "state" / "operation.json").read_text())
+    assert recorded["status"] == "verifying" and "corpus_update_reset" not in recorded, recorded
 
 
 def _resume(runtime, config):
