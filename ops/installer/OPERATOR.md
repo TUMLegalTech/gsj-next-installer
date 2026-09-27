@@ -2660,25 +2660,11 @@ engineering build keeps its recorded immutable profile, including Traefik's
 site keep uploads small enough to finish within 60 seconds, for example with a
 lower `limits.upload_mb`.
 
-NetworkPolicy restricts egress for Forgejo only. GSJ (web, agent runner and
-MCP), the provisioning Job and Chroma have unrestricted egress. The
-installer's deny/allow check proves that one policy pair, not isolation of the
-whole stack.
-
-If you must write that namespace's egress rules yourself, this is what the
-release is *configured* to reach — read from the chart and your site file, not
-from a capture of its traffic. Inside the namespace: the `<release>-forgejo`
-Service on 3000, the `<release>-chroma` Service on 8000, and — from Forgejo —
-the `<release>-web` Service on 8780, the webhook delivery the chart's own
-Forgejo egress policy already permits. Cluster DNS. The
-Kubernetes API, from the gsj Pod's start-up check and from the provisioning
-Job. The two endpoints your site file names, `llm.base_url` and `ocr.url` — or
-the proxy in `trust.proxy_file`, if you set one. And, during acceptance, the
-route of `public_url` (`verification.connect_host` and `connect_port` if you
-set them), because the verifier runs inside the application's container and
-dials the public route from there. Forgejo and Chroma are stock third-party
-images: what they attempt on their own account beyond this, we have not
-enumerated.
+NetworkPolicy closes the outbound traffic of the gsj Pod (web, agent runner
+and MCP) and of Chroma, and pins Forgejo's; the provisioning Job and the Pods
+the installer opens beside the release keep their egress. "Outgoing
+connections" below lists what is allowed, what the installer resolves for it,
+and what its network check proves.
 
 Trust inputs serve different consumers:
 
@@ -2786,6 +2772,67 @@ installer resumes a run or cleans up an earlier one, in the verifier's
 `verification-failed` progress line. A test through the node port is different
 from a test through the host's published port; record which path passed. No
 browser or host trust store is modified automatically.
+
+## Outgoing connections
+
+The chart closes the outbound traffic of the two Pods that hold case data.
+The gsj Pod — gsj-web, the MCP door, the agent runner and their init
+containers share one network namespace, so one list serves all of them — may
+reach exactly:
+
+- cluster DNS: the CoreDNS Pods of `kube-system` (label `k8s-app: kube-dns`),
+  UDP and TCP 53;
+- the release's own Forgejo on 3000 and Chroma on 8000;
+- the ingress controller's namespace (`ingress.namespace`), because the
+  acceptance verifier inside gsj-web dials `public_url` — and, on k3s with
+  its bundled servicelb, the `svclb` Pod in `kube-system` that fronts the
+  controller's Service, which is where the node's address is translated to;
+- the addresses of `llm.base_url`, `ocr.url`, each `llm.allowed_origins` entry
+  and each proxy URL in `trust.proxy_file`. A NetworkPolicy names addresses,
+  never hosts, so **the installer resolves every hostname among them on the
+  machine it runs on, at every install, upgrade, repair and restore**, and
+  writes the addresses into the chart's values (`networkPolicy.egress.endpoints`,
+  one `{cidr, port}` per address). An IP literal is used as it is. A name this
+  machine cannot resolve is refused by name before anything is touched. A
+  name your cluster's DNS answers with another address than this machine's
+  DNS is yours to reconcile: the Pod would resolve the name, connect to the
+  cluster's answer and be refused, and the Verbindungstest would say "Nicht
+  verbunden". A model origin a lawyer enters in a case's settings works only
+  if its address is on this list.
+
+Chroma may reach DNS and nothing else. Nothing in the gsj Pod reaches the
+Kubernetes API: its start-up check reads the provisioning Job's ready marker
+from a mounted ConfigMap, and no service-account token is mounted in the gsj,
+Forgejo or Chroma Pods. Everything else is refused: model hubs and package
+indexes (`huggingface.co`, `pypi.org`, `github.com`), the agent runtime's
+version check and tool downloads (`pi.dev`, `api.github.com`; the runtime also
+runs with `PI_OFFLINE=1`), ONNX Runtime's telemetry collector
+(`mobile.events.data.microsoft.com`; the images are built and run with
+`ORT_DISABLE_TELEMETRY=1`), the isolation panel's canaries, the node's own
+services, an arbitrary address on 443.
+
+The installer's network check (`networkpolicy` in the summary, `egress` in
+`network-check.json`) asserts this from inside the gsj Pod at every
+install: the LLM's `/v1/models`, the OCR route, Forgejo, Chroma and DNS
+answer; `huggingface.co`, `pypi.org`, `github.com`, `api.github.com`,
+`pi.dev`, `mobile.events.data.microsoft.com` and an arbitrary public address
+on 443, and the node's own port 22, get no connection within 10 s; from Chroma
+nothing but DNS gets through; and the three pairs of the earlier check still
+hold (Forgejo reaches the door on 8780, Forgejo does not reach Chroma, the
+door reaches Chroma). A check that finds a connection where none may exist
+stops the install at `verifying`, as the earlier deny check did.
+
+Two limits to know. The rules name what a packet reaches **after** the
+cluster's service translation (a Service's Pod, the controller's Pod, never a
+ClusterIP or a node port): that is where k3s's kube-router, Calico and Cilium
+evaluate a policy — measured on k3s for the NodePort, the load-balancer and
+the servicelb shapes. A CNI that evaluates before the translation would need
+`ipBlock` entries for those addresses instead, and a CNI that enforces
+nothing (step 0's probe) leaves the list as documentation. And DNS lookups
+still leave the cluster: CoreDNS forwards names outside the cluster to the
+node's resolvers, so a name is resolved even when the connection that
+follows is refused — restricting that is the cluster's DNS configuration,
+not this installer's.
 
 ## Upgrade and recover a named operation
 

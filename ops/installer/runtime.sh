@@ -533,7 +533,7 @@ load_site() {
  OP_PASSWORD=$(resolve_file "$(j .operator.password_file)"); if [[ $COMMAND != restore || -f $OP_PASSWORD ]]; then private_file "$OP_PASSWORD"; [[ -s $OP_PASSWORD ]] || fail 'operator password is empty'; fi
  BACKUP_DIR=$(resolve_file "$(j .backup.directory)"); BACKUP_PASSWORD=$(resolve_file "$(j .backup.passphrase_file)"); private_file "$BACKUP_PASSWORD"; [[ -s $BACKUP_PASSWORD ]] || fail 'backup encryption passphrase is empty'
  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$SITE" > "$GSJ_WORK/values.pending.json"
+ compile_values "$SITE" > "$GSJ_WORK/values.pending.json"
  local delivery_ca delivery_auth
  delivery_ca=$(j .delivery.ca_file); delivery_auth=$(j .delivery.auth_header_file)
  if [[ -n $delivery_ca ]]; then
@@ -1196,6 +1196,54 @@ initializer_memory_check() {
 # 58203 (the guide's step-0 block, verbatim in its logic). A credential file
 # rides as a header read from a private file, never on a command line.
 GSJ_OCR_PROBE_PNG=iVBORw0KGgoAAAANSUhEUgAAATcAAABDAQAAAADRnX/8AAACLklEQVR42u2VMW7cMBBFHykhUpVVuu2sI+wBnJhHyRFSuooHCBDkGDkKj6Aj0F1KGXDBNbicFJS00tqFU6XZ6QR8/uH8+V80yntKLe+rK+6K+1fcsUVrHnfGmM/GGDgZw1OHWnh0HNsNX+g2BMMzL+r4PfDnBaiBmAD8tpE/EQkqDUEBVHWsNFfKF+AWUE2g8BDYJSoVHjRbgAwobhMIIBAhI/hyv7FgZQElyJX3Hgrzeo5kjIr6RqcA1j3cJxrFhFBwQYG4VvJGaTvkJ3Ev2G7m88BYv9LWAJDrc1+B0PIm0P2QGecB/ErmyHyaHu5nnOkB6V/RfZ+koJ/7etjI98nZOM6SMEx8AuhKPhgGUpgPqnMFZ7uzzEdjAZ7Nyck0KghYUAiXV8uI2Yx9VnfllxFwFlILkLXwUbcjF5yKP0HsFgpb3HJRN6ggkyrVvF8ADuMK14tU3hOKpvsRLCSIi3yNZtg7l+tDwLvLHMGveKZrBFpQKVrVy7wJQ9rcMNGSq/O+7bR1+9pWY6rfyvlq7Kdph8Vq3RmXwa4enGFq19EFTnHCjSvzrnfTjT3ghdQWvruSnbNhejzEeUMplpz7OyVXKncqmhpV1bAjNeONUMWGbMKu5NytqI7GCN0TpKEv32jfLfMKuLURjD05BGows+99WdoqHy12CYJlyZtMCV5wNbURBLDUuPn/UqqLK/FbnFHASEs/+Vk2PQGM/8bhIwBfD+w/AOb67l9x/xH3F0Tp4vsISHl9AAAAAElFTkSuQmCC
+# ---- the gsj pod's closed outbound list: the site's addresses, resolved ----
+# The chart closes the gsj pod's outbound traffic to a list, and a
+# NetworkPolicy names ADDRESSES, never hosts. compile_values therefore
+# resolves every host the application dials outside the cluster — the LLM,
+# the OCR, each allowed model origin, each proxy — on THIS machine, at every
+# compile, and hands compile.jq the list ([{cidr, port}]) the chart renders as
+# ipBlock rules. An IP literal is itself; a name that does not resolve here is
+# refused by name, because a rule that names nothing would leave the agent
+# without its model and say so only in the Verbindungstest. A name that
+# answers differently inside the cluster is the operator's DNS to reconcile
+# (the guide's "Outgoing connections" says so).
+egress_endpoint_urls() { # every URL the gsj pod dials outside the cluster, one per line
+ jq -r '[.llm.base_url, .ocr.url] + .llm.allowed_origins | map(select(. != "")) | .[]' "$1"
+ local file; file=$(jq -r '.trust.proxy_file // ""' "$1")
+ [[ -z $file ]] || jq -r '[.HTTP_PROXY, .HTTPS_PROXY] | map(select(. != "")) | .[]' "$(resolve_file "$file")"
+}
+resolve_endpoint() { # URL, its site key -> one {cidr, port} JSON object per address, on stdout
+ local url=$1 scheme='' rest authority host port address answered=0
+ if [[ $url == *://* ]]; then scheme=${url%%://*}; rest=${url#*://}; else rest=$url; fi
+ authority=${rest%%[/?#]*}; authority=${authority##*@}
+ if [[ $authority == \[* ]]; then host=${authority%%]*}; host=${host#[}; port=${authority##*]}; port=${port#:}
+ elif [[ $authority == *:* ]]; then host=${authority%%:*}; port=${authority##*:}
+ else host=$authority; port=''; fi
+ [[ -n $port ]] || case $scheme in https) port=443;; socks5|socks5h|socks4|socks4a) port=1080;; *) port=80;; esac
+ { [[ $host =~ ^[A-Za-z0-9._~%-]+$ || $host =~ ^[0-9A-Fa-f:.]+$ ]] && [[ $port =~ ^[0-9]{1,5}$ ]]; } \
+   || fail "$2 names $(url_origin_only "$url"), which is not a host and a port a NetworkPolicy can be written for"
+ while read -r address; do
+   [[ -n $address ]] || continue
+   answered=1
+   if [[ $address == *:* ]]; then jq -n --arg cidr "$address/128" --argjson port "$port" '{cidr:$cidr,port:$port}'
+   else jq -n --arg cidr "$address/32" --argjson port "$port" '{cidr:$cidr,port:$port}'; fi
+ done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+ (( answered )) || fail "$2 names $(url_origin_only "$url"), whose host this machine cannot resolve: the gsj pod's outbound policy admits addresses, never names, so the installer resolves them here. Fix this machine's DNS for that name or write the address into the site file, then run again"
+}
+egress_endpoints() { # merged site file -> the JSON list compile.jq takes as --argjson egress_endpoints
+ local site=$1 url source
+ {
+   while read -r url; do
+     [[ -n $url ]] || continue
+     source=$(jq -r --arg u "$url" 'if .llm.base_url==$u then "llm.base_url" elif .ocr.url==$u then "ocr.url" elif (.llm.allowed_origins|index($u)) then "llm.allowed_origins" else "trust.proxy_file" end' "$site")
+     resolve_endpoint "$url" "$source"
+   done < <(egress_endpoint_urls "$site")
+ } | jq -s 'unique'
+}
+compile_values() { # merged site file -> the chart's values on stdout: compile.jq plus the resolved outbound list
+ local endpoints; endpoints=$(egress_endpoints "$1")
+ jq --slurpfile release "$GSJ_PAYLOAD/release.json" --argjson egress_endpoints "$endpoints" -f "$GSJ_PAYLOAD/compile.jq" "$1"
+}
 endpoint_probe_header() {
  # Authorization: Bearer <the credential file's contents>, in a 0600 file
  # curl reads with --header @FILE; empty when the endpoint has no credential.
@@ -4020,8 +4068,40 @@ public_verify() {
  done < "$GSJ_WORK/spa-assets"
  jq -n --arg url "$url" --argjson assets "$(wc -l < "$GSJ_WORK/spa-assets")" '{name:"public-https",status:"passed",url:$url,tls_verified:true,spa:true,security_headers:true,assets_verified:$assets}' > "$STATE_DIR/public-check.json"
 }
+# The egress probe the door's container runs (it has httpx): every address
+# that must answer, every address that must not connect within 10 s, and a
+# name cluster DNS must resolve. It reports; the assertions are in
+# network_verify. A refused target is "no connection" whatever the CNI's way
+# of refusing — an immediate reset (kube-router), a hang to the timeout
+# (Calico, kindnet) or a name that did not resolve — and only the arbitrary
+# public ADDRESS, which needs no name, must be a real refusal or timeout.
+GSJ_EGRESS_PROBE_PY='import json, socket, sys, time
+import httpx
+spec = json.load(sys.stdin)
+out = {"answer": {}, "refuse": {}, "resolve": {}}
+for name, url in spec["answer"].items():
+    try:
+        out["answer"][name] = {"http": httpx.get(url, timeout=10.0, follow_redirects=False).status_code}
+    except Exception as exc:
+        out["answer"][name] = {"error": type(exc).__name__}
+for name, target in spec["refuse"].items():
+    started = time.monotonic()
+    try:
+        socket.create_connection((target["host"], target["port"]), timeout=10).close()
+        out["refuse"][name] = {"connected": True, "seconds": round(time.monotonic() - started, 1)}
+    except socket.gaierror:
+        out["refuse"][name] = {"connected": False, "outcome": "unresolved", "seconds": round(time.monotonic() - started, 1)}
+    except OSError as exc:
+        out["refuse"][name] = {"connected": False, "outcome": type(exc).__name__, "seconds": round(time.monotonic() - started, 1)}
+for name, host in spec["resolve"].items():
+    try:
+        socket.getaddrinfo(host, None); out["resolve"][name] = True
+    except OSError:
+        out["resolve"][name] = False
+print(json.dumps(out))
+'
 network_verify() {
- local forge pod start elapsed status=0 body='' rc=0 tries=0
+ local forge pod chroma start elapsed status=0 body='' rc=0 tries=0
  forge=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=forgejo" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
  # The allowed pair asserts the strict /readyz, which stays dependency-bearing:
  # guarded and briefly retried, so a heartbeat blip right after the
@@ -4046,7 +4126,45 @@ network_verify() {
  (( status != 0 )) || fail 'NetworkPolicy deny was not enforced: Forgejo reached Chroma, which the policy must block'
  pod=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gsj" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
  k exec "$pod" -c gsj-web -- python -c "import httpx; r=httpx.get('http://$RELEASE-chroma:8000/api/v2/heartbeat'); r.raise_for_status(); assert isinstance(r.json()['nanosecond heartbeat'],int)" >/dev/null
- jq -n --arg source "$forge" --argjson seconds "$elapsed" '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds}' > "$STATE_DIR/network-check.json"
+ # The gsj pod's closed outbound list, from inside the pod: the site's own
+ # endpoints, Forgejo, Chroma and cluster DNS answer; the hubs and indexes
+ # the runtime must never download from, the agent runtime's own hosts, the
+ # telemetry collector, an arbitrary public address on 443 and the node's
+ # own port 22 get no connection within 10 s. What the probe found is kept
+ # in the record, target by target.
+ local node llm ocr probe
+ node=$(k get pod "$pod" -o json | jq -r '.status.hostIP // ""')
+ [[ -n $node ]] || fail "the application pod $pod reports no host address; the outbound check cannot name the node"
+ llm=$(j '.llm.base_url // ""'); ocr=$(j '.ocr.url // ""')
+ jq -n --arg release "$RELEASE" --arg node "$node" --arg llm "$llm" --arg ocr "$ocr" '
+   {answer:({forgejo:"http://\($release)-forgejo:3000/api/healthz", chroma:"http://\($release)-chroma:8000/api/v2/heartbeat"}
+            + (if $llm != "" then {llm:(($llm|sub("/+$";""))+"/models")} else {} end)
+            + (if $ocr != "" then {ocr:$ocr} else {} end)),
+    refuse:({"huggingface.co":{host:"huggingface.co",port:443}, "pypi.org":{host:"pypi.org",port:443}, "github.com":{host:"github.com",port:443},
+             "api.github.com":{host:"api.github.com",port:443}, "pi.dev":{host:"pi.dev",port:443},
+             "mobile.events.data.microsoft.com":{host:"mobile.events.data.microsoft.com",port:443},
+             "public-address":{host:"1.1.1.1",port:443}, "node-ssh":{host:$node,port:22}}),
+    resolve:{cluster:"\($release)-forgejo"}}' > "$GSJ_WORK/egress-spec.json"
+ probe=$(k exec -i "$pod" -c gsj-web -- python -c "$GSJ_EGRESS_PROBE_PY" egress-probe < "$GSJ_WORK/egress-spec.json") || fail "the outbound probe did not run in the application pod (exit $?)"
+ jq -e 'type=="object" and (.answer|type=="object") and (.refuse|type=="object") and (.resolve|type=="object")' <<< "$probe" >/dev/null 2>&1 || fail 'the outbound probe in the application pod reported nothing readable'
+ printf '%s' "$probe" > "$GSJ_WORK/egress-probe.json"
+ local target
+ target=$(jq -r '[.answer|to_entries[]|select(.value.http==null)|.key]|join(", ")' "$GSJ_WORK/egress-probe.json")
+ [[ -z $target ]] || fail "NetworkPolicy: the gsj pod did not reach $target, which its outbound policy must admit (the probe's outcome is in the operation's egress-probe.json)"
+ target=$(jq -r '[.refuse|to_entries[]|select(.value.connected==true)|.key]|join(", ")' "$GSJ_WORK/egress-probe.json")
+ [[ -z $target ]] || fail "NetworkPolicy outbound deny was not enforced: the gsj pod connected to $target, which its outbound policy must refuse"
+ jq -e '.refuse["public-address"].outcome != "unresolved"' "$GSJ_WORK/egress-probe.json" >/dev/null || fail 'NetworkPolicy outbound check: the probe of the arbitrary public address needs no name and reported no refusal'
+ jq -e '.resolve.cluster==true' "$GSJ_WORK/egress-probe.json" >/dev/null || fail 'cluster DNS did not answer from the gsj pod, which its outbound policy must admit'
+ # From Chroma nothing but DNS: its image has bash and getent, nothing else
+ # that opens a connection, so bash's own /dev/tcp is the probe.
+ chroma=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=chroma" -o json | jq -r '.items[]|select(.status.phase=="Running")|.metadata.name')
+ local chroma_report
+ chroma_report=$(k exec "$chroma" -- bash -c ': chroma-egress; r=""; for t in "forgejo '"$RELEASE"'-forgejo 3000" "web '"$RELEASE"'-web 8780" "public-address 1.1.1.1 443" "github.com github.com 443"; do set -- $t; if timeout 10 bash -c "exec 3<>/dev/tcp/$2/$3" 2>/dev/null; then r="$r$1=connected "; else r="$r$1=blocked "; fi; done; if getent hosts '"$RELEASE"'-forgejo >/dev/null 2>&1; then r="${r}dns=ok"; else r="${r}dns=failed"; fi; printf "%s" "$r"') || fail "the outbound probe did not run in the Chroma pod (exit $?)"
+ [[ $chroma_report == *"=connected"* ]] && fail "NetworkPolicy outbound deny was not enforced on Chroma: it connected to ${chroma_report%%=connected*}, and Chroma may reach nothing but DNS"
+ [[ $chroma_report == *"dns=ok"* ]] || fail "cluster DNS did not answer from the Chroma pod, which its outbound policy must admit (the probe reported: $chroma_report)"
+ jq -n --arg source "$forge" --argjson seconds "$elapsed" --slurpfile probe "$GSJ_WORK/egress-probe.json" --arg chroma "$chroma_report" \
+   '{name:"networkpolicy-deny-allow",status:"passed",source:$source,allow:"Forgejo → web readiness",deny:"Forgejo → Chroma blocked",control:"GSJ → Chroma API heartbeat",deny_seconds:$seconds,
+     egress:{gsj:$probe[0],chroma:($chroma|split(" ")|map(select(.!="")|split("=")|{key:.[0],value:.[1]})|from_entries)}}' > "$STATE_DIR/network-check.json"
 }
 verification_new_run() {
  local attempts
@@ -4496,7 +4614,7 @@ prepare_repair_transition() {
  local source=$1 intent uid
  jq -e '.corpus.repair_generation<2147483647' "$SITE" >/dev/null || fail 'corpus repair generation is exhausted'
  jq '.corpus.repair_generation += 1' "$SITE" > "$GSJ_WORK/repair-site.json"
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$GSJ_WORK/repair-site.json" > "$GSJ_WORK/repair-values.json"
+ compile_values "$GSJ_WORK/repair-site.json" > "$GSJ_WORK/repair-values.json"
  uid=$(k get namespace "$NAMESPACE" -o json | jq -er .metadata.uid)
  intent="repair-transition-$OPERATION-$(sha_file "$GSJ_WORK/repair-site.json")-$(sha_file "$GSJ_PAYLOAD/release.json").json"
  jq -n --arg operation "$OPERATION" --arg source "$source" --arg target "$RELEASE_ID" --arg uid "$uid" --arg release "$(sha_file "$GSJ_PAYLOAD/release.json")" --slurpfile before "$SITE" --slurpfile after "$GSJ_WORK/repair-site.json" --slurpfile values "$GSJ_WORK/repair-values.json" --slurpfile saved "$STATE_DIR/site.pending.json" --slurpfile prior_values "$STATE_DIR/values.pending.json" '{format:"gsj.repair-transition/1",operation:$operation,source:$source,target:$target,namespace_uid:$uid,release_sha256:$release,site_before:$before[0],site_after:$after[0],values_after:$values[0],saved_site:$saved[0],saved_values:$prior_values[0]}' > "$GSJ_WORK/repair-transition.json"
@@ -4866,7 +4984,7 @@ restore_program_select() {
  jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$SITE" > "$GSJ_WORK/restore-program/validated-site.json"
  jq -e --slurpfile site "$SITE" '.==$site[0]' "$GSJ_WORK/restore-program/validated-site.json" >/dev/null || fail 'restore configuration does not satisfy the exact source schema'
  retained_site_matches "$SITE" "$STATE_DIR/site.pending.json" || fail 'restore program configuration differs from the retained operation'
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$SITE" > "$GSJ_WORK/values.pending.json"
+ compile_values "$SITE" > "$GSJ_WORK/values.pending.json"
  RESTORE_PROGRAM_ACTIVE=true
 }
 restore_program_resources() {
@@ -5247,7 +5365,7 @@ restore_archive() {
    def acme: {tls:(.tls|{issuer,email,acme_server,secret}),ingress_class:.ingress.class};
    .tls.profile!="managed-acme" or (acme==($target[0]|acme))
  ' "$GSJ_WORK/restore-source-site.json" >/dev/null || fail 'restore cannot change the ACME account, issuer or solver identity'
- jq --slurpfile release "$GSJ_PAYLOAD/release.json" -f "$GSJ_PAYLOAD/compile.jq" "$GSJ_WORK/restore-source-site.json" > "$GSJ_WORK/restore-source-values.json"
+ compile_values "$GSJ_WORK/restore-source-site.json" > "$GSJ_WORK/restore-source-values.json"
  # Context, node and StorageClass may relocate. Account, endpoint/model/auth,
  # trust, public host, and typed resource references must retain their identity.
  jq -e --slurpfile target "$GSJ_WORK/values.pending.json" '

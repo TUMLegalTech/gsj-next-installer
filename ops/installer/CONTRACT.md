@@ -55,6 +55,7 @@ exactly these values. Every leaf below is a value the chart declares in
 | `ingress.controller` | `traefik.io/ingress-controller` under the managed Traefik profile, else `k8s.io/ingress-nginx` (a `--arg ingress_controller` is accepted by the program but not passed by the runtime today) |
 | `ingress.tls` | `[{secretName: tls.secret, hosts: [<host>]}]` |
 | `networkPolicy.enabled`, `networkPolicy.ingressControllerNamespace` | `true`, `ingress.namespace` |
+| `networkPolicy.egress.endpoints` | `[{cidr, port}]`: one entry per address of `llm.base_url`, `ocr.url`, each `llm.allowed_origins[]` and each proxy URL in `trust.proxy_file`, the URL's port (or the scheme's default) and its host resolved by the installer on the machine it runs on at every compile (`getent ahosts`; an IP literal is itself; a host that does not resolve is refused by name); `[]` for a site that names none. The chart renders them as `ipBlock` rules of the gsj pod's outbound policy — a policy cannot name a hostname |
 | `operator.login`, `operator.existingSecret` | `operator.login`, `operator.secret` (the installer creates that Secret before Helm) |
 | `operator.password`, `operator.autogenPassword` | `""`, `false` |
 | `agent.turnTimeout` | `limits.turn_seconds` |
@@ -92,8 +93,8 @@ Rendered by the chart:
 | Secret | `R-admin-token`, `R-agent-token`, `R-webhook` | minted by the Job, re-mint policy `reuse` |
 | Secret | `R-operator` | rendered only without `operator.existingSecret`; the installer always names its own |
 | PersistentVolumeClaim | `R-data`, `R-forgejo`, `R-chroma` | unless `existingClaim` names the operator's |
-| ServiceAccount, Role, RoleBinding | `R-provisioner`, `R-pod`, `R-marker-reader` | the pod's only API access is the marker read |
-| NetworkPolicy | `R-default-deny-ingress`, `R-gsj-web-ingress`, `R-forgejo-ingress`, `R-forgejo-egress`, `R-chroma-ingress` | `R-gsj-web-ingress` admits the whole `networkPolicy.ingressControllerNamespace` |
+| ServiceAccount, Role, RoleBinding | `R-provisioner` | the gsj pod has no API access: no service-account token is mounted in it (nor in the Forgejo and Chroma pods), and wait-deps reads the ready marker `R-provisioned` from a mounted ConfigMap volume |
+| NetworkPolicy | `R-default-deny-ingress`, `R-gsj-web-ingress`, `R-forgejo-ingress`, `R-forgejo-egress`, `R-chroma-ingress`, `R-gsj-egress`, `R-chroma-egress` | `R-gsj-web-ingress` admits the whole `networkPolicy.ingressControllerNamespace`; `R-gsj-egress` closes the gsj pod's outbound traffic to cluster DNS (kube-system pods labelled `k8s-app: kube-dns`), Forgejo :3000, Chroma :8000, the ingress controller's namespace and, on k3s, the `svccontroller.k3s.cattle.io/svcnamespace=<that namespace>` pods in kube-system (the site's own public URL, dialled by the verifier), and `networkPolicy.egress.endpoints`; `R-chroma-egress` admits DNS only. The Pods the installer opens beside the release are not selected: they carry no `app.kubernetes.io/component` label of the release (the credential-repair Pod carries the gsj pod's labels and needs only Forgejo) |
 | Ingress | `R-web` | proxy limits rendered for ingress-nginx only (§2 `ingress.controller`) |
 
 Created by the installer, before or beside the chart (the chart must never

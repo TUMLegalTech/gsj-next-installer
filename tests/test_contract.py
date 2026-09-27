@@ -169,9 +169,7 @@ def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
                 ("Job", "gsj-provision"), ("ConfigMap", "gsj-scripts"),
                 ("Secret", "gsj-operator"),
                 ("PersistentVolumeClaim", "gsj-data"), ("PersistentVolumeClaim", "gsj-forgejo"), ("PersistentVolumeClaim", "gsj-chroma"),
-                ("ServiceAccount", "gsj-provisioner"), ("ServiceAccount", "gsj-pod"),
-                ("Role", "gsj-provisioner"), ("Role", "gsj-marker-reader"),
-                ("RoleBinding", "gsj-provisioner"), ("RoleBinding", "gsj-marker-reader"),
+                ("ServiceAccount", "gsj-provisioner"), ("Role", "gsj-provisioner"), ("RoleBinding", "gsj-provisioner"),
                 ("NetworkPolicy", "gsj-default-deny-ingress"), ("NetworkPolicy", "gsj-gsj-web-ingress"),
                 ("NetworkPolicy", "gsj-forgejo-ingress"), ("NetworkPolicy", "gsj-forgejo-egress"), ("NetworkPolicy", "gsj-chroma-ingress"),
                 ("Ingress", "gsj-web")}
