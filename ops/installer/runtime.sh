@@ -5274,10 +5274,14 @@ restore_files() {
  # decided:
  # - 256 MiB, and a tenth of the archive, for whatever else lands on that
  #   filesystem meanwhile;
- # - a tenth of the filesystem: an emptyDir lives on the node's root
- #   filesystem, where the kubelet evicts Pods below 10 % free by default, so
- #   an archive that fit with 256 MiB to spare could push the node under that
- #   line and get the restore Pod evicted after the whole transfer;
+ # - a tenth of the filesystem, for the emptyDir alone (storage.transfer_path
+ #   empty): it lives on the node's root filesystem, where the kubelet evicts
+ #   Pods below 10 % free by default, so an archive that fit with 256 MiB to
+ #   spare could push the node under that line and get the restore Pod
+ #   evicted after the whole transfer. A transfer_path hostPath is a directory
+ #   the operator chose, a dedicated data disk among others, which that
+ #   threshold does not watch: a tenth of it kept free (over 200 GiB of a 2 TiB
+ #   disk) refused restores that fit;
  # - storage.minimum_free_bytes when /transfer shares its filesystem (f_fsid)
  #   with an application volume: the stream spends the room the application
  #   needs there, and the backup's capacity check charges that floor the same.
@@ -5296,7 +5300,9 @@ restore_files() {
  fi
  margin=268435456; floor='256 MiB, the least margin'
  (( size / 10 <= margin )) || { margin=$(( size / 10 )); floor='a tenth of the archive'; }
- (( total / 10 <= margin )) || { margin=$(( total / 10 )); floor="a tenth of the filesystem's $total bytes, which keeps the node clear of the kubelet's default eviction threshold"; }
+ if [[ -z $(j '.storage.transfer_path // ""') ]] && (( total / 10 > margin )); then
+   margin=$(( total / 10 )); floor="a tenth of the filesystem's $total bytes, which keeps the node clear of the kubelet's default eviction threshold"
+ fi
  if (( shared )) && (( $(j .storage.minimum_free_bytes) > margin )); then
    margin=$(j .storage.minimum_free_bytes); floor='storage.minimum_free_bytes, the site'"'"'s floor for the filesystem the application volumes share with it'
  fi

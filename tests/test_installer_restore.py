@@ -421,14 +421,13 @@ def _refusal(result):
     return next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
 
 
-@pytest.mark.parametrize("transfer", ["", "/data/gsj-install/transfer"], ids=["emptyDir", "hostPath"])
-def test_a_tenth_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path, transfer):
+def test_a_tenth_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path):
     """An emptyDir lives on the node's root filesystem, where the kubelet
     evicts Pods below 10 % free by default: an archive that fit with 256 MiB
     to spare could push the node under that line and get the restore Pod
     evicted after the whole transfer. What stays free after the stream is at
     least a tenth of the filesystem."""
-    total, size = 100 * GIB, 1000
+    transfer, total, size = "", 100 * GIB, 1000
     result, calls = _staging(runtime, tmp_path, transfer, free=size + 10 * GIB - 1, total=total, size=size)
     assert result.returncode != 0
     assert _streamed(calls) == [], "refused before a byte was streamed"
@@ -439,6 +438,46 @@ def test_a_tenth_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path
     result, calls = _staging(runtime, tmp_path, transfer, free=size + total // 10, total=total, size=size)
     assert "restore staging space" not in result.stderr
     assert len(_streamed(calls)) == 1
+
+
+HOST_PATH = "/data/gsj-install/transfer"
+
+
+def test_a_transfer_hostpath_is_not_held_to_a_tenth_of_its_filesystem(runtime, tmp_path):
+    """The kubelet's eviction threshold watches the node's root filesystem,
+    where an emptyDir lives. storage.transfer_path is a directory the operator
+    chose, a dedicated data disk among others: a tenth of that disk kept free
+    refused restores that fit. There the least margin and a tenth of the
+    archive hold, and nothing about the filesystem's size."""
+    total, size = 2000 * GIB, 1000
+    result, calls = _staging(runtime, tmp_path, HOST_PATH, free=size + 268435456, total=total, size=size)
+    assert "restore staging space" not in result.stderr, _refusal(result)
+    assert len(_streamed(calls)) == 1, "the least margin admitted the stream"
+    result, calls = _staging(runtime, tmp_path, HOST_PATH, free=size + 268435456 - 1, total=total, size=size)
+    assert result.returncode != 0 and _streamed(calls) == []
+    refusal = _refusal(result)
+    assert "a margin of 268435456: 256 MiB, the least margin" in refusal, refusal
+    assert "a tenth of the filesystem" not in refusal and "eviction" not in refusal, refusal
+
+
+@pytest.mark.parametrize("size, total, shared, floor, named", [
+    (1000, 100 * GIB, False, None, "256 MiB, the least margin"),
+    (3 * GIB, 100 * GIB, False, None, "a tenth of the archive"),
+    (1000, 100 * GIB, True, 20 * GIB, "storage.minimum_free_bytes"),
+    (30 * GIB, 100 * GIB, True, GIB, "a tenth of the archive"),       # a floor below the archive's tenth does not decide
+], ids=["least", "archive", "site-floor", "floor-below-the-archive"])
+def test_a_transfer_hostpath_refusal_names_only_the_floor_that_applied(runtime, tmp_path, size, total, shared, floor, named):
+    """On a hostPath the floors are the least margin, a tenth of the archive and,
+    on the application volumes' filesystem, storage.minimum_free_bytes: the
+    refusal names the one that decided and never the filesystem's tenth."""
+    result, calls = _staging(runtime, tmp_path, HOST_PATH, free=1000, total=total, size=size, shared=shared, floor=floor)
+    assert result.returncode != 0 and _streamed(calls) == []
+    refusal = _refusal(result)
+    assert named in refusal, refusal
+    for other in {"256 MiB, the least margin", "a tenth of the archive", "a tenth of the filesystem's", "storage.minimum_free_bytes"} - {named}:
+        assert other not in refusal, (other, refusal)
+    margin = {"256 MiB, the least margin": 268435456, "a tenth of the archive": size // 10, "storage.minimum_free_bytes": floor}[named]
+    assert f"needs {size + margin} (" in refusal, refusal
 
 
 def test_a_transfer_directory_on_the_volumes_filesystem_leaves_the_sites_free_space_floor(runtime, tmp_path):
