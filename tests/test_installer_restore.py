@@ -335,12 +335,20 @@ def test_owned_pod_refuses_unsupported_or_inexact_quantities_even_when_identical
 
 # --- the transfer directory has room for the decrypted archive before the stream ----
 
-def _staging(runtime, tmp_path, transfer, free, size=1000):
+GIB = 1024 ** 3
+
+
+def _staging(runtime, tmp_path, transfer, free, size=1000, total=2 * GIB, shared=False, floor=None):
     """restore_files up to its stream: the Pod is Ready, the writers and the
-    bindings are proven, and the fake exec answers the free-space measurement."""
+    bindings are proven, and the fake exec answers the measurement -- free
+    bytes, the filesystem's size, and whether /transfer shares its filesystem
+    with an application volume. The default filesystem is small enough that
+    its tenth never decides the margin."""
     run, state, work = runtime
     site = json.loads((work / "site.json").read_text())
     site["storage"]["transfer_path"] = transfer
+    if floor is not None:
+        site["storage"]["minimum_free_bytes"] = floor
     (work / "site.json").write_text(json.dumps(site))
     (work / "values.pending.json").write_text(json.dumps({
         "image": {"pullSecrets": []}, "storage": {key: {"existingClaim": ""} for key in ("data", "forgejo", "chroma")}}))
@@ -349,7 +357,8 @@ def _staging(runtime, tmp_path, transfer, free, size=1000):
     archive.write_bytes(b"")
     os.truncate(archive, size)      # sparse: its length is all the check reads
     cluster = json.loads(state.read_text())
-    cluster.update(resources={}, calls=[], exec_rules=[{"match": "statvfs", "stdout": f"{free}\n"}])
+    answer = f"{free} {total} {int(shared)}\n" if free != "" else ""
+    cluster.update(resources={}, calls=[], exec_rules=[{"match": "statvfs", "stdout": answer}])
     state.write_text(json.dumps(cluster))
     result = run(f'''OPERATION={"a" * 24}; ARCHIVE="$TEST_ARCHIVE"; BACKUP_PASSWORD="$TEST_ARCHIVE"
 trap 'echo "HINT=${{RECOVERY_HINT:-}}" >&2' EXIT
@@ -407,6 +416,72 @@ def test_an_unmeasured_transfer_directory_is_refused_before_the_stream(runtime, 
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
     assert refusal.startswith("GSJ: restore staging space is unmeasured"), refusal
     assert "nothing was streamed" in refusal
+
+def _refusal(result):
+    return next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+
+
+@pytest.mark.parametrize("transfer", ["", "/data/gsj-install/transfer"], ids=["emptyDir", "hostPath"])
+def test_a_tenth_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path, transfer):
+    """An emptyDir lives on the node's root filesystem, where the kubelet
+    evicts Pods below 10 % free by default: an archive that fit with 256 MiB
+    to spare could push the node under that line and get the restore Pod
+    evicted after the whole transfer. What stays free after the stream is at
+    least a tenth of the filesystem."""
+    total, size = 100 * GIB, 1000
+    result, calls = _staging(runtime, tmp_path, transfer, free=size + 10 * GIB - 1, total=total, size=size)
+    assert result.returncode != 0
+    assert _streamed(calls) == [], "refused before a byte was streamed"
+    refusal = _refusal(result)
+    assert refusal.startswith("GSJ: restore staging space is insufficient"), refusal
+    assert f"a margin of {total // 10}" in refusal and str(size + total // 10) in refusal, refusal
+    assert f"a tenth of the filesystem's {total} bytes" in refusal and "eviction" in refusal, refusal
+    result, calls = _staging(runtime, tmp_path, transfer, free=size + total // 10, total=total, size=size)
+    assert "restore staging space" not in result.stderr
+    assert len(_streamed(calls)) == 1
+
+
+def test_a_transfer_directory_on_the_volumes_filesystem_leaves_the_sites_free_space_floor(runtime, tmp_path):
+    """/transfer on the filesystem the restored volumes live on: the stream
+    spends the room the application needs there, which the backup's capacity
+    check keeps at storage.minimum_free_bytes. The same floor holds here."""
+    total, size, floor = 100 * GIB, 1000, 20 * GIB
+    result, calls = _staging(runtime, tmp_path, "", free=size + 15 * GIB, total=total, size=size, shared=True, floor=floor)
+    assert result.returncode != 0
+    assert _streamed(calls) == []
+    refusal = _refusal(result)
+    assert f"a margin of {floor}" in refusal and str(size + floor) in refusal, refusal
+    assert "storage.minimum_free_bytes" in refusal, refusal
+    # the same room on a filesystem of its own is enough: the floor is the volumes'
+    result, calls = _staging(runtime, tmp_path, "", free=size + 15 * GIB, total=total, size=size, shared=False, floor=floor)
+    assert "restore staging space" not in result.stderr and len(_streamed(calls)) == 1
+    result, calls = _staging(runtime, tmp_path, "", free=size + floor, total=total, size=size, shared=True, floor=floor)
+    assert "restore staging space" not in result.stderr and len(_streamed(calls)) == 1
+
+
+@pytest.mark.parametrize("size, total, shared, floor, named", [
+    (1000, 2 * GIB, False, None, "256 MiB, the least margin"),
+    (3 * GIB, 2 * GIB, False, None, "a tenth of the archive"),
+    (1000, 100 * GIB, False, None, "a tenth of the filesystem's"),
+    (1000, 100 * GIB, True, 20 * GIB, "storage.minimum_free_bytes"),
+    (1000, 100 * GIB, True, GIB, "a tenth of the filesystem's"),      # a floor below the tenth does not decide
+], ids=["least", "archive", "filesystem", "site-floor", "floor-below-the-tenth"])
+def test_the_refusal_names_the_floor_that_decided_the_margin(runtime, tmp_path, size, total, shared, floor, named):
+    result, calls = _staging(runtime, tmp_path, "", free=1000, total=total, size=size, shared=shared, floor=floor)
+    assert result.returncode != 0 and _streamed(calls) == []
+    refusal = _refusal(result)
+    assert named in refusal, refusal
+    for other in {"256 MiB, the least margin", "a tenth of the archive", "a tenth of the filesystem's", "storage.minimum_free_bytes"} - {named}:
+        assert other not in refusal, (other, refusal)
+
+
+def test_the_measurement_reads_the_filesystem_size_and_the_volumes_filesystem_ids(runtime, tmp_path):
+    result, calls = _staging(runtime, tmp_path, "", free=GIB, total=2 * GIB)
+    command = " ".join(next(c for c in calls if c[:1] == ["exec"] and "statvfs" in " ".join(c)))
+    assert "f_blocks" in command and "f_fsid" in command, command
+    for mount in ("/volumes/gsj", "/volumes/forgejo", "/volumes/chroma"):
+        assert mount in command, command
+
 
 
 PRIOR = "b" * 24

@@ -5168,23 +5168,41 @@ restore_files() {
  # anything verifies it, and nothing asked whether it fits: a full node disk
  # would end it partway, after all the time the transfer took. Measure the
  # directory inside the Pod first. The decrypted archive is never larger than
- # the encrypted one (a header and a padding block less); the margin is the
- # larger of 256 MiB and a tenth of it, for whatever else lands on that
- # filesystem meanwhile. A refusal here has streamed nothing: the operation is
- # retained, and restore-repair continues it once there is room.
- local size margin need free where verb="restore-repair --operation $OPERATION with the exact saved target"
+ # the encrypted one (a header and a padding block less); what must stay free
+ # after it is the largest of these floors, and the refusal names the one that
+ # decided:
+ # - 256 MiB, and a tenth of the archive, for whatever else lands on that
+ #   filesystem meanwhile;
+ # - a tenth of the filesystem: an emptyDir lives on the node's root
+ #   filesystem, where the kubelet evicts Pods below 10 % free by default, so
+ #   an archive that fit with 256 MiB to spare could push the node under that
+ #   line and get the restore Pod evicted after the whole transfer;
+ # - storage.minimum_free_bytes when /transfer shares its filesystem (f_fsid)
+ #   with an application volume: the stream spends the room the application
+ #   needs there, and the backup's capacity check charges that floor the same.
+ # A refusal here has streamed nothing: the operation is retained, and
+ # restore-repair continues it once there is room.
+ local size margin floor need free total shared measured where verb="restore-repair --operation $OPERATION with the exact saved target"
  [[ ${RESTORE_PROGRAM_ACTIVE:-false} != true ]] || verb="restore-repair --operation $OPERATION with this corrected installer"
- size=$(wc -c < "$ARCHIVE" | tr -d ' '); margin=$(( size / 10 > 268435456 ? size / 10 : 268435456 )); need=$(( size + margin ))
+ size=$(wc -c < "$ARCHIVE" | tr -d ' ')
  if [[ -n $(j '.storage.transfer_path // ""') ]]; then where="$(j .storage.transfer_path)/$OPERATION on node $(j .storage.node)"
  else where="the restore Pod's emptyDir on node $(j .storage.node)'s own filesystem (storage.transfer_path is empty)"; fi
- free=$(k exec "$pod" -- python -c 'import os; v=os.statvfs("/transfer"); print(v.f_bavail*v.f_frsize)' 2>"$STATE_DIR/restore-transfer-space.err") || free=''
- if [[ ! $free =~ ^[0-9]+$ ]]; then
+ measured=$(k exec "$pod" -- python -c 'import os; t=os.statvfs("/transfer"); print(t.f_bavail*t.f_frsize, t.f_blocks*t.f_frsize, int(any(os.statvfs(v).f_fsid==t.f_fsid for v in ("/volumes/gsj","/volumes/forgejo","/volumes/chroma"))))' 2>"$STATE_DIR/restore-transfer-space.err") || measured=''
+ read -r free total shared <<< "$measured"
+ if [[ ! $free =~ ^[0-9]+$ || ! $total =~ ^[0-9]+$ || ! $shared =~ ^[01]$ ]]; then
    RECOVERY_HINT="$verb once the restore Pod answers"
-   fail "restore staging space is unmeasured: the free space of $where could not be read inside the restore Pod, so whether the decrypted archive ($need bytes with its margin) fits is unknown; nothing was streamed. kubectl's own words are kept in $STATE_DIR/restore-transfer-space.err; continue with the command the closing line names"
+   fail "restore staging space is unmeasured: the free space of $where could not be read inside the restore Pod, so whether the decrypted archive ($size bytes and its margin) fits is unknown; nothing was streamed. kubectl's own words are kept in $STATE_DIR/restore-transfer-space.err; continue with the command the closing line names"
  fi
+ margin=268435456; floor='256 MiB, the least margin'
+ (( size / 10 <= margin )) || { margin=$(( size / 10 )); floor='a tenth of the archive'; }
+ (( total / 10 <= margin )) || { margin=$(( total / 10 )); floor="a tenth of the filesystem's $total bytes, which keeps the node clear of the kubelet's default eviction threshold"; }
+ if (( shared )) && (( $(j .storage.minimum_free_bytes) > margin )); then
+   margin=$(j .storage.minimum_free_bytes); floor='storage.minimum_free_bytes, the site'"'"'s floor for the filesystem the application volumes share with it'
+ fi
+ need=$(( size + margin ))
  if (( free < need )); then
    RECOVERY_HINT="$verb once $where has $need bytes free"
-   fail "restore staging space is insufficient: $where has $free bytes free and the decrypted archive needs $need (the encrypted archive's $size bytes plus a margin of $margin); nothing was streamed. Make room there, then continue with the command the closing line names; this operation stays retained for it"
+   fail "restore staging space is insufficient: $where has $free bytes free and the decrypted archive needs $need (the encrypted archive's $size bytes plus a margin of $margin: $floor); nothing was streamed. Make room there, then continue with the command the closing line names; this operation stays retained for it"
  fi
  log 'Transferring and verifying the immutable restore archive; existing partial data remains owned by this operation'
  local remote="/transfer/snapshot-$(jq -r .archive_sha256 "$STATE_DIR/restoration.json").tar.gz"

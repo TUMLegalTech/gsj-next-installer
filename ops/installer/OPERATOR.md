@@ -3835,12 +3835,18 @@ node while the operation runs and nothing of it survives afterwards, so there
 is no directory to make private, to hand back or to remove.
 
 Before a restore streams its decrypted archive into that directory, or into
-its `emptyDir`, it measures the free space there inside the restore Pod and
-refuses, having streamed nothing, when the archive and a margin — the larger
-of 256 MiB and a tenth of the archive — would not fit: *"restore staging space
-is insufficient: … has … bytes free and the decrypted archive needs …"*. Make
-room there, then run the `restore-repair --operation ID` the closing line
-names; the operation stays retained for it.
+its `emptyDir`, it measures that filesystem inside the restore Pod and
+refuses, having streamed nothing, when the archive and a margin would not fit.
+The margin is what must stay free after the stream, the largest of: 256 MiB; a
+tenth of the archive; a tenth of the filesystem (an `emptyDir` is on the node's
+root filesystem, where the kubelet evicts Pods below 10 % free by default); and
+`storage.minimum_free_bytes` when the directory shares its filesystem with the
+application's volumes, as the backup's capacity check charges it. The refusal
+names the one that decided: *"restore staging space is insufficient: … has …
+bytes free and the decrypted archive needs … (the encrypted archive's … bytes
+plus a margin of …: a tenth of the filesystem's … bytes, …)"*. Make room there,
+then run the `restore-repair --operation ID` the closing line names; the
+operation stays retained for it.
 
 **`TMPDIR` belongs on the data disk too.** The installer's own working
 directory, and the corpus envelope inside it, sit under `TMPDIR` (else `/tmp`)
@@ -4329,7 +4335,7 @@ first install, or its recovery, realistically meets:
 | `the node cannot pull this release from` | the pull proof failed: `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
 | `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with pulls still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers |
 | `Helm provisioning failed; persistent state was retained` | the Helm apply of an install, upgrade or restore exited non-zero; the last 25 lines of Helm's log precede it. The operation stays in its Helm phase, where `resume` refuses | fix the cause, wait 180 s, then the `repair --operation ID --config … --non-interactive` the closing line names |
-| `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin; nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
+| `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin (the refusal names the floor that set it); nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
 | `the operation Lease is already free; nothing to abandon` | `abandon` on a target with no live operation — normal after a completed install | carry on; it exits `1` while doing no harm, so do not let a script stop on it |
 | `a Helm release named … exists … sweep never removes a deployment` | `sweep` clears residue, never a deployment | `helm uninstall` first (its claims are kept), then `sweep` |
 
