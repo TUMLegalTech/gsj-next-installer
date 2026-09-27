@@ -22,6 +22,14 @@ import time
 
 from release import ROOT, Refused, download, require, run, save, sha, webpin
 
+# The permanent release key: the SHA-256 of the release.pem published beside
+# every installer. Every installed release verifies its successor under the key
+# it carries (upgrade --to, repair --to), so a candidate signed with any other
+# key -- a throwaway one, on a bundle marked qualification:false -- passed
+# this gate and then stopped every such upgrade at 'target release signature
+# is invalid'. gate() refuses it before any other check.
+RELEASE_TRUST_KEY_SHA256 = "8cd0a432a238866178c10f7b49d36cfc417125f32d53d445ea28f0de73d30bc3"
+
 
 def prepare(destination):
     require(not destination.exists(), "qualification input directory must be fresh")
@@ -566,6 +574,9 @@ def check_initializer_qualification(directory, manifest):
 
 def gate(directory, reports):
     descriptor = bundle(directory)
+    require(descriptor.get("trustKeySha256") == RELEASE_TRUST_KEY_SHA256,
+            "the candidate is not signed for the permanent release key; every installed release would refuse it as an "
+            "upgrade target, so sign it with that key and qualify it again")
     require(descriptor.get("qualification") is False, "qualification-only artifact cannot be publicly released")
     manifest = json.loads((directory / "manifest.json").read_bytes())
     canonical = (json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=True) + "\n").encode()

@@ -250,7 +250,7 @@ def qualified_files(module, tmp_path, monkeypatch):
     (tmp_path / "manifest.json").write_text(data)
     (tmp_path / "image-inventory.json").write_text(json.dumps({"images": images, "all_remote_manifests_verified": True}))
     descriptor = {"qualification": False, "releaseId": "target", "version": "1.1.0", "manifestSha256": hashlib.sha256(data.encode()).hexdigest(),
-                  "installer": {"sha256": "c" * 64}}
+                  "trustKeySha256": module.RELEASE_TRUST_KEY_SHA256, "installer": {"sha256": "c" * 64}}
     staged = staged_release()
     (tmp_path / "staging.json").write_text(json.dumps(staged))
     monkeypatch.setattr(module, "bundle", lambda path: descriptor)
@@ -680,6 +680,33 @@ def test_qualification_gate_rejects_unproved_actual_delivery_readback(modules, t
         receipt[key] = "changed"
     reports[1].write_text(json.dumps(report))
     with pytest.raises(ValueError, match="readback"):
+        module.gate(tmp_path, reports)
+
+
+# --- the key a released candidate carries ---
+
+def test_the_permanent_release_key_is_the_published_one(modules):
+    """The SHA-256 of the release.pem published beside every installer:
+    changing it is a decision about the product's trust root, never a
+    side effect."""
+    assert modules[1].RELEASE_TRUST_KEY_SHA256 == "8cd0a432a238866178c10f7b49d36cfc417125f32d53d445ea28f0de73d30bc3"
+
+
+@pytest.mark.parametrize("key,qualification", [("f" * 64, False), ("f" * 64, True), (None, False)])
+def test_the_gate_refuses_a_candidate_not_signed_for_the_permanent_release_key(modules, tmp_path, monkeypatch, key, qualification):
+    """Every installed release verifies its successor under the key it
+    carries, so a candidate signed with any other key -- a throwaway one, on
+    a bundle marked qualification:false -- passed every other check and then
+    stopped every upgrade --to at 'target release signature is invalid'. The
+    gate refuses it first, before it reads anything else."""
+    module = modules[1]
+    descriptor, reports = qualified_files(module, tmp_path, monkeypatch)
+    module.gate(tmp_path, reports)                  # the fixture is a candidate the gate passes
+    descriptor["qualification"] = qualification
+    if key is None: descriptor.pop("trustKeySha256")
+    else: descriptor["trustKeySha256"] = key
+    (tmp_path / "manifest.json").unlink()           # nothing else is read before the key is judged
+    with pytest.raises(module.Refused, match="not signed for the permanent release key"):
         module.gate(tmp_path, reports)
 
 
