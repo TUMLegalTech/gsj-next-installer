@@ -4998,6 +4998,28 @@ restore_files() {
      log "The transfer directory $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node) could not be made private (mode 0700), so other accounts on that node may read the decrypted archive this restore stages there; kubectl's own words are kept in $STATE_DIR/transfer-private.err"
  fi
  restore_no_writers "$pod"; restore_bindings; assert_owner
+ # The stream below writes the whole decrypted archive into /transfer before
+ # anything verifies it, and nothing asked whether it fits: a full node disk
+ # would end it partway, after all the time the transfer took. Measure the
+ # directory inside the Pod first. The decrypted archive is never larger than
+ # the encrypted one (a header and a padding block less); the margin is the
+ # larger of 256 MiB and a tenth of it, for whatever else lands on that
+ # filesystem meanwhile. A refusal here has streamed nothing: the operation is
+ # retained, and restore-repair continues it once there is room.
+ local size margin need free where verb="restore-repair --operation $OPERATION with the exact saved target"
+ [[ ${RESTORE_PROGRAM_ACTIVE:-false} != true ]] || verb="restore-repair --operation $OPERATION with this corrected installer"
+ size=$(wc -c < "$ARCHIVE" | tr -d ' '); margin=$(( size / 10 > 268435456 ? size / 10 : 268435456 )); need=$(( size + margin ))
+ if [[ -n $(j '.storage.transfer_path // ""') ]]; then where="$(j .storage.transfer_path)/$OPERATION on node $(j .storage.node)"
+ else where="the restore Pod's emptyDir on node $(j .storage.node)'s own filesystem (storage.transfer_path is empty)"; fi
+ free=$(k exec "$pod" -- python -c 'import os; v=os.statvfs("/transfer"); print(v.f_bavail*v.f_frsize)' 2>"$STATE_DIR/restore-transfer-space.err") || free=''
+ if [[ ! $free =~ ^[0-9]+$ ]]; then
+   RECOVERY_HINT="$verb once the restore Pod answers"
+   fail "restore staging space is unmeasured: the free space of $where could not be read inside the restore Pod, so whether the decrypted archive ($need bytes with its margin) fits is unknown; nothing was streamed. kubectl's own words are kept in $STATE_DIR/restore-transfer-space.err; continue with the command the closing line names"
+ fi
+ if (( free < need )); then
+   RECOVERY_HINT="$verb once $where has $need bytes free"
+   fail "restore staging space is insufficient: $where has $free bytes free and the decrypted archive needs $need (the encrypted archive's $size bytes plus a margin of $margin); nothing was streamed. Make room there, then continue with the command the closing line names; this operation stays retained for it"
+ fi
  log 'Transferring and verifying the immutable restore archive; existing partial data remains owned by this operation'
  local remote="/transfer/snapshot-$(jq -r .archive_sha256 "$STATE_DIR/restoration.json").tar.gz"
  # The receiver verifies the complete archive before publishing it. Broken

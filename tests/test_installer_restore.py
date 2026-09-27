@@ -5,6 +5,7 @@ extraction and killed file writers are tested separately by restore-files.
 """
 import json
 import hashlib
+import os
 
 import pytest
 
@@ -330,3 +331,79 @@ def test_owned_pod_refuses_unsupported_or_inexact_quantities_even_when_identical
     from copy import deepcopy
     want=_quantity_pod();want['spec']['containers'][0]['resources']['limits'][resource]=value
     assert _compare_quantities(runtime,want,deepcopy(want)).returncode!=0
+
+
+# --- the transfer directory has room for the decrypted archive before the stream ----
+
+def _staging(runtime, tmp_path, transfer, free, size=1000):
+    """restore_files up to its stream: the Pod is Ready, the writers and the
+    bindings are proven, and the fake exec answers the free-space measurement."""
+    run, state, work = runtime
+    site = json.loads((work / "site.json").read_text())
+    site["storage"]["transfer_path"] = transfer
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({
+        "image": {"pullSecrets": []}, "storage": {key: {"existingClaim": ""} for key in ("data", "forgejo", "chroma")}}))
+    (work / "restoration.json").write_text(json.dumps({"archive_sha256": "c" * 64}))
+    archive = tmp_path / "archive.enc"
+    archive.write_bytes(b"")
+    os.truncate(archive, size)      # sparse: its length is all the check reads
+    cluster = json.loads(state.read_text())
+    cluster.update(resources={}, calls=[], exec_rules=[{"match": "statvfs", "stdout": f"{free}\n"}])
+    state.write_text(json.dumps(cluster))
+    result = run(f'''OPERATION={"a" * 24}; ARCHIVE="$TEST_ARCHIVE"; BACKUP_PASSWORD="$TEST_ARCHIVE"
+trap 'echo "HINT=${{RECOVERY_HINT:-}}" >&2' EXIT
+restore_resource() {{ :; }}; restore_no_writers() {{ :; }}; restore_bindings() {{ :; }}; assert_owner() {{ :; }}
+restore_files synthetic-restore synthetic-release registry.invalid/web@sha256:{"e" * 64}
+''', TEST_ARCHIVE=str(archive))
+    return result, json.loads(state.read_text())["calls"]
+
+
+def _streamed(calls):
+    return [c for c in calls if c[:2] == ["exec", "-i"]]
+
+
+@pytest.mark.parametrize("transfer, where", [
+    ("/data/gsj-install/transfer", "/data/gsj-install/transfer/" + "a" * 24 + " on node synthetic-node"),
+    ("", "emptyDir on node synthetic-node's own filesystem"),
+])
+def test_a_transfer_directory_without_room_for_the_archive_is_refused_before_the_stream(runtime, tmp_path, transfer, where):
+    """restore_files streamed the decrypted archive into /transfer without
+    asking whether it fits; a full node disk would end the stream partway,
+    after all the time the transfer took."""
+    result, calls = _staging(runtime, tmp_path, transfer, free=268435456)
+    assert result.returncode != 0
+    assert _streamed(calls) == [], "refused before a byte was streamed"
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert refusal.startswith("GSJ: restore staging space is insufficient"), refusal
+    assert where in refusal
+    # the encrypted archive is 1000 bytes; the margin is the larger of 256 MiB and a tenth of it
+    assert "268435456 bytes free" in refusal and str(1000 + 268435456) in refusal
+    assert "nothing was streamed" in refusal
+    assert any(c[:1] == ["exec"] and "statvfs" in " ".join(c) for c in calls), "measured inside the Pod"
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith("restore-repair --operation " + "a" * 24), hint
+
+
+def test_a_tenth_of_a_large_archive_is_the_margin(runtime, tmp_path):
+    size = 3 * 1024 ** 3                                  # a tenth of it is more than 256 MiB
+    result, calls = _staging(runtime, tmp_path, "/data/gsj-install/transfer", free=size + 268435456, size=size)
+    assert result.returncode != 0
+    assert _streamed(calls) == []
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert str(size + size // 10) in refusal, refusal
+
+
+def test_a_transfer_directory_with_room_is_streamed_into(runtime, tmp_path):
+    result, calls = _staging(runtime, tmp_path, "/data/gsj-install/transfer", free=1000 + 268435456)
+    assert "restore staging space" not in result.stderr
+    assert len(_streamed(calls)) == 1, "the measurement admitted the stream"
+
+
+def test_an_unmeasured_transfer_directory_is_refused_before_the_stream(runtime, tmp_path):
+    result, calls = _staging(runtime, tmp_path, "/data/gsj-install/transfer", free="")
+    assert result.returncode != 0
+    assert _streamed(calls) == []
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert refusal.startswith("GSJ: restore staging space is unmeasured"), refusal
+    assert "nothing was streamed" in refusal
