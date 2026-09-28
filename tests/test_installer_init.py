@@ -1116,7 +1116,7 @@ def test_a_link_that_appears_beside_the_installer_is_never_written_through(tmp_p
 # test fails by name instead of leaving a writer blocked on a FIFO.
 _PUBLISH = """INIT_STAGE="$TEST_STAGE"
 set -m
-( rc=0; init_publish release.pem "$TEST_DEST" || rc=$?; printf 'rc=%s why=%s\\n' "$rc" "${INIT_WHY:-}" ) > "$TEST_WORK/publish.out" 2>&1 & pid=$!
+( rc=0; init_publish release.pem "$TEST_DEST" || rc=$?; printf 'rc=%s why=%s temp=%s\\n' "$rc" "${INIT_WHY:-}" "${INIT_PUBLISH_TEMP-unset}" ) > "$TEST_WORK/publish.out" 2>&1 & pid=$!
 set +m
 for i in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "-$pid"; echo HUNG; exit 0; fi
@@ -1181,6 +1181,7 @@ def test_a_name_planted_where_a_companion_is_published_is_never_opened_nor_repla
         assert name.is_symlink()
     assert precious.read_text() == "precious" and not (tmp_path / "absent").exists() and list(elsewhere.iterdir()) == []
     assert sorted(p.name for p in dest.iterdir()) == ["release.pem"], "a temporary name was left beside the planted one"
+    assert result.stdout.rstrip().endswith(" temp="), "the name kept for the exit trap was not cleared after the rm"
 
 
 def test_a_companion_is_published_by_an_ln_without_minus_T(runtime, tmp_path):
@@ -1199,6 +1200,7 @@ def test_a_companion_is_published_whole_and_private_and_an_unwritable_folder_is_
     assert (dest / "release.pem").read_text() == "the checked copy\n"
     assert stat.S_IMODE((dest / "release.pem").stat().st_mode) == 0o600 and not (dest / "release.pem").is_symlink()
     assert sorted(p.name for p in dest.iterdir()) == ["release.pem"]
+    assert result.stdout.rstrip().endswith(" temp="), "the name kept for the exit trap was not cleared after the rm"
     if os.geteuid() != 0:                                               # root writes through mode 555
         again = tmp_path / "again"
         again.mkdir()
@@ -1207,6 +1209,29 @@ def test_a_companion_is_published_whole_and_private_and_an_unwritable_folder_is_
         os.chmod(dest, 0o755)
         assert "rc=1" in result.stdout and f"{dest} is not writable" in result.stdout, result.stdout + result.stderr
         assert list(dest.iterdir()) == []
+        assert result.stdout.rstrip().endswith(" temp="), "the name kept for the exit trap was not cleared on the refusal"
+
+
+def test_a_stop_during_publication_leaves_no_hidden_copy_beside_the_installer(runtime, tmp_path):
+    """init_publish writes the checked copy to a hidden name beside the
+    installer and links it into place; init stopped by a signal between that
+    write and the removal of the hidden name left the copy there for good.
+    The name is kept where the exit trap finds it, and the trap removes it:
+    the stop comes from link itself, after the write and before the rm."""
+    run, _, _ = runtime
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    (stage / "release.pem").write_text("the checked copy\n")
+    result = run('''INIT_STAGE="$TEST_STAGE"; GSJ_WORK="$TEST_WORK/run"; mkdir "$GSJ_WORK"
+install_exit_traps
+link() { ls -A "$TEST_DEST" > "$TEST_WORK/at-the-stop"; kill -TERM $$; }
+init_publish release.pem "$TEST_DEST"
+echo NOT-STOPPED
+''', TEST_STAGE=str(stage), TEST_DEST=str(dest))
+    _, _, work = runtime
+    assert result.returncode == 143 and "NOT-STOPPED" not in result.stdout, result.stdout + result.stderr
+    assert (work / "at-the-stop").read_text().startswith(".release.pem."), "the stop came before the write"
+    assert list(dest.iterdir()) == [], "the hidden temporary copy was left beside the installer"
 
 
 def test_run_through_a_symlink_beside_the_installer_means_beside_the_file(tmp_path, keypair):
@@ -1245,14 +1270,17 @@ def test_init_is_read_only_against_the_cluster(tmp_path, keypair):
     one of them -- no create, apply, delete, patch, exec, run, label, scale,
     no Lease, no --raw, no --watch -- even with an operator's exported
     leftovers that cleanup_exit would otherwise act on. The process-group
-    leftovers name a sentinel this test owns; it must outlive the run. helm
-    is recorded too and answers only `version --short`."""
+    leftovers name a sentinel this test owns; it must outlive the run, and so
+    must the file the publication leftover names. helm is recorded too and
+    answers only `version --short`."""
     box = Box(tmp_path, keypair)
+    precious = tmp_path / "precious"
+    precious.write_text("an operator's file")
     sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
     try:
         result = box.run(PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true", TRANSFER_HANDBACK_POD="leftover-pod",
                          RENEWER=str(sentinel.pid), HELM_PID=str(sentinel.pid), GSJ_ADDON_COMMAND_PID=str(sentinel.pid),
-                         CONTEXT="c", NAMESPACE="ns", RELEASE="r", SITE="/nonexistent")
+                         INIT_PUBLISH_TEMP=str(precious), CONTEXT="c", NAMESPACE="ns", RELEASE="r", SITE="/nonexistent")
         assert sentinel.poll() is None, "init's exit signalled a process group it did not own"
     finally:
         sentinel.kill()
@@ -1264,23 +1292,27 @@ def test_init_is_read_only_against_the_cluster(tmp_path, keypair):
     assert {_verb(call) for call in calls} <= READ_ONLY, sorted({_verb(call) for call in calls})
     assert not any(flag in call for call in calls for flag in ("--watch", "-w", "--raw", "exec", "delete", "replace", "create", "apply", "patch"))
     assert box.helm_calls() and all(call == ["version", "--short"] for call in box.helm_calls()), box.helm_calls()
+    assert precious.exists() and precious.read_text() == "an operator's file", "the exit trap removed a file an exported leftover named"
 
 
 @pytest.mark.parametrize("verb", [["inspect"], ["install", "--non-interactive", "--config", "/nonexistent/site.json"]])
 def test_leftover_variables_never_reach_a_cluster_or_a_process_group_from_any_verb(tmp_path, keypair, verb):
     """cleanup_exit acts on what these name: a process group to signal, a
-    probe Pod to delete, a Lease to release, an operation to name. main
-    cleared an operator's exported leftovers for init alone; an exported
-    HELM_PID made inspect's exit signal a process group it never started.
-    Every verb clears them before bootstrap: the sentinel outlives inspect
-    (which succeeds) and an install that stops at its missing configuration,
-    no mutating kubectl call is made and the leftover operation is not named."""
+    probe Pod to delete, a Lease to release, an operation to name, a file to
+    remove. main cleared an operator's exported leftovers for init alone; an
+    exported HELM_PID made inspect's exit signal a process group it never
+    started. Every verb clears them before bootstrap: the sentinel and the
+    named file outlive inspect (which succeeds) and an install that stops at
+    its missing configuration, no mutating kubectl call is made and the
+    leftover operation is not named."""
     box = Box(tmp_path, keypair)
+    precious = tmp_path / "precious"
+    precious.write_text("an operator's file")
     sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
     try:
         env = {**box.env, "PROBE_POD": "leftover-probe", "OPERATION": "leftover-op", "LEASE_ACQUIRED": "true",
                "TRANSFER_HANDBACK_POD": "leftover-pod", "RECOVERY_HINT": "leftover-hint", "RENEWER": str(sentinel.pid),
-               "HELM_PID": str(sentinel.pid), "GSJ_ADDON_COMMAND_PID": str(sentinel.pid)}
+               "HELM_PID": str(sentinel.pid), "GSJ_ADDON_COMMAND_PID": str(sentinel.pid), "INIT_PUBLISH_TEMP": str(precious)}
         result = subprocess.run([shutil.which("bash", path=SYSTEM_PATH), str(box.installer), *verb], env=env,
                                 cwd=str(box.installer.parent), capture_output=True, text=True, timeout=180)
         assert sentinel.poll() is None, f"{verb[0]}'s exit signalled a process group it did not own"
@@ -1294,6 +1326,7 @@ def test_leftover_variables_never_reach_a_cluster_or_a_process_group_from_any_ve
     assert "MUTATION-REFUSED" not in result.stderr
     assert not any(v in call for call in box.kube_calls() for v in ("delete", "replace", "create", "apply", "patch", "exec"))
     assert list(box.tmpdir.iterdir()) == []
+    assert precious.exists() and precious.read_text() == "an operator's file", "the exit trap removed a file an exported leftover named"
 
 
 def test_leftover_variables_never_reach_a_cluster_even_when_init_stops_before_its_own_code(runtime):
@@ -1306,11 +1339,14 @@ def test_leftover_variables_never_reach_a_cluster_even_when_init_stops_before_it
     (payload / "helpers" / "lease-repair-source-release.json").write_text("{}")
     for name in ("verification-cleanup.sh", "startup-recovery.sh"):
         (payload / "helpers" / name).write_text("")
+    precious = state.parent / "precious"
+    precious.write_text("an operator's file")
     result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { install_exit_traps; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n',
-                 PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true")
+                 PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true", INIT_PUBLISH_TEMP=str(precious))
     assert result.returncode != 0 and "supports only inspect and lease-repair" in result.stderr
     assert not (work / "init-ran").exists()
     assert json.loads(state.read_text())["calls"] == [], "the exit trap acted on an exported leftover"
+    assert precious.exists() and precious.read_text() == "an operator's file", "the exit trap removed a file an exported leftover named"
 
 
 def test_leftover_variables_never_reach_a_cluster_when_bootstrap_stops_after_its_exit_trap(runtime, tmp_path):

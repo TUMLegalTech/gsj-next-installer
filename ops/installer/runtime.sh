@@ -1765,6 +1765,9 @@ cleanup_exit() {
  if (( rc != 0 )) && [[ -n ${TRANSFER_HANDBACK_POD:-} ]]; then transfer_handback "$TRANSFER_HANDBACK_POD" || true; fi
  # The pull probe is not state anyone resumes: it goes on every exit.
  if [[ -n ${PROBE_POD:-} ]]; then k delete pod "$PROBE_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true; fi
+ # init stopped while it published a companion: the hidden copy it wrote
+ # beside the installer is its own, and nothing else would ever remove it.
+ if [[ -n ${INIT_PUBLISH_TEMP:-} ]]; then rm -f "$INIT_PUBLISH_TEMP"; fi
  # Failure retains the lease and durable operation identity for named recovery.
  if (( rc == 0 )) && [[ -n ${OPERATION:-} ]]; then release_operation; fi
  # A terminal stage names its own recovery; resuming it would only repeat it.
@@ -6527,22 +6530,26 @@ init_publish() {
  # links that into place: it is link(2) itself, which fails for an existing
  # name of any type and never descends into one (ln links INTO an existing
  # directory, or a link to one, and its -T that stops that is GNU's alone: on
- # a macOS box every publication failed as "not writable").
+ # a macOS box every publication failed as "not writable"). The hidden name
+ # is kept in INIT_PUBLISH_TEMP from before the write until after its rm, so
+ # init stopped by a signal in between leaves no copy there: cleanup_exit
+ # removes it.
  local name=$1 dest="$2/$1" temp
  temp=$(mktemp -u "$2/.$1.XXXXXXXXXX" 2>/dev/null) || { INIT_WHY="$2 is not writable"; return 1; }
+ INIT_PUBLISH_TEMP=$temp
  if ! ( set -o noclobber; cat "$INIT_STAGE/$name" > "$temp" ) 2>/dev/null; then
-   [[ -e $temp ]] || { INIT_WHY="$2 is not writable"; return 1; }
-   rm -f "$temp"; INIT_WHY="$dest could not be written"; return 1
+   [[ -e $temp ]] || { INIT_PUBLISH_TEMP=''; INIT_WHY="$2 is not writable"; return 1; }
+   rm -f "$temp"; INIT_PUBLISH_TEMP=''; INIT_WHY="$dest could not be written"; return 1
  fi
  if ! link "$temp" "$dest" 2>/dev/null; then
-   rm -f "$temp"
+   rm -f "$temp"; INIT_PUBLISH_TEMP=''
    if [[ -e $dest || -L $dest ]]; then INIT_WHY="$dest appeared during the download and was not replaced"; return 2; fi
    # The copy was just written there, so the folder is writable: what failed
    # is the link itself, which a FAT or exFAT file system and some network
    # shares refuse (EPERM, ENOTSUP)
    INIT_WHY="$2 is on a file system without hard links (FAT, exFAT, some network shares), and init puts a checked copy in place only by linking it"; return 1
  fi
- rm -f "$temp"
+ rm -f "$temp"; INIT_PUBLISH_TEMP=''
 }
 init_own_dir() {
  # The working folder and its credentials folder, on the add-on staging
@@ -7010,10 +7017,11 @@ main() {
  [[ $COMMAND != upgrade || -n $TO || -n $EXPECTED_VERSION ]] || $INTERACTIVE || fail 'non-interactive upgrade requires --to VERSION; repeat the installed release with --to <installed version>'
  # init reports on the clients this machine has and downloads nothing but its own release's files, under every --fetch-tools form.
  [[ $COMMAND != init ]] || ! $FETCH_TOOLS || fail 'init reports on the clients this machine has and downloads nothing but its own release; run it without --fetch-tools'
- # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal); every verb
- # sets its own after bootstrap installs the exit trap, and an operator's exported leftovers must reach neither a
- # cluster nor a process: an exported HELM_PID made inspect's exit signal a process group it never started.
- unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT
+ # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal, a file
+ # to remove); every verb sets its own after bootstrap installs the exit trap, and an operator's exported leftovers must
+ # reach neither a cluster, a process nor a file: an exported HELM_PID made inspect's exit signal a process group it
+ # never started.
+ unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT INIT_PUBLISH_TEMP
  bootstrap
  source "$GSJ_PAYLOAD/helpers/verification-cleanup.sh"
  source "$GSJ_PAYLOAD/helpers/startup-recovery.sh"
