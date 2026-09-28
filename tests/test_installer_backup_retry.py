@@ -55,6 +55,10 @@ def maintenance(tmp_path):
     fake = tmp_path / "k.py"
     fake.write_text('''import json, os, pathlib, sys
 p=pathlib.Path(os.environ['TEST_CLUSTER']); s=json.loads(p.read_text()); a=sys.argv[1:]
+# the runtime pipes one fake kubectl into another (create --dry-run | jq | apply), so two of them can hold the
+# state at once: the state is published by rename, never by a truncating write a concurrent reader could see empty
+def save():
+ t=p.with_name(p.name+'.'+str(os.getpid())); t.write_text(json.dumps(s)); os.replace(t,p)
 s['calls'].append(a); result=None
 if a[:2]==['get','namespace']: result={'metadata':{'uid':s['namespace_uid']}}
 elif a[:2]==['get','deploy']: result=s['controllers']
@@ -63,7 +67,7 @@ elif a[:2]==['get','deployment']:
  if '-o' in a and a[a.index('-o')+1]=="jsonpath={.metadata.uid}": print(obj['metadata']['uid'])
  else: result=obj
 elif a[:2] in (['get','pods'],['get','jobs']):
- if a[1]=='pods' and s.get('fail_pod_read'): p.write_text(json.dumps(s)); raise SystemExit(29)
+ if a[1]=='pods' and s.get('fail_pod_read'): save(); raise SystemExit(29)
  items=s.get('writer_pods' if a[1]=='pods' else 'writer_jobs',[])
  # A release label selector cannot see foreign Pods; an unselected listing can.
  if a[1]=='pods' and '-l' not in a: items=items+s.get('foreign_pods',[])
@@ -86,7 +90,7 @@ elif a[:1]==['exec']:
  if '-i' in a: sys.stdin.buffer.read()
  if a[-2:]==['cat','/transfer/snapshot.tar.gz']: sys.stdout.buffer.write(b'synthetic verified PVC archive')
 else: raise SystemExit('unexpected synthetic kubectl call: '+repr(a))
-p.write_text(json.dumps(s))
+save()
 if result is not None: print(json.dumps(result))
 ''')
     password = tmp_path / "recovery-key"
