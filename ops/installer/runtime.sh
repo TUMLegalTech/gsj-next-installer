@@ -4816,7 +4816,8 @@ verify_application() {
    fi
    if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null && jq -e '.status|IN("complete","cleaned")' "$active" >/dev/null; then retire=true; fi
    if $retire; then
-     mkdir -p "$STATE_DIR/verification/$run"; mv "$active" "$STATE_DIR/verification/$run/retired-verification-active.json"
+     # its settings.json carries the operator password; public-settings.json stays as its evidence
+     mkdir -p "$STATE_DIR/verification/$run"; mv "$active" "$STATE_DIR/verification/$run/retired-verification-active.json"; rm -f "$STATE_DIR/verification/$run/settings.json"
      log "Retired verification run $run of ended operation $prior to $STATE_DIR/verification/$run/retired-verification-active.json: its ledger went with the claims this operation replaced; this operation starts its own run"
    fi
  fi

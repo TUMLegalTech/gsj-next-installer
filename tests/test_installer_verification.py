@@ -590,10 +590,13 @@ def test_a_run_of_an_ended_operation_whose_ledger_went_with_its_claims_is_retire
         (work/'operation-intents'/PRIOR/'intent.json').write_text(json.dumps({'format':'gsj.operation-intent/1',
             'record':{'operation':PRIOR,'target':'synthetic-release','kind':'restore','status':'owned'},'namespace_uid':namespace}))
     state.write_text(json.dumps({'codes':[],'calls':[]}))
+    secret=work/'verification'/rid/'settings.json'
     result=run([75])
     if retired:
         assert result.returncode==0,result.stderr
         assert f'Retired verification run {rid} of ended operation {PRIOR}' in result.stderr
+        # the retired run's settings carry the operator password: its evidence keeps only the public copy
+        assert not secret.exists()
         assert (work/'verification'/rid/'retired-verification-active.json').read_bytes()==before
         assert json.loads(state.read_text())['calls']==['initial','cleanup']
         current=json.loads(active_path.read_text())
