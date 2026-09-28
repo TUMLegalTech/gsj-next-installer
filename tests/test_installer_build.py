@@ -532,7 +532,7 @@ def test_the_built_installer_ships_no_internal_review_label(release, tmp_path, p
     if planted:
         Path(value["_build"]["chart"]).write_bytes(builder.compressed_tar({
             "gsj/Chart.yaml": (b"apiVersion: v2\nname: gsj\nversion: 0.10.0-beta.1\nappVersion: 0.10.0-beta.1\n", 0o644),
-            "gsj/templates/job.yaml": (("# a comment that kept its " + "PR" + "-FIXES" + " record name\n").encode(), 0o644)}))
+            "gsj/templates/job.yaml": (("# a comment that kept its [" + "-".join(["SAMPLE", "RECORD"]) + "] record name\n").encode(), 0o644)}))
     output = tmp_path / "installer.sh"
     result = run("--manifest", manifest, "--output", output)
     assert result.returncode == 0, result.stderr

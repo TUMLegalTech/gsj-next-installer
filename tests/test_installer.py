@@ -2255,24 +2255,86 @@ def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path
 # one. A record's name is hyphenated upper-case words inside brackets; one
 # that is quoted (a value), carries a digit (an algorithm, a challenge) or
 # opens on a single letter (a header) is not.
-# Every alternative is spelled apart by concatenation or by escaped dots, so
-# this file never matches itself; the three scans below import this one list.
+# A record's, a phase's or a pass's own name is one to three words joined by
+# a dash or a space, and is listed only by its SHA-256, so this public file
+# never spells one: NAMED_ANY in any case, NAMED_CAPS only as written in
+# capitals (in lower case the same words are the guide's prose).
+NAMED_ANY = frozenset({
+    "08dc27546298d9820b5f122897e69b2c3b3a580117f7fe7f12faf919ec96f99d",
+    "19ee4d9ebdf5210944ddbb525c2da1b9050155732f598f07641f7c3775659327",
+    "598b54324af74449ee621269e2f8500c1895523b4a6ac5fa4ee74145dea4c28f",
+    "59da401a19ff17caea8ed5c75bb61b99e53cb4786c0d91d03dc350fa17bd4ae3",
+    "62c7f50ae0cff9c65355789c23d549afd9316a2884ceb380cf65dcef1ae3e0df",
+    "7674e7036999e5d3fc1a97dc6a286af9aa064cd3dea8ac3f22072eba49a9631a",
+    "df7000677e186e4c75b46071a478fe5aa9e9db38e7c211c5f33b135163a3ca37",
+    "dfffdbbc291156195f81a0a145c14eb24bc181413cdd805eadb882285b75c050",
+    "ec55092b3c2cf9ab2538d8f425d98b38448f262030f00fd639ef4e1b4cd93242",
+    "fef0a7df684c624d51e011c0623e6bbe1948874babe94600123b51cd083ba450",
+})
+NAMED_CAPS = frozenset({
+    "6c5825c88c13ba107887f8ded7004e82c70cbc526a1cc0dc256fe23ed59ac1ae",
+    "9312f11cf8997c749a499045ccc974c1344e5ab98138374f0ee9c9c0b3c4f158",
+    "9e359102b540e3967488313b12ac3080a828562c399247cc19ee129fa9d852f9",
+    "afb783c15f7f1fa9b52b14c9450ead5d03c91671c1ec66cc5bfb713be0312248",
+    "ceeeabc893bfc8b35d97b150ab33283deb834f97cc27a2e994a9991c66e9d227",
+    "d1434510de44b539245b33edc5a00f8312aae028ec4ec0bcf45e0574499c5d0c",
+})
+# Every remaining alternative is spelled apart by concatenation or by escaped
+# dots, so this file never matches itself; the three scans below import this
+# one list and the digests above through internal_labels.
 INTERNAL_LABEL = re.compile(
-    "(?i:" + "|".join(["audit" + r" rounds?", "misattribution" + "[- ]pass", "FIX" + "-PASS", "PR" + "-FIXES",
-                       "PR" + "-DISSECT", "SAFETY" + "-FIVE", "INSTALLER" + "-SNOWFLAKE", "INSTALL" + "-GSJ-ADMIN",
-                       r"\b(?!(?:0|10|127)\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)"
+    "(?i:" + "|".join([r"\b(?!(?:0|10|127)\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)"
                        r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b",
                        r"\b[0-9]{1,3}(?:[.-][0-9]{1,3}){3}\.[a-z]"]) + ")|"
-    + "|".join([r"\bPROMO" + r"TION\b", r"\bWEB" + r"NEXT\b", r"\bINIT" + r"-VERB\b", r"\bPILOT" + r"-MOVE\b",
-                r"\bRELEASE" + "-BETA", r"\bBETA" + "[0-9]", r"\bQA" + r"D\b", r"\bPATCH" + "-?[0-9]",
+    + "|".join([r"\bBETA" + "[0-9]", r"\bPATCH" + "-?[0-9]",
                 r"\[(?i:rev" + r"iew)(?:[ ,]+[A-Za-z]+)*[ ,]+[A-Z][0-9]+\b", r"\b(?i:rev" + r"iew)(?: (?i:finding|sweep))? [A-Z][0-9]+\b",
                 r"\[[^\]]*\b[A-Z]" + r"[0-9]+\b[^\]]*\]", r"\b[A-Z]" + r"[0-9]+-[0-9]+\b",
                 r"\[[^\]]*(?<![-\w'\"])[A-Z]{2,}(?:-[A-Z]" + r"{2,})+(?![-\w'\"])[^\]]*\]"]))
 
 
+_WORD = re.compile(r"[A-Za-z0-9]+")
+
+
+def named_label(line, any_case=NAMED_ANY, caps=NAMED_CAPS):
+    """Whether LINE carries a name listed by digest: every run of one to three
+    words that a single dash or space joins is hashed as written and in
+    capitals."""
+    words = list(_WORD.finditer(line))
+    for i in range(len(words)):
+        window = words[i].group()
+        for j in range(i, min(i + 3, len(words))):
+            if j > i:
+                gap = line[words[j - 1].end():words[j].start()]
+                if gap not in ("-", " "):
+                    break
+                window += gap + words[j].group()
+            if hashlib.sha256(window.upper().encode()).hexdigest() in any_case \
+                    or hashlib.sha256(window.encode()).hexdigest() in caps:
+                return True
+    return False
+
+
+def labelled(line):
+    return bool(INTERNAL_LABEL.search(line)) or named_label(line)
+
+
 def internal_labels(name, text):
     """NAME:LINE for every line of TEXT that carries an internal label."""
-    return [f"{name}:{n}" for n, line in enumerate(text.splitlines(), 1) if INTERNAL_LABEL.search(line)]
+    return [f"{name}:{n}" for n, line in enumerate(text.splitlines(), 1) if labelled(line)]
+
+
+def test_the_label_guard_finds_a_name_by_its_digest():
+    """A listed name is found in any case, or only in capitals, as one to
+    three words that a dash or a space joins, alone or inside a longer run.
+    The names are synthetic and their digests made at run time."""
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    anywhere, capitals = "-".join(["SAMPLE", "PHASE", "ONE"]), "-".join(["SAMPLE", "CUT"])
+    sets = ({digest(anywhere)}, {digest(capitals)})
+    for text in (f"the {anywhere} record", f"the {anywhere.lower()} record", f"as {anywhere}-3 held ({capitals})",
+                 f"the x-{capitals} ran"):
+        assert named_label(text, *sets), text
+    for text in (f"the {capitals.lower()} ran", "a sample phase-one", "SAMPLE PHASE ONE", "the SAMPLE, CUT"):
+        assert not named_label(text, *sets), text
 
 
 def test_the_label_guard_finds_an_address_and_a_host_built_on_one():
@@ -2337,7 +2399,7 @@ GUIDE_PROSE = [
 
 
 def test_the_label_guard_leaves_the_guide_s_prose_and_the_example_addresses_alone():
-    assert [text for text in GUIDE_PROSE if INTERNAL_LABEL.search(text)] == []
+    assert [text for text in GUIDE_PROSE if labelled(text)] == []
 
 
 def test_the_public_tree_carries_no_internal_review_labels():
