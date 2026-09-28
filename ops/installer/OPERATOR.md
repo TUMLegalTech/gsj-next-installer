@@ -1391,8 +1391,11 @@ it, some of them hours in. Each refusal begins with the words quoted here:
   one minor from the server (*"kubectl version skew: the kubectl --fetch-tools
   downloaded for this run is …"*) — on `upgrade --to` as well, whose verified
   target installer is told which clients this run fetched and fetches its own
-  release's pins of them
-  ([Client tools and versions](#client-tools-and-versions)). Your own kubectl, skewed the same way, is
+  release's pins of them, when the installer that runs `upgrade --to` is this
+  release or a later one
+  ([Client tools and versions](#client-tools-and-versions)). An upgrade started
+  from v0.10.0-beta.6 hands no client names on, so its target only warns about
+  that skew: run it on a kubectl within one minor of the server. Your own kubectl, skewed the same way, is
   named in a log line and the run goes on with it (*"kubectl … is more than one
   minor from the server (…), and kubectl is supported within one minor of the
   server. The run goes on with it; …"*).
@@ -1849,7 +1852,10 @@ verify and run the names of the clients this run fetched, not the clients
 themselves — the bare `--fetch-tools` when all three were fetched,
 `--fetch-tools=` with the names otherwise. That installer fetches those clients
 itself, as its own release pins them, and treats them as fetched, not as your
-machine's own: on an upgrade its preflight refuses the skew the same way. Its
+machine's own: on an upgrade its preflight refuses the skew the same way.
+v0.10.0-beta.6 hands nothing on: an `upgrade --to` it runs with
+`--fetch-tools` leaves the target treating the fetched kubectl as your own,
+and a skew there is only warned about. Its
 fetch looks in the same cache by checksum first, so a pin the two releases
 share comes from there and is not downloaded again; a pin the target release
 changed is downloaded, from the address that release names for it, and that
@@ -2089,9 +2095,13 @@ GSJ: the node cannot pull this release from registry.base (registry.example.org/
 ```
 
 What it asks you to check follows the site. With `registry.base`, the copy and
-the prefix, as above, and the credential for that host. Without one it begins
-*"the node cannot pull this release from the release's own repositories"* and
-asks for the credential alone: *"The repositories and digests are the signed
+the prefix, as above, and the credential for that host. On an upgrade whose
+site has just dropped `registry.base`, it names the release's own repositories
+and the base the installed deployment used, and still asks about the copy and
+the prefix: put `registry.base` back, or give the nodes a route and a
+credential to the release's own repositories. Without one, and none recorded
+for the installed deployment, it begins *"the node cannot pull this release
+from the release's own repositories"* and asks for the credential alone: *"The repositories and digests are the signed
 release's own. Check that registry.pull_secret (or the registry.config_file it
 is made from) carries a credential that can read every one of them; a node that
 cannot reach those registries at all needs a mirror it can reach, named in
@@ -2245,7 +2255,8 @@ On a slow link to a mirror, raise `deadlines.dependencies_seconds` in the site
 file before you install or upgrade, and nothing has to be recovered. A pull
 that fails in a way no retry changes — a refused credential, a name or digest
 the registry does not hold, an invalid name — is refused as *cannot pull*,
-above, after 90 s of retries, whatever the deadline; any other failure is
+above, after 90 s of retries, or sooner when `deadlines.dependencies_seconds`
+is shorter; any other failure is
 waited out for at most `deadlines.dependencies_seconds` from its first report
 — never to the longer bound, which only a pull still under way gets — and
 refused as *cannot pull*, by its class, if it is still reported then. A probe Pod the
@@ -4776,7 +4787,7 @@ first install, or its recovery, realistically meets:
 | `backup cannot change application settings` | the site file differs from the installed one outside its `backup`, `delivery` and `verification` blocks and `storage.transfer_path` and `storage.minimum_free_bytes` — an edited `registry.base` counts | put the installed values back, or run the operation that adopts the edit — an upgrade, or `install` again with the same installer — then back up |
 | `temporary storage backend cleanup incomplete` | the storage check's temporary claim bound a volume and marked it `Delete`, and 120 s after that claim was deleted the volume was still there. The message names the volume and its phase, and the phase is the whole difference | *…and it is now Failed*: nothing on this cluster deletes a volume of that class. Name your own claim in `storage.data.existing_claim`; wait until the operation's Lease has gone 180 s unrenewed, `abandon --operation ID --reason "…"`, install again. The volume it names accepts no claim until that PersistentVolume object is deleted and created again — do that only if you still want it. *…was still present (phase …)*, any other phase, `unknown` if it could not be read: whatever removes volumes of that class is slow or stuck. Do **not** delete the volume; look at that provisioner or deleter, then continue with the command the closing line names |
 | `the image pull probe could not be created in namespace` | a Pod that proves a pull, one per image in turn, was refused before it pulled — *an admission policy (LimitRange or ResourceQuota) refused the Pod*, *an admission policy refused it*, or your kubeconfig's permissions | admit it — each probe Pod is one container requesting `cpu: 100m` and `memory: 128Mi`, the storage check's figures, both limits equal to those requests, and is labelled `gsj.io/pull-probe` — then the command the closing line names: `resume`, or for a restore the verb its phase accepts |
-| `the node cannot pull this release from` | the pull proof failed for the image it names (*"image … of 6, … (… pulled before it, … not yet tried)"*): `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry. A failure no retry changes (a refused credential, a name or digest the registry does not hold, an invalid name) is refused after 90 s; any other within `deadlines.dependencies_seconds` of its first report, *"… still failing deadlines.dependencies_seconds (…) after it was first reported …"*, or at the end of the probe's wait where that comes first, *"… still failing at the end of …"* | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
+| `the node cannot pull this release from` | the pull proof failed for the image it names (*"image … of 6, … (… pulled before it, … not yet tried)"*): `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry. A failure no retry changes (a refused credential, a name or digest the registry does not hold, an invalid name) is refused after 90 s, or sooner when `deadlines.dependencies_seconds` is shorter; any other within `deadlines.dependencies_seconds` of its first report, *"… still failing deadlines.dependencies_seconds (…) after it was first reported …"*, or at the end of the probe's wait where that comes first, *"… still failing at the end of …"* | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
 | `the image pull probe's Pod was not scheduled` | the scheduler left a probe Pod unplaced (`PodScheduled` `False`) for 300 s, or to the end of the probe's wait where that came first: `storage.node` has no room for its request, 100m CPU and 128Mi, beside what the Pods there already request — on an upgrade the running deployment's too — or does not accept it (cordoned, tainted, no node of that name). The scheduler's words are kept in `pull-probe-status.json` | free requests on that node, or uncordon it, wait 180 s, then the `resume --operation ID` the closing line names; a first install may instead `abandon` and `install` again with another `storage.node`, which an installed release cannot change; a restore names the verb its phase accepts |
 | `the image pull probe's Pod ended before its image was pulled` | a probe Pod ended without its image — phase `Failed` or `Succeeded`, or its container terminated: the kubelet evicted it under resource pressure or refused it at admission, the node shut down or was lost, or it outlived its own `activeDeadlineSeconds` — and is refused on the poll that read it, by its phase and reason. The kubelet's words are kept in `pull-probe-status.json` | make the node admit and keep it — up, with room for its 100m CPU and 128Mi, and evicting nothing under resource pressure — wait 180 s, then the `resume --operation ID` the closing line names *"once node … admits and keeps the probe Pod …"*; a first install may instead `abandon` and `install` again with another `storage.node`; a restore names the verb its phase accepts |
 | `the image pull probe's Pod was deleted before its image was pulled` | another client — an operator, a cleanup job or a policy controller — deleted a probe Pod before its pull; refused on the poll that found it gone | stop whatever deletes Pods labelled `gsj.io/pull-probe` in the namespace, wait 180 s, then the command the closing line names, as for an ended Pod |

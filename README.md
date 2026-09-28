@@ -47,7 +47,8 @@ install and when you would find out.
   for every site, one probe Pod per image in turn, so nodes that cannot pull
   stop an install at its start, not hours in. A pull that fails in a way no
   retry changes (a refused credential, a name or digest the registry does not
-  hold, an invalid name) is refused after 90 s; any other failure within
+  hold, an invalid name) is refused after 90 s, or sooner when
+  `deadlines.dependencies_seconds` is shorter; any other failure within
   `deadlines.dependencies_seconds` (900 s by default) of its first report;
   a probe Pod the scheduler cannot place — each asks for 100m CPU and
   128Mi, one at a time, beside the running deployment on an upgrade — after
@@ -76,7 +77,9 @@ install and when you would find out.
   (*kubectl version skew*) — on `upgrade --to` too, whose target installer
   is told which clients the run fetched and fetches its own release's pins
   of them: from the cache when they are the same pins, otherwise downloaded,
-  which needs their download addresses reachable. `init` is the
+  which needs their download addresses reachable. That hand-off needs the
+  installer running `upgrade --to` to be this release or a later one: from
+  v0.10.0-beta.6 the target only warns about the skew. `init` is the
   one command that does not stop at the first: it names them all at once, in
   its report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible
