@@ -641,15 +641,20 @@ def test_an_ingress_of_no_class_on_the_host_is_refused_when_this_site_s_class_is
 
 @pytest.mark.parametrize("default", [None, "false", "True"])
 def test_an_ingress_of_no_class_on_the_host_is_logged_when_a_reused_class_is_not_the_cluster_default(runtime, tmp_path, default):
-    """Only the default class serves a class-less Ingress, and the annotation
-    marks it only as the exact string "true"."""
+    """The default class takes a class-less Ingress, and the annotation marks
+    it only as the exact string "true": short of that it is no collision. The
+    log line said nothing routed to it here, but a reused controller can serve
+    class-less Ingresses without being marked the default (OpenShift's
+    ingress-to-route turns them into Routes), so it says that one may."""
     run, state, work = runtime
     _baseline(tmp_path, state, work, _ingress("other-namespace", "other-web", HOST))
     _saved_class(work, default)
     result = _checks(run)
     _admitted(result, state)
-    _logged(result, "also served by another controller's Ingress other-namespace/other-web", f"public_url's host {HOST}",
-            "nothing routes to it here", "names none", "The run goes on")
+    _logged(result, "also named by Ingress other-namespace/other-web", f"public_url's host {HOST}", "of no ingress class",
+            "may still be served by this site's controller if that controller serves Ingresses without a class",
+            "The run goes on")
+    assert "nothing routes to it here" not in result.stderr and "another controller's" not in result.stderr, result.stderr
     assert "already served" not in result.stderr, result.stderr
 
 
