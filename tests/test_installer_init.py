@@ -1313,6 +1313,47 @@ def test_leftover_variables_never_reach_a_cluster_even_when_init_stops_before_it
     assert json.loads(state.read_text())["calls"] == [], "the exit trap acted on an exported leftover"
 
 
+def test_leftover_variables_never_reach_a_cluster_when_bootstrap_stops_after_its_exit_trap(runtime, tmp_path):
+    """bootstrap installs the exit trap the moment its work directory exists,
+    so a stop while it unpacks the payload or fetches a client already runs
+    cleanup_exit: main must clear the leftovers before bootstrap, not after
+    it. The script run here carries no payload below its marker, so install
+    stops at 'installer payload missing' with the trap in place (the work
+    directory it removes is gone). The process-group leftover names a
+    sentinel this test owns and the context is exported, so a leftover probe
+    Pod would reach the recording kubectl: the sentinel outlives the run, no
+    kubectl call is recorded and no leftover name reaches the closing line."""
+    run, state, work = runtime
+    tools = Path(_tools(tmp_path / "tools", **FLOORS))
+    # sleep paces the exit trap's wait on a signalled group, as on any box:
+    # without it a trap acting on a leftover stops there, before the Pods.
+    (tools / "sleep").symlink_to(shutil.which("sleep", path=SYSTEM_PATH))
+    # The client preflight's version question is answered at the floor here;
+    # any other call reaches the fixture's recording kubectl.
+    (tools / "kubectl").write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = version ]; then printf \'{"clientVersion": {"gitVersion": "v%s"}}\\n\' "' + FLOORS["kubectl"] + '"; exit 0; fi\n'
+        f'exec "{sys.executable}" "{tmp_path / "bin" / "kubectl"}" "$@"\n')
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    (work / "no-payload.sh").write_text('source "$TEST_FUNCTIONS"\nmain install --non-interactive --config "$TEST_WORK/site.json"\necho REACHED\n')
+    sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
+    try:
+        result = run('exec bash "$TEST_WORK/no-payload.sh"', PATH=str(tools), TMPDIR=str(tmpdir),
+                     CONTEXT="synthetic-context", NAMESPACE="synthetic-namespace",
+                     PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true",
+                     TRANSFER_HANDBACK_POD="leftover-pod", RECOVERY_HINT="leftover-hint",
+                     HELM_PID=str(sentinel.pid), GSJ_ADDON_COMMAND_PID=str(sentinel.pid))
+        assert sentinel.poll() is None, "the exit trap signalled a process group it did not own"
+    finally:
+        sentinel.kill()
+        sentinel.wait()
+    assert result.returncode == 1 and "installer payload missing" in result.stderr and "REACHED" not in result.stdout, result.stderr
+    assert list(tmpdir.iterdir()) == [], "the exit trap never ran: the work directory was left behind"
+    assert json.loads(state.read_text())["calls"] == [], "the exit trap acted on an exported leftover"
+    assert "leftover" not in result.stderr, result.stderr
+
+
 def test_no_secret_or_full_url_reaches_any_message_or_the_report(tmp_path, keypair):
     """The canary rides in every place untrusted text could come from: the
     release URL's path and userinfo, kubectl's and curl's stderr, the
