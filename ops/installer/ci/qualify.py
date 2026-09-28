@@ -27,7 +27,8 @@ from release import ROOT, Refused, download, require, run, save, sha, webpin
 # it carries (upgrade --to, repair --to), so a candidate signed with any other
 # key -- a throwaway one, on a bundle marked qualification:false -- passed
 # this gate and then stopped every such upgrade at 'target release signature
-# is invalid'. gate() refuses it before any other check.
+# is invalid'. gate() refuses it right after the bundle's own signature
+# check, before it reads the manifest or judges the qualification flag.
 RELEASE_TRUST_KEY_SHA256 = "8cd0a432a238866178c10f7b49d36cfc417125f32d53d445ea28f0de73d30bc3"
 
 

@@ -463,12 +463,14 @@ no private input.
 7. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
    and populated upgrade/restore): the populated upgrade acquires the
    candidate from the staged version URL and holds the read-back receipt to
-   the staged bytes; the gate (`ci/qualify.py gate`) then refuses, before
-   any other check, a candidate that is not signed for the permanent release
-   key (`RELEASE_TRUST_KEY_SHA256`) — every installed release verifies its
-   successor under the key it carries — with *"the candidate is not signed
-   for the permanent release key; every installed release would refuse it as
-   an upgrade target, so sign it with that key and qualify it again"*, and
+   the staged bytes; the gate (`ci/qualify.py gate`) then refuses, right
+   after the bundle's own signature check, before it reads the manifest or
+   judges the qualification flag, a candidate that is not signed for the
+   permanent release key (`RELEASE_TRUST_KEY_SHA256`) — every installed
+   release verifies its successor under the key it carries — with *"the
+   candidate is not signed for the permanent release key; every installed
+   release would refuse it as an upgrade target, so sign it with that key and
+   qualify it again"*, and
    requires every report and receipt, each report naming the helm, kubectl,
    jq and Kubernetes server versions it ran with (its `clients`; qualification
    never passes `--fetch-tools`, so those are the PATH clients the installer
