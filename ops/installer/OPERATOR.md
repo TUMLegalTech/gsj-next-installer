@@ -510,7 +510,9 @@ links — FAT, exFAT, some network shares — is named in a log line, *"init: �
 not saved in …: … is on a file system without hard links (FAT, exFAT, some
 network shares), and init puts a checked copy in place only by linking it"*
 for the second, and the files go to `$HOME/gsj-operator/releases/<version>/`
-instead) -- checks the three clients below against their floors at once
+instead; each is written under a hidden temporary name beside the installer
+and linked into place, and a stop by a signal while it does removes that
+hidden copy) -- checks the three clients below against their floors at once
 and says what to install (bash, curl, tar, gzip, base64, OpenSSL 3 and a
 SHA-256 tool are required before it can run at all, one at a time), checks what it can reach (your cluster, named by its
 context; `github.com` for the corpus; `ghcr.io` for the images), checks the
@@ -778,7 +780,8 @@ This is the most common way an install fails. The installer proves every pull
 of the release's six images on the storage node before it applies anything, so
 the failure stops an install at its start, not hours in — after 90 s of
 retries for a failure no retry changes, after 300 s for a probe Pod the
-scheduler cannot place, and for any other failure within
+scheduler cannot place, at once for one that ended, was deleted or was
+replaced before its pull, and for any other failure within
 `deadlines.dependencies_seconds` (900 s by default) of its first report — but
 it stops it. A
 stopped first install is abandoned and started again when the cure is a
@@ -1348,12 +1351,21 @@ it, some of them hours in. Each refusal begins with the words quoted here:
   annotated `ingressclass.kubernetes.io/is-default-class: "true"`. Under
   `managed-traefik` it never counts: the installer's Traefik is not the
   default class and serves `ingress.class` alone. Any other Ingress on the
-  host is another controller's, or no controller's, which this site's
-  controller never routes: it is said in a log line and the run goes on
+  host is said in a log line and the run goes on. One of another class is
+  another controller's, and one of no class under `managed-traefik` no
+  controller's, which this site's controller never routes
   (*"public_url's host … is also served by another controller's Ingress …;
   nothing routes to it here, because it names an ingress class other than
   ingress.class …, or names none and … is not the cluster's default ingress
-  class. … The run goes on"*). Not counted either: this
+  class. … The run goes on"*). One of no class under `ingress.profile=reuse`
+  gets a line of its own, since some controllers serve class-less Ingresses
+  without being marked the default — OpenShift's ingress-to-route turns them
+  into Routes (*"public_url's host … is also named by Ingress …, of no ingress
+  class, and … is not the cluster's default ingress class, so it is not
+  refused; it may still be served by this site's controller if that
+  controller serves Ingresses without a class …"*): if yours does, remove
+  that Ingress, give it an ingress class, or choose another `public_url`,
+  before the install fails at its acceptance check. Not counted either: this
   deployment's own Ingress (an upgrade's), an Ingress already
   being deleted, and one labelled `acme.cert-manager.io/http01-solver=true` —
   cert-manager's HTTP-01 solver, which serves the host while a renewal is
@@ -2147,6 +2159,45 @@ told that *"a changed storage.node is refused for an installed release, whose
 claims stay where they are"*; a restore names the verb its phase accepts and
 that *"a changed storage.node cannot continue this restore"*.
 
+**Placed, each must last until it has pulled.** Only a Pod that may still
+pull is waited on: `Pending` or `Running`, its container waiting for its image
+or not yet reported. A Pod that can no longer pull is refused on the poll that
+reads it, since no wait changes it, naming the image it was to pull: one that
+*ended* without its image — phase `Failed` or `Succeeded`, or its container
+terminated: the kubelet evicted it under resource pressure or refused it at
+admission (`OutOfcpu`, `OutOfmemory`), the node shut down or was lost, or it
+outlived its own `activeDeadlineSeconds` (*How long it waits*, below); one
+that was *deleted* under the probe; and one *replaced* by another Pod of the
+same name and another uid, which another client created and whose pull proves
+nothing about the Pod the probe asked for:
+
+```
+GSJ: the image pull probe's Pod ended before its image was pulled (phase Failed, reason Evicted), so whether the node can pull image 2 of 6, ...@sha256:... (1 pulled before it, 4 not yet tried), from the release's own repositories is unproven: the kubelet evicted it under resource pressure or refused to admit it, the node shut down or was lost, or it outlived its activeDeadlineSeconds. The Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
+```
+
+The phase and the reason are repeated only when they are values the installer
+knows — one of the five Pod phases; `Evicted`, `OutOfcpu`, `OutOfmemory`,
+`DeadlineExceeded`, `NodeLost`, `Shutdown`, `Terminated` or `NodeShutdown` —
+otherwise as `other`, and as `unknown` where the Pod reports none; the
+kubelet's own message stays in `pull-probe-status.json`. A deleted Pod is
+refused as *"the image pull probe's Pod was deleted before its image was
+pulled, …: another client deleted it (an operator, a cleanup job or a policy
+controller)"*, with no status left to keep; a replaced one as *"the image pull
+probe's Pod was replaced by another Pod of the same name (another uid) before
+its image was pulled, …"*, and the run's exit leaves that Pod alone, since it
+is another client's. The cure is on the node, or with whatever deletes the
+probe's Pods, never a raised deadline: a node that is up, admits the Pod's
+request and evicts nothing under resource pressure, or an end to whatever
+deletes or recreates Pods labelled `gsj.io/pull-probe`; then wait the 180 s the
+operation's Lease needs and run the `resume --operation ID` the closing line
+names *"once node … admits and keeps the probe Pod (cpu 100m and memory 128Mi,
+with no eviction under resource pressure) and nothing else deletes or replaces
+Pods labelled gsj.io/pull-probe in namespace …"*. As for an unplaced Pod, a
+first install is also offered `abandon` and `install` again *"from the
+corrected file with another storage.node"*, an installed release is told that
+*"a changed storage.node is refused for an installed release"*, and a restore
+names the verb its phase accepts.
+
 **How long it waits depends on whether the image location moved.** An earlier
 installer ran this probe only for a site that set `registry.base` (or had just
 dropped it); without one, the corpus image — and web, runner and mcp — were
@@ -2160,8 +2211,15 @@ a pull (a Pod not placed, or with no container status, is not pulling at all)
 — and waited for up to `deadlines.initialization_seconds` more. A site that
 sets or changes `registry.base` waits `deadlines.dependencies_seconds` at most
 for all six images together, the corpus image included: the six Pods spend
-that one wait between them. Either way, a still-unfinished pull at the end is
-refused, naming the image whose pull was under way:
+that one wait between them. Every one of these times is the clock's, not a
+count of the probe's polls: the whole wait runs from the probe's start, and
+each rule from what the Pod in hand reported. Each probe Pod carries its own
+`activeDeadlineSeconds`, which the kubelet times on the node from the Pod's
+start: the probe's whole wait plus a tenth of it, never less than 300 s more —
+1200 s for a wait of 900 s, 96030 s for the 87300 s a site without
+`registry.base` waits by default — so the Pod outlives the probe's own
+refusal. Either way, a still-unfinished pull at the end is refused, naming the
+image whose pull was under way:
 
 ```
 GSJ: the node did not finish pulling this release's images from registry.base (registry.example.org/team) within deadlines.dependencies_seconds (900 s): image 4 of 6, registry.example.org/team/...@sha256:... (3 pulled before it, 2 not yet tried), was not pulled; ...; the Pod's status is kept in .../pull-probe-status.json. Helm has applied nothing in this run
@@ -2188,7 +2246,8 @@ above, after 90 s of retries, whatever the deadline; any other failure is
 waited out for at most `deadlines.dependencies_seconds` from its first report
 — never to the longer bound, which only a pull still under way gets — and
 refused as *cannot pull*, by its class, if it is still reported then. A probe Pod the
-scheduler has not placed is refused as *not scheduled*, above, after 300 s.
+scheduler has not placed is refused as *not scheduled*, above, after 300 s, and
+one that ended, was deleted or was replaced before its pull at once.
 
 **It covers a location that changed**, in either direction. An upgrade whose
 site file has *lost* `registry.base` — a stale copy, a deleted line — would
@@ -2993,13 +3052,25 @@ serves an Ingress that names none: under `ingress.profile=reuse`, the class
 annotated `ingressclass.kubernetes.io/is-default-class: "true"`. Under
 `managed-traefik` a class-less Ingress is never one, because the installer
 installs Traefik as no default and holds it to `ingress.class`. Any other
-Ingress on the host is another controller's, or no controller's, which this
-site's controller never routes, so it is named in a log line and the run goes
-on: *"public_url's host … is also served by another controller's Ingress
+Ingress on the host is named in a log line and the run goes on. One of
+another class is another controller's, and one of no class under
+`managed-traefik` no controller's, which this site's controller never routes:
+*"public_url's host … is also served by another controller's Ingress
 NAMESPACE/NAME; nothing routes to it here, because it names an ingress class
 other than ingress.class CLASS, or names none and CLASS is not the cluster's
 default ingress class. Clients reach this deployment only where …'s address
-leads to this site's controller. The run goes on"*. The host is
+leads to this site's controller. The run goes on"*. One of no class under
+`ingress.profile=reuse` is not known to be another's: some controllers serve
+class-less Ingresses without being marked the default (OpenShift's
+ingress-to-route turns them into Routes), so its line says so: *"public_url's
+host … is also named by Ingress NAMESPACE/NAME, of no ingress class, and CLASS
+is not the cluster's default ingress class, so it is not refused; it may still
+be served by this site's controller if that controller serves Ingresses
+without a class (OpenShift's ingress-to-route turns them into Routes), and
+then two deployments share one host on one controller and the install fails
+at its acceptance check, hours in, with a trust error. If this site's
+controller does that, remove that Ingress, give it an ingress class, or choose
+another public_url. The run goes on"*. The host is
 compared without its port and regardless of case, and this deployment's own
 Ingress, on an upgrade, is not a collision. Where your
 kubeconfig may not list Ingresses in every namespace, the check is skipped and
@@ -3489,9 +3560,12 @@ operation's saved site and in the installed record, and says so in one line:
 corpus.allow_update is set back to false in …, the operation's saved site and
 the installed record, so a later release's corpus change is refused until it is
 admitted again after its own pre-migration backup"*. The next corpus change
-then asks again, after its own backup. It rewrites only a regular file: a site
-file that is a symbolic link is never written through, and then nothing is
-changed and the line says so instead — *"The corpus change this operation
+then asks again, after its own backup. Before it writes the installed record
+it publishes the ready-state record again from the reset site, so a later
+`backup` round finds one current source that says `false`, never two that
+differ (*"recorded current backup sources are ambiguous"*). It rewrites only
+a regular file: a site file that is a symbolic link is never written through,
+and then nothing is changed and the line says so instead — *"The corpus change this operation
 admitted is complete (fingerprint … to …), but … is a symbolic link or no
 longer a regular file, so corpus.allow_update stays true there and in the
 installed record: set it to false in the file the link names, or a later
@@ -4187,20 +4261,23 @@ its `emptyDir`, it measures that filesystem inside the restore Pod and
 refuses, having streamed nothing, when the archive and a margin would not fit.
 The margin is what must stay free after the stream, the largest of: 256 MiB; a
 tenth of the archive; for the `emptyDir` alone, with `storage.transfer_path`
-empty, a tenth of the filesystem (the `emptyDir` is on the node's root
-filesystem, where the kubelet evicts Pods below 10 % free by default); and
+empty, 15 % of the filesystem (the `emptyDir` is on the node's root
+filesystem, where the kubelet's default hard eviction thresholds evict Pods
+below 10 % free, `nodefs.available`, and below 15 %, `imagefs.available`,
+which watches that same filesystem on a node whose images share it); and
 `storage.minimum_free_bytes` when the directory shares its filesystem with the
 application's volumes, as the backup's capacity check charges it. A
-`transfer_path` directory is not held to a tenth of its filesystem: it is a
-disk you chose, which that eviction threshold does not watch, and a tenth of a
-2 TiB data disk would keep over 200 GiB free beyond the archive. The refusal
+`transfer_path` directory is not held to a share of its filesystem: it is a
+disk you chose, which those eviction thresholds do not watch, and 15 % of a
+2 TiB data disk would keep over 300 GiB free beyond the archive. The refusal
 names the one that decided: *"restore staging space is insufficient: … has …
 bytes free and the decrypted archive needs … (the encrypted archive's … bytes
 plus a margin of …: …)"*, where the last words are *"256 MiB, the least
 margin"*, *"a tenth of the archive"*, *"storage.minimum_free_bytes, the site's
 floor for the filesystem the application volumes share with it"* or, for the
-`emptyDir`, *"a tenth of the filesystem's … bytes, which keeps the node clear
-of the kubelet's default eviction threshold"*. Make room there,
+`emptyDir`, *"15 % of the filesystem's … bytes, which keeps the node clear of
+the kubelet's default eviction thresholds (imagefs.available<15 % where the
+images share this filesystem, nodefs.available<10 %)"*. Make room there,
 then run the `restore-repair --operation ID` the closing line names; the
 operation stays retained for it.
 
@@ -4510,7 +4587,8 @@ restore checkpoint refuses a fresh restore there (*"restore checkpoint already
 exists; use restore-repair --operation ID for its recorded resource/file phase
 or resume for application startup"*; once you have abandoned the operation,
 *"restore checkpoint already exists for operation …, which was abandoned
-before its restore completed, …"*, naming the route below). Restore the same
+before its restore completed, …"*, naming the route below from its uninstall
+on, since the abandon is done). Restore the same
 verified archive into an empty namespace of the same name (restore keeps the archive's
 namespace and release names) from a new site directory: on another cluster,
 keeping this namespace too, or, with one cluster, on this one once the
@@ -4687,7 +4765,7 @@ first install, or its recovery, realistically meets:
 | `operator.password_file (…) cannot be read by the account that runs the installer`, `tls.private_key_file (…) cannot be read …`, `tls.certificate_file (…) cannot be read …` | an `install` or `upgrade` could not open that file as the account it runs as, and refused it by its site name before comparing a byte. What `jq` says while it compares these files is kept, mode 0600, in `preflight-operator-password.err` or `preflight-tls-files.err` in the state directory, never printed | make that account the file's owner, with mode 0600 or 0400 — the certificate need only be readable by it — then the same command |
 | `ingress.namespace … does not exist`, `ingress.namespace … runs no ingress controller` | under `ingress.profile=reuse`, the namespace is missing, or it holds no Running Pod. Running Pods none of which is a controller the check recognizes are said in a log line (*"ingress.namespace … holds … Running Pod(s), and none of them is an ingress controller this check recognizes …"*), not refused | set `ingress.namespace` to the namespace the controller's Pods run in — the first column of `kubectl get pods -A` — then the same command |
 | `ingress.namespace … is the namespace this deployment is installed in` | under `managed-traefik`, `ingress.namespace` is `target.namespace`; Traefik gets a namespace of its own | another `ingress.namespace` (`gsj-ingress` is the default), or `ingress.profile` `reuse` for a controller that already runs |
-| `public_url's host … is already served by Ingress` | another deployment's Ingress serves that host on this site's controller, named in the refusal: its class (`spec.ingressClassName`, else the `kubernetes.io/ingress.class` annotation) is `ingress.class`, or it names none and `ingress.class` is the cluster's default class (never under `managed-traefik`). One of another class, or of none otherwise, is said in a log line (*"… is also served by another controller's Ingress …"*) and the run goes on. An Ingress being deleted and cert-manager's HTTP-01 solver (labelled `acme.cert-manager.io/http01-solver=true`) are not counted | remove that Ingress, or choose another `public_url` |
+| `public_url's host … is already served by Ingress` | another deployment's Ingress serves that host on this site's controller, named in the refusal: its class (`spec.ingressClassName`, else the `kubernetes.io/ingress.class` annotation) is `ingress.class`, or it names none and `ingress.class` is the cluster's default class (never under `managed-traefik`). One of another class, or of none under `managed-traefik`, is said in a log line (*"… is also served by another controller's Ingress …"*), one of none under `reuse` in a line of its own (*"… it may still be served by this site's controller if that controller serves Ingresses without a class …"*), and the run goes on. An Ingress being deleted and cert-manager's HTTP-01 solver (labelled `acme.cert-manager.io/http01-solver=true`) are not counted | remove that Ingress, or choose another `public_url` |
 | `managed add-on CustomResourceDefinitions are left without their owner record` | CRDs of an add-on this site selects, left by an earlier install of it without its owner record | the teardown the refusal names — this installer deletes nothing — then the same command |
 | `the operator Secret … could not be read`, `TLS Secret … could not be read` | your kubeconfig could not read that Secret in the target namespace | correct the access — kubectl's output is kept in the state-directory file the refusal names — then the same command |
 | `no node has room for this deployment` | the scheduler's arithmetic over what other Pods have *reserved* | free requests on a node or name another in `storage.node`; this is not about free memory |
@@ -4697,9 +4775,12 @@ first install, or its recovery, realistically meets:
 | `the image pull probe could not be created in namespace` | a Pod that proves a pull, one per image in turn, was refused before it pulled — *an admission policy (LimitRange or ResourceQuota) refused the Pod*, *an admission policy refused it*, or your kubeconfig's permissions | admit it — each probe Pod is one container requesting `cpu: 100m` and `memory: 128Mi`, the storage check's figures, both limits equal to those requests, and is labelled `gsj.io/pull-probe` — then the command the closing line names: `resume`, or for a restore the verb its phase accepts |
 | `the node cannot pull this release from` | the pull proof failed for the image it names (*"image … of 6, … (… pulled before it, … not yet tried)"*): `registry.base` (or, without it, the release's own repositories), the registry's contents, the pull credential, or the node's own route to the registry. A failure no retry changes (a refused credential, a name or digest the registry does not hold, an invalid name) is refused after 90 s; any other within `deadlines.dependencies_seconds` of its first report, *"… still failing deadlines.dependencies_seconds (…) after it was first reported …"*, or at the end of the probe's wait where that comes first, *"… still failing at the end of …"* | correct it, wait 180 s, then the command the closing line names — `repair`, or on a first install `abandon` and `install` again |
 | `the image pull probe's Pod was not scheduled` | the scheduler left a probe Pod unplaced (`PodScheduled` `False`) for 300 s, or to the end of the probe's wait where that came first: `storage.node` has no room for its request, 100m CPU and 128Mi, beside what the Pods there already request — on an upgrade the running deployment's too — or does not accept it (cordoned, tainted, no node of that name). The scheduler's words are kept in `pull-probe-status.json` | free requests on that node, or uncordon it, wait 180 s, then the `resume --operation ID` the closing line names; a first install may instead `abandon` and `install` again with another `storage.node`, which an installed release cannot change; a restore names the verb its phase accepts |
+| `the image pull probe's Pod ended before its image was pulled` | a probe Pod ended without its image — phase `Failed` or `Succeeded`, or its container terminated: the kubelet evicted it under resource pressure or refused it at admission, the node shut down or was lost, or it outlived its own `activeDeadlineSeconds` — and is refused on the poll that read it, by its phase and reason. The kubelet's words are kept in `pull-probe-status.json` | make the node admit and keep it — up, with room for its 100m CPU and 128Mi, and evicting nothing under resource pressure — wait 180 s, then the `resume --operation ID` the closing line names *"once node … admits and keeps the probe Pod …"*; a first install may instead `abandon` and `install` again with another `storage.node`; a restore names the verb its phase accepts |
+| `the image pull probe's Pod was deleted before its image was pulled` | another client — an operator, a cleanup job or a policy controller — deleted a probe Pod before its pull; refused on the poll that found it gone | stop whatever deletes Pods labelled `gsj.io/pull-probe` in the namespace, wait 180 s, then the command the closing line names, as for an ended Pod |
+| `the image pull probe's Pod was replaced by another Pod of the same name` | another client deleted a probe Pod and created one of its name (another uid), whose pull proves nothing; refused on that poll, and that Pod, not the probe's, is left in place | stop whatever recreates Pods labelled `gsj.io/pull-probe` in the namespace, wait 180 s, then the command the closing line names, as for an ended Pod |
 | `the node did not finish pulling this release's images` | the pull proof ran out of `deadlines.dependencies_seconds` (900 s by default) with the named image's pull still under way, or of that plus `deadlines.initialization_seconds` on a site that neither sets nor changes `registry.base` | raise `deadlines.dependencies_seconds`, wait 180 s, then the `repair` the closing line names — on a first install `abandon` and `install` again; a restore takes no raised deadline — or the `resume` (for a restore, the verb) it names once the registry answers and the probe Pod can be scheduled |
 | `Helm provisioning failed; persistent state was retained` | the Helm apply of an install, upgrade or restore exited non-zero; the last 25 lines of Helm's log precede it. The operation stays in its Helm phase, where `resume` refuses | fix the cause, wait 180 s, then the `repair --operation ID --config … --non-interactive` the closing line names |
-| `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin (the refusal names the floor that set it; a tenth of the filesystem is the `emptyDir`'s alone); nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
+| `restore staging space is insufficient` | the restore's transfer directory, or its `emptyDir`, has less free space than the decrypted archive and its margin (the refusal names the floor that set it; 15 % of the filesystem is the `emptyDir`'s alone); nothing was streamed | make room there, then the `restore-repair --operation ID` the closing line names |
 | `the operation Lease is already free; nothing to abandon` | `abandon` on a target with no live operation — normal after a completed install | carry on; it exits `1` while doing no harm, so do not let a script stop on it |
 | `a Helm release named … exists … sweep never removes a deployment` | `sweep` clears residue, never a deployment | `helm uninstall` first (its claims are kept), then `sweep` |
 
@@ -4864,9 +4945,11 @@ A fresh restore goes into an empty namespace of the same name, from a new
 site directory, and the installer's refusals name both places it can be:
 *"… into an empty namespace … from a new site directory: on another cluster,
 or on this one once the deployment is removed (abandon --operation …, helm -n
-… uninstall …, sweep, then delete namespace …)"* — with *"… uninstall … and
-its managed add-ons with their CRDs (see the guide), …"* when the site selects
-a managed profile. This section is the second.
+… uninstall …, sweep, then delete namespace …)"* — ending *"…, sweep, delete
+namespace …, then remove its managed add-ons and their CRDs (see the guide))"*
+when the site selects a managed profile, and starting at *"(helm -n …
+uninstall …"* when the operation it names is already abandoned or swept, which
+`abandon` refuses. This section is the second.
 With one cluster, the namespace is emptied by removing the deployment first.
 That takes the deployment's data off the cluster before the restore puts it
 back, so it has an order, and the first step is the one that makes the others
@@ -4962,9 +5045,9 @@ abandoned or swept, with *"restore checkpoint already exists for operation …,
 which was abandoned before its restore completed, so restore-repair and resume
 refuse it; keep this site directory as it is, and restore into an empty
 namespace … from a new site directory: …"* (*swept* where a sweep ended it),
-which names this route — or strands it partway, at verification with
-*"verification ownership ledger is missing after launch"*, where only that
-state's own recovery continues it. A
+which names this route from its uninstall on — or strands it partway, at
+verification with *"verification ownership ledger is missing after launch"*,
+where only that state's own recovery continues it. A
 directory no installer has used holds nothing of the kind. Keep the old one: its
 `abandoned-*.json` and `swept-*.json` records are the account of what was done.
 

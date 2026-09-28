@@ -49,9 +49,10 @@ install and when you would find out.
   retry changes (a refused credential, a name or digest the registry does not
   hold, an invalid name) is refused after 90 s; any other failure within
   `deadlines.dependencies_seconds` (900 s by default) of its first report;
-  and a probe Pod the scheduler cannot place — each asks for 100m CPU and
+  a probe Pod the scheduler cannot place — each asks for 100m CPU and
   128Mi, one at a time, beside the running deployment on an upgrade — after
-  300 s. With
+  300 s; and one that ends, is deleted or is replaced by another Pod of its
+  name before its pull, at once. With
   `registry.base` (or on the upgrade that drops it) all six images must
   arrive within `deadlines.dependencies_seconds`, which a slow link to the
   mirror may need raised; without it a pull still under way then is waited
