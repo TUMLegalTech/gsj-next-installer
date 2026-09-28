@@ -2697,9 +2697,10 @@ URLISH = (r"\$\(j '?\.?[a-z_.]*(url|base_url|acme_server|offbox_url|vectors_url)
           r"|\$\{?([A-Za-z_]*url|URL|base|[a-z_]*_server)\b")
 URL_SINKS = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still_live) ['\"]"
                        r"|\b(RECOVERY_HINT|note|hint|found|next|fresh|resume|message|line)=)")
-# a filter that DERIVES from its input -- a digest, a field, a count, a file written
-# by the installer's own writers -- so what comes out is not the URL
-URL_DERIVES = re.compile(r"\|\s*(cut|tr|sha256sum|shasum|md5sum|openssl|base64|wc|sort|uniq|od|xxd|fold|rev|atomic|immutable_file)\b")
+# a filter that DERIVES from its input -- a digest, a count, a file written by
+# the installer's own writers -- so what comes out is not the URL; sort, uniq,
+# cut, tr, fold, rev and the encoders hand the URL on or can be undone
+URL_DERIVES = re.compile(r"\|\s*(sha256sum|shasum|md5sum|openssl dgst|wc|atomic|immutable_file)\b")
 # head, tail, sed, awk, grep and jq hand their input on (`| head -n 1`, `| sed -n p`,
 # `| jq -R .` print the URL itself); only these forms of them extract: a sed
 # under -n whose substitution replaces with its first group and prints with
@@ -2925,6 +2926,14 @@ URL_SCAN_MUTANTS = {
     "a printf piped into sed -n p": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -n p\n}\n',
     "a printf piped into awk": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | awk \'{print}\'\n}\n',
     "a printf piped into grep": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | grep https\n}\n',
+    # sort, uniq, cut, tr, fold and base64 reorder, trim or encode the URL: it is still printed
+    "a printf piped into sort": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sort\n}\n',
+    "a printf piped into uniq": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | uniq\n}\n',
+    "a printf piped into fold": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | fold -w 500\n}\n',
+    "a printf piped into cut": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | cut -c1-\n}\n',
+    "a printf piped into base64": 'mutant() {\n local url=$1\n printf \'%s\' "$url" | base64\n}\n',
+    "an alias through sort": 'mutant() {\n local url=$1 first\n first=$(printf \'%s\' "$url" | sort)\n fail "cannot reach $first"\n}\n',
+    "a site field through tr": 'mutant() {\n local where\n where=$(j .llm.base_url | tr -d "\\n")\n log "at $where"\n}\n',
     "a printf piped into jq -R": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | jq -R .\n}\n',
     "an alias through head": 'mutant() {\n local url=$1 first\n first=$(printf \'%s\' "$url" | head -n 1)\n fail "cannot reach $first"\n}\n',
     "a site field through sed -n p": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -n p)\n log "at $where"\n}\n',
