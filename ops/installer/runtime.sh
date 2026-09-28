@@ -4891,9 +4891,13 @@ record_installed() {
  # the Lease) is complete once this record is written, and the consent that
  # admitted it is spent: left true, the next release's corpus would be adopted
  # without anyone being asked. The merged site is changed first, so the
- # installed record carries false; the operator's file and the operation's
- # saved site only after the operation is complete, because until then a
- # resume compares them with the site its Helm target was compiled from. A
+ # installed record carries false, and the ready-state record is published
+ # again from it: record_ready wrote that from the site while it said true,
+ # and two records of the same release and controllers whose sites differ
+ # make read_backup_source refuse every later backup round and replacement
+ # repair as ambiguous. The operator's file and the operation's saved site
+ # only after the operation is complete, because until then a resume
+ # compares them with the site its Helm target was compiled from. A
  # file that is a link is never rewritten through it, and then nothing is:
  # records that say false beside a file that says true would refuse every
  # later backup as a settings change. The marker goes into the operation
@@ -4911,6 +4915,7 @@ record_installed() {
      allow_update_false "$SITE"
      jq '.corpus_update_reset="pending"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
      atomic "$SITE" < "$GSJ_WORK/corpus-reset.json"
+     record_ready
    else corpus_reset=kept; fi
  fi
  storage_identity > "$GSJ_WORK/storage.json"

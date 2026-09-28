@@ -97,6 +97,50 @@ def test_matching_complete_record_preferred_only_when_source_payload_agrees(roun
     assert result.returncode != 0 and "ambiguous" in result.stderr
 
 
+def test_a_completed_corpus_change_leaves_one_current_source_for_later_rounds(rounds, tmp_path):
+    """An operation admitted by corpus.allow_update=true published its
+    ready-state record from the merged site while that still said true, and
+    the installed record then from the site with the consent spent. Both
+    described the same release and controllers with sites that differed, so
+    every later backup round and replacement repair was refused as ambiguous.
+    The ready-state record is published again from the reset site before the
+    installed record: both say false, and the complete record is the source."""
+    m = rounds
+    fake = tmp_path / "k.py"
+    fake.write_text(fake.read_text().replace("elif a[:2]==['get','namespace']", (
+        "elif a[:2]==['create','configmap']: result={'apiVersion':'v1','kind':'ConfigMap','metadata':{'name':a[2]},"
+        "'data':{'installed.json':pathlib.Path(next(v for v in a if v.startswith('--from-file=')).split('=',2)[2]).read_text()}}\n"
+        "elif a[:1]==['apply']: record=json.load(sys.stdin); s['source_cms'][record['metadata']['name']]=record\n"
+        "elif a[:2]==['get','namespace']"), 1))
+    source = json.loads((m["work"] / "installed.json").read_text())
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "release.json").write_text(json.dumps(
+        {**source["manifest"], "corpus": {**source["manifest"]["corpus"], "fingerprint": "b" * 64}}))
+    site = {**source["site"], "corpus": {**source["site"]["corpus"], "allow_update": True}}
+    for path in (m["work"] / "site.json", m["state"] / "site.pending.json", tmp_path / "operator-site.json"):
+        path.write_text(json.dumps(site))
+    for name in ("verification.json", "public-check.json", "network-check.json"):
+        (m["state"] / name).write_text("{}")
+    (m["state"] / "operation.json").write_text(json.dumps(
+        {"operation": "operation123", "kind": "upgrade", "target": source["manifest"]["identity"],
+         "status": "verifying", "corpus_update_from": "c" * 64}))
+    places = f'SITE="$GSJ_WORK/site.json"; GSJ_PAYLOAD={payload}; CONFIG={tmp_path / "operator-site.json"}\n'
+    result = m["run"](places + "installation_summary() { :; }\nrecord_ready; record_installed")
+    assert result.returncode == 0, result.stderr
+    assert "set back to false" in result.stderr
+    records = {name: json.loads(record["data"]["installed.json"])
+               for name, record in json.loads(m["cluster"].read_text())["source_cms"].items() if name != "gsj-scripts"}
+    assert {name: record["site"]["corpus"]["allow_update"] for name, record in records.items()} == {
+        "gsj-ready-state": False, "gsj-installed": False}, records
+    assert json.loads((m["state"] / "ready.json").read_text()) == records["gsj-ready-state"]
+    result = m["run"](places + "read_backup_source current")
+    assert result.returncode == 0, result.stderr
+    assert "ambiguous" not in result.stderr
+    selected = json.loads((m["work"] / "installed.json").read_text())
+    assert selected["status"] == "complete" and selected["site"]["corpus"]["allow_update"] is False
+
+
 @pytest.mark.parametrize("fault", ["image", "corpus_image", "initializer_generation", "manifest", "model_path", "unowned", "namespace", "pv", "unrecorded_target"])
 def test_current_source_rejects_mismatched_runtime_or_record_without_mutation(rounds, fault):
     m = rounds
