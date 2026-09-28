@@ -4513,9 +4513,9 @@ verified archive into an empty namespace of the same name (restore keeps the arc
 namespace and release names) from a new site directory: on another cluster,
 keeping this namespace too, or, with one cluster, on this one once the
 deployment is removed (`abandon --operation`, `helm -n NAMESPACE uninstall` of
-the release and, with a managed profile, its managed add-ons and their CRDs,
-`sweep`, then delete the namespace; under a class that deletes on release that
-erases the claims' data), in the order
+the release, `sweep`, then delete the namespace, which under a class that
+deletes on release erases the claims' data; then, with a managed profile, its
+managed add-ons and, last, their CRDs), in the order
 [Restore onto the same cluster](#restore-onto-the-same-cluster) gives:
 
 ```sh
