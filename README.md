@@ -73,7 +73,9 @@ install and when you would find out.
   `upgrade` warns, before the operation Lease, about a kubectl more than one
   minor from the API server, and refuses one that `--fetch-tools` brought
   (*kubectl version skew*) — on `upgrade --to` too, whose target installer
-  is handed the clients the run fetched. `init` is the
+  is told which clients the run fetched and fetches its own release's pins
+  of them: from the cache when they are the same pins, otherwise downloaded,
+  which needs their download addresses reachable. `init` is the
   one command that does not stop at the first: it names them all at once, in
   its report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible

@@ -1378,7 +1378,9 @@ it, some of them hours in. Each refusal begins with the words quoted here:
 - a kubectl that `--fetch-tools` downloaded for this run and that is more than
   one minor from the server (*"kubectl version skew: the kubectl --fetch-tools
   downloaded for this run is …"*) — on `upgrade --to` as well, whose verified
-  target installer is handed the clients this run fetched. Your own kubectl, skewed the same way, is
+  target installer is told which clients this run fetched and fetches its own
+  release's pins of them
+  ([Client tools and versions](#client-tools-and-versions)). Your own kubectl, skewed the same way, is
   named in a log line and the run goes on with it (*"kubectl … is more than one
   minor from the server (…), and kubectl is supported within one minor of the
   server. The run goes on with it; …"*).
@@ -1827,12 +1829,16 @@ its first seconds with a refusal that names `--fetch-tools=kubectl`, which
 brings the same pin back. Your own kubectl, skewed the same way, is only warned
 about, in the log line the kubectl row quotes. Upgrade your own kubectl rather
 than fetching that one.
-`upgrade --to` and `repair --to` hand the clients this run fetched on to the
-target release's installer they verify and run — the bare `--fetch-tools` when
-all three were fetched, `--fetch-tools=` with the set otherwise — so that
-installer takes them as fetched, not as your machine's own, and on an upgrade
-its preflight refuses the skew the same way. The same pins come from the cache
-by their checksums; nothing is downloaded twice.
+`upgrade --to` and `repair --to` hand the target release's installer they
+verify and run the names of the clients this run fetched, not the clients
+themselves — the bare `--fetch-tools` when all three were fetched,
+`--fetch-tools=` with the names otherwise. That installer fetches those clients
+itself, as its own release pins them, and treats them as fetched, not as your
+machine's own: on an upgrade its preflight refuses the skew the same way. Its
+fetch looks in the same cache by checksum first, so a pin the two releases
+share comes from there and is not downloaded again; a pin the target release
+changed is downloaded, from the address that release names for it, and that
+needs the address reachable from this machine as the first fetch did.
 
 **`--fetch-tools=TOOL[,TOOL]`** fetches only the clients it names —
 `helm`, `kubectl`, `jq`, comma-separated — and keeps the others on your
