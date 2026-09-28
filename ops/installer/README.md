@@ -25,12 +25,15 @@ seconds, if one is missing or below its floor (helm 3.13, kubectl 1.24,
 jq 1.6 — each measured against real binaries, see the comment block above
 `GSJ_HELM_FLOOR` in `runtime.sh`). OpenSSL has a floor of its own, checked in
 the same first seconds and never downloaded: OpenSSL 3.0 or newer, not LibreSSL
-(`GSJ_OPENSSL_FLOOR`; the certificate-hostname refusals read the verdict
+(`GSJ_OPENSSL_FLOOR`; the certificate-hostname checks read the verdict
 `openssl x509 -checkhost` prints, which LibreSSL does not implement). The
 refusal happens before the payload is unpacked, so it costs nothing and touches
 nothing. `--fetch-tools`, accepted by every command, restores the download:
 `gsj_client_info` then supplies the pinned URL and SHA256 per tool, and
-verified clients are cached in the runtime's private bin directory. Neither
+verified clients are cached in the runtime's private bin directory;
+`--fetch-tools=TOOL[,TOOL]` downloads only the clients it names and holds the
+others to their floors; `upgrade --to` and `repair --to` pass the set they
+fetched on to the verified target's installer. Neither
 
 <!-- init: begin -->
 `init` is the one command that names every missing or too-old client at
@@ -399,9 +402,12 @@ no private input.
    `.venv/bin/python -B ops/installer/ci/full-suite.py --report /release-output/full-suite.json`.
    It refuses to start when a prerequisite it knows is missing — the four
    packages (`gsj_deploy`, `gsj_web`, `agent_runner`, `gsj`), a
-   `chromadb-client` still installed, the pinned Git objects, `bash`, `helm`,
-   `jq` and `openssl`, the two add-on archives, an interpreter that is not
-   X.509-strict, a missing system CA bundle — names every test file to pytest
+   `chromadb-client` still installed, the pinned Git objects, the previous
+   release's tag in this repository (`v0.10.0-beta.6`, whose installer files
+   the site continuity test in `tests/test_contract.py` reads; a clone or
+   fetch that took no tags gets it with `git fetch --tags origin`), `bash`,
+   `helm`, `jq` and `openssl`, the two add-on archives, an interpreter that is
+   not X.509-strict, a missing system CA bundle — names every test file to pytest
    so the modules the public CI ignores cannot be left out, and fails on any
    skip whatever its reason, expected failure, deselection, collection error
    or file that contributed no test. A release whose full run is not green is
@@ -457,16 +463,38 @@ no private input.
 7. **Qualification** against a disposable cluster (`ci/qualify.py`, ordinary
    and populated upgrade/restore): the populated upgrade acquires the
    candidate from the staged version URL and holds the read-back receipt to
-   the staged bytes; the gate (`ci/qualify.py gate`) then requires every
-   report and receipt. The harness reads the verifier's check list from the
+   the staged bytes; the gate (`ci/qualify.py gate`) then refuses, right
+   after the bundle's own signature check, before it reads the manifest or
+   judges the qualification flag, a candidate that is not signed for the
+   permanent release key (`RELEASE_TRUST_KEY_SHA256`) — every installed
+   release verifies its successor under the key it carries — with *"the
+   candidate is not signed for the permanent release key; every installed
+   release would refuse it as an upgrade target, so sign it with that key and
+   qualify it again"*, and
+   requires every report and receipt, each report naming the helm, kubectl,
+   jq and Kubernetes server versions it ran with (its `clients`; qualification
+   never passes `--fetch-tools`, so those are the PATH clients the installer
+   ran on, and a run that cannot read one stops before its first phase). The
+   harness reads the verifier's check list from the
    pinned product commit, so the machine it runs on needs a Git directory
    that carries that commit — `GSJ_NEXT_WEB_GIT_DIR`, the staged
    `ops/.build/gsj-next-web.git`, or the `../gsj-next-web` sibling — and
    refuses in its first second, naming that recipe, when none does. Give
    every run a fresh site directory: the installer's state lives beside the
-   site file, and a second run over the first run's state (its namespace
-   already deleted by the harness) stops at verification with *"verification
-   ownership ledger is missing after launch"*.
+   site file, and a second run over the first run's state meets that run's
+   records. It retires the first run's verification record by itself
+   (*"Retired verification run … of ended operation …"*) when the namespace
+   the first operation recorded in its intent has since been replaced — the
+   harness deletes it — and that run's ledger is absent from the new volume,
+   and, under a restore, when that run had finished. A restore into the
+   replaced namespace brings the ledger back with the archive's claims; then
+   the first run's own reconciliation runs under its old binding (for a run
+   still active, the cleanup of its test accounts) and the record is retired
+   after it. Where neither holds — no intent saved for the first operation,
+   or the same namespace with any other run — the record is resumed, and with
+   its ledger
+   gone the second run stops at verification with *"verification ownership
+   ledger is missing after launch"*.
 8. **Publication**: the release assets (below) — `verify-release.sh`, the
    public key, the descriptor, its signature and the installer — after the
    gate has passed for these exact signed bytes.

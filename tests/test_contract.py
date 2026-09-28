@@ -10,16 +10,24 @@ reads; the initializer receives exactly its settings keys; the verifier's
 checks, failure codes and exit codes are what the runtime and the operator
 guide expect; and the deadline, controller and released-vectors mappings hold.
 
-Skip-guarded on the pinned Git objects (a public runner has no product) and
-on helm and jq, like the product's own chart tests.
+Skip-guarded on the pinned Git objects (a public runner has no product), on
+helm where a test renders the chart, and on jq, like the product's own chart
+tests. The contracts on the installer's own files need neither the product
+nor helm: the synthetic site's compiled keys, the contract document's names,
+and above all that a site file written for the previous release keeps its
+meaning under this one. That one reads the previous release's installer
+files from this repository's own Git tags, so it runs on the public runner
+too, and skips only where the tag is absent (a shallow clone).
 """
 import ast
+import inspect
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 import pytest
 import yaml
@@ -28,9 +36,11 @@ from tests import pinned_web
 from tests.pinned_web import needs_web
 from tests.test_installer import INSTALLER, ROOT, _release, _site
 
-pytestmark = [needs_web,
-              pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed"),
-              pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")]
+# needs_web marks each test that reads the pinned product and needs_helm each
+# test that renders it, not the module: a test of the installer's own files,
+# the continuity test at the end among them, runs without either.
+needs_helm = pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+pytestmark = [pytest.mark.skipif(shutil.which("jq") is None, reason="jq not installed")]
 
 EXAMPLES = sorted((INSTALLER / "examples").glob("*.site.json"))
 CORPUS = ["--set", "corpus.enabled=true", "--set", "corpus.manifestSha256=" + "a" * 64,
@@ -97,6 +107,8 @@ def web_deployment(docs, release="gsj"):
 
 # ---- every example site: validate, compile, render ---------------------------
 
+@needs_web
+@needs_helm
 @pytest.mark.parametrize("example", EXAMPLES, ids=[p.name for p in EXAMPLES])
 def test_every_example_site_validates_compiles_and_renders_with_the_pinned_chart(tmp_path, example):
     site = validated(merged(example))
@@ -128,6 +140,7 @@ def test_every_example_site_validates_compiles_and_renders_with_the_pinned_chart
             assert values["image"][role]["digest"] == "sha256:" + "a" * 64
 
 
+@needs_web
 @pytest.mark.parametrize("example", EXAMPLES, ids=[p.name for p in EXAMPLES])
 def test_every_compiled_leaf_is_a_value_the_pinned_chart_declares(tmp_path, example):
     """The inverse of the chart's `test_every_value_has_a_consumer`: the
@@ -161,6 +174,8 @@ def test_the_synthetic_site_compiles_to_the_documented_keys(tmp_path):
 
 # ---- the objects and init containers the runtime addresses -------------------
 
+@needs_web
+@needs_helm
 def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
     docs = rendered(tmp_path, None, *CORPUS)
     names = {(d["kind"], d["metadata"]["name"]) for d in docs}
@@ -187,6 +202,8 @@ def test_the_pinned_chart_renders_every_object_the_runtime_addresses(tmp_path):
     assert ports == {"gsj-web": 8780, "gsj-forgejo": 3000, "gsj-chroma": 8000}
 
 
+@needs_web
+@needs_helm
 def test_the_init_containers_run_the_documented_programs_with_the_termination_policy_the_runtime_reads(tmp_path):
     web = web_deployment(rendered(tmp_path, None, *CORPUS))
     inits = {c["name"]: c for c in web["spec"]["template"]["spec"]["initContainers"]}
@@ -206,6 +223,8 @@ def test_the_init_containers_run_the_documented_programs_with_the_termination_po
     assert [c["name"] for c in without["spec"]["template"]["spec"]["initContainers"]] == ["wait-deps", "migrate"]
 
 
+@needs_web
+@needs_helm
 def test_the_initializer_receives_exactly_its_settings_keys(tmp_path):
     docs = rendered(tmp_path, None, *CORPUS, "--set", "corpus.releasedVectors=true")
     scripts = next(d for d in docs if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "gsj-scripts")
@@ -233,6 +252,7 @@ def _assigned_set(source, name):
     raise AssertionError(f"{name} not found")
 
 
+@needs_web
 def test_the_verifier_contract_is_what_the_runtime_and_the_guide_expect():
     source = pinned_web.show("gsj_deploy/verify.py").decode()
     checks = _assigned_set(source, "REQUIRED_CHECKS")
@@ -257,6 +277,8 @@ def test_the_verifier_contract_is_what_the_runtime_and_the_guide_expect():
 
 # ---- the mappings the chart and the installer agree on (moved from the product's chart tests) ----
 
+@needs_web
+@needs_helm
 def test_progress_deadline_outlasts_the_dependency_wait_and_the_import(tmp_path):
     """The first rollout holds the dependency wait AND the corpus import. The
     chart's defaults ARE the installer's mapping of the same site deadlines
@@ -284,6 +306,8 @@ def test_progress_deadline_outlasts_the_dependency_wait_and_the_import(tmp_path)
     assert "startup.progressDeadlineSeconds must exceed" in out.stderr, out.stderr
 
 
+@needs_web
+@needs_helm
 def test_compiled_values_name_the_controller_and_carry_no_inert_key(tmp_path):
     """compile.jq names the controller — its managed Traefik by profile, a
     reused class by the spec.controller the installer passes, else
@@ -311,6 +335,8 @@ def test_compiled_values_name_the_controller_and_carry_no_inert_key(tmp_path):
         assert bool(annotations) == (controller == "k8s.io/ingress-nginx"), controller
 
 
+@needs_web
+@needs_helm
 def test_the_site_declares_released_vectors_to_the_initializer(tmp_path):
     """compile.jq turns a configured corpus.vectors_url OR vectors_path into
     corpus.releasedVectors=true — the declaration the initializer waits on
@@ -330,7 +356,114 @@ def test_the_site_declares_released_vectors_to_the_initializer(tmp_path):
         assert json.loads(scripts["data"]["initializer.json"])["released_vectors"] is (flag == "true")
 
 
+def _helm_skips(item):
+    marks = getattr(item, "pytestmark", [])
+    return [m for m in (marks if isinstance(marks, list) else [marks])
+            if m.name == "skipif" and "helm" in m.kwargs.get("reason", "")]
+
+
+def _web_skips(item):
+    marks = getattr(item, "pytestmark", [])
+    return [m for m in (marks if isinstance(marks, list) else [marks]) if m == needs_web.mark]
+
+
+def test_only_the_tests_that_read_the_pinned_product_skip_without_it_and_only_those_that_render_it_without_helm():
+    """A runner without helm still holds every contract no render needs, the
+    previous release's site continuity above all: it reads Git and runs jq.
+    The helm skip sits on each test that renders, never on the module. A
+    public runner has no product: the product skip sits on each test that
+    reads the pinned product -- its files, its chart or a render of it --
+    and on no other, so a test of the installer's own files runs there."""
+    assert _helm_skips(sys.modules[__name__]) == [], "the module skips every test on a runner without helm"
+    assert _web_skips(sys.modules[__name__]) == [], "the module skips every test on a runner without the product"
+    for name, test in sorted(globals().items()):
+        if name.startswith("test_"):
+            source = inspect.getsource(test)
+            renders = re.search(r"\brendered\(|\bhelm\b.*\btemplate\b", source) is not None
+            assert bool(_helm_skips(test)) == renders, name
+            reads = re.search(r"\bpinned_web\.|\brendered\(|\bchart\(\)|\bshow\(", source) is not None
+            assert bool(_web_skips(test)) == reads, name
+
+
 def test_the_contract_document_names_this_module_and_the_pin_test():
     text = (INSTALLER / "CONTRACT.md").read_text()
     assert "tests/test_contract.py" in text and "tests/test_web_pin.py" in text
     assert "chart/INSTALLER-CONTRACT.md" in text and "ops/installer/CONTRACT.md" in text
+
+
+# ---- a site written for the previous release keeps its meaning ---------------
+
+PREVIOUS = "v0.10.0-beta.6"
+# A site shaped like a customer's own: an ingress controller and a certificate
+# they already run, local-path storage pinned to a node with its own staging
+# directory, a registry credential Secret, both model endpoints, released vectors.
+CUSTOMER = {
+    "schema_version": "gsj.site/1",
+    "target": {"context": "customer-cluster", "namespace": "legal-cases", "release": "gsj"},
+    "public_url": "https://cases.customer.example",
+    "operator": {"login": "operator", "password_file": "credentials/operator-password"},
+    "llm": {"base_url": "https://llm.customer.example/v1", "model": "their-model",
+            "credential": {"secret": "llm-api-key"}, "allowed_origins": ["https://llm.customer.example"]},
+    "ocr": {"url": "https://ocr.customer.example/v1/chat/completions", "model": "glm-ocr",
+            "credential": {"file": "credentials/ocr-key"}},
+    "storage": {"profile": "reuse", "class": "local-path", "node": "worker-3", "transfer_path": "/data/gsj-transfer"},
+    "ingress": {"profile": "reuse", "class": "nginx", "namespace": "ingress-nginx"},
+    "tls": {"profile": "existing", "secret": "cases-tls"},
+    "registry": {"pull_secret": "customer-pull"},
+    "backup": {"directory": "/backups/gsj", "passphrase_file": "credentials/backup-passphrase"},
+    "corpus": {"vectors_url": "https://github.com/TUMLegalTech/gsj-decisions-corpus/releases/download/corpus-1.snowflake-m-v2-int8-768.13c5dee7/vectors.json",
+               "vectors_sha256": "b3281726c7ddac5258674c19f9d64180bfec1d820c428ab164b93e2a2f292692"},
+}
+CONTINUITY = [*EXAMPLES, "customer"]
+
+
+def _previous_installer(tmp_path):
+    """The previous release's defaults, schema and validator, read from its tag."""
+    git = shutil.which("git")
+    if git is None or subprocess.run([git, "-C", str(ROOT), "rev-parse", "--verify", "--quiet", PREVIOUS + "^{commit}"],
+                                     capture_output=True).returncode != 0:
+        pytest.skip(f"the previous release's tag {PREVIOUS} is not in this Git directory "
+                    "(a shallow clone; the tests workflow checks out the whole history)")
+    files = tmp_path / PREVIOUS
+    files.mkdir()
+    for name in ("defaults.json", "site.schema.json", "validate.jq"):
+        shown = subprocess.run([git, "-C", str(ROOT), "show", f"{PREVIOUS}:ops/installer/{name}"],
+                               capture_output=True, check=True)
+        (files / name).write_bytes(shown.stdout)
+    return files
+
+
+def _merge(defaults, site):
+    """The runtime's merge, byte for byte: `jq -s '.[0] * .[1]' defaults site`."""
+    return subprocess.run(["jq", "-s", ".[0] * .[1]", str(defaults), str(site)], capture_output=True, check=True).stdout
+
+
+def _validate(files, merged_bytes):
+    """The runtime's validation of a merged site: the bytes it keeps as the site, or the refusal."""
+    return subprocess.run(["jq", "--slurpfile", "schema", str(files / "site.schema.json"), "-f", str(files / "validate.jq")],
+                          input=merged_bytes, capture_output=True)
+
+
+@pytest.mark.parametrize("example", CONTINUITY, ids=[getattr(p, "name", p) for p in CONTINUITY])
+def test_a_site_written_for_the_previous_release_means_the_same_under_this_one(tmp_path, example):
+    """A site file the previous release accepted must keep working unchanged:
+    merged over the previous defaults it validates here; the target, operator
+    and storage an upgrade compares are the same under either release's
+    defaults; and the site the runtime keeps is the same bytes under both."""
+    previous = _previous_installer(tmp_path)
+    site = example
+    if example == "customer":
+        site = tmp_path / "customer.site.json"
+        site.write_text(json.dumps(CUSTOMER))
+    before = _merge(previous / "defaults.json", site)
+    now = _merge(INSTALLER / "defaults.json", site)
+    admitted = _validate(INSTALLER, before)
+    assert admitted.returncode == 0, admitted.stderr.decode()
+    identity = subprocess.run(["jq", "-n", "--argjson", "before", before, "--argjson", "now", now,
+                               "[$before, $now] | map({target, operator, storage}) | .[0] == .[1]"],
+                              capture_output=True, text=True, check=True)
+    assert identity.stdout.strip() == "true", "the target, operator or storage an upgrade compares moved"
+    kept_before, kept_now = _validate(previous, before), _validate(INSTALLER, now)
+    assert kept_before.returncode == 0 and kept_now.returncode == 0, (kept_before.stderr, kept_now.stderr)
+    assert before == now, "the merged site differs between the two releases' defaults"
+    assert kept_before.stdout == kept_now.stdout, "the validated site differs between the two releases"

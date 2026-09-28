@@ -98,7 +98,7 @@ def test_the_installed_library_is_at_the_core_tag_the_product_ships():
 
 @needs_web
 def test_the_pinned_initializer_and_corpus_sources_are_qualified_runtimes():
-    """Review finding B1: startup-runtime-preflight.py admits a source
+    """A review finding: startup-runtime-preflight.py admits a source
     Pod's runtime only when the sha256 pair of ITS initialize.py and corpus.py
     is registered in QUALIFIED_SOURCE_RUNTIMES -- and the review found the
     next product's initializer unregistered, so the combined release's gate

@@ -3,8 +3,10 @@
 These tests exercise the shipped Bash ownership/phase protocol. Actual archive
 extraction and killed file writers are tested separately by restore-files.
 """
+import ast
 import json
 import hashlib
+import os
 
 import pytest
 
@@ -330,3 +332,367 @@ def test_owned_pod_refuses_unsupported_or_inexact_quantities_even_when_identical
     from copy import deepcopy
     want=_quantity_pod();want['spec']['containers'][0]['resources']['limits'][resource]=value
     assert _compare_quantities(runtime,want,deepcopy(want)).returncode!=0
+
+
+# --- the transfer directory has room for the decrypted archive before the stream ----
+
+GIB = 1024 ** 3
+
+
+def _staging(runtime, tmp_path, transfer, free, size=1000, total=GIB, shared=False, floor=None):
+    """restore_files up to its stream: the Pod is Ready, the writers and the
+    bindings are proven, and the fake exec answers the measurement -- free
+    bytes, the filesystem's size, and whether /transfer shares its filesystem
+    with an application volume. The default filesystem is small enough that
+    its 15 % never decides the margin."""
+    run, state, work = runtime
+    site = json.loads((work / "site.json").read_text())
+    site["storage"]["transfer_path"] = transfer
+    if floor is not None:
+        site["storage"]["minimum_free_bytes"] = floor
+    (work / "site.json").write_text(json.dumps(site))
+    (work / "values.pending.json").write_text(json.dumps({
+        "image": {"pullSecrets": []}, "storage": {key: {"existingClaim": ""} for key in ("data", "forgejo", "chroma")}}))
+    (work / "restoration.json").write_text(json.dumps({"archive_sha256": "c" * 64}))
+    archive = tmp_path / "archive.enc"
+    archive.write_bytes(b"")
+    os.truncate(archive, size)      # sparse: its length is all the check reads
+    cluster = json.loads(state.read_text())
+    answer = f"{free} {total} {int(shared)}\n" if free != "" else ""
+    cluster.update(resources={}, calls=[], exec_rules=[{"match": "statvfs", "stdout": answer}])
+    state.write_text(json.dumps(cluster))
+    result = run(f'''OPERATION={"a" * 24}; ARCHIVE="$TEST_ARCHIVE"; BACKUP_PASSWORD="$TEST_ARCHIVE"
+trap 'echo "HINT=${{RECOVERY_HINT:-}}" >&2' EXIT
+restore_resource() {{ :; }}; restore_no_writers() {{ :; }}; restore_bindings() {{ :; }}; assert_owner() {{ :; }}
+restore_files synthetic-restore synthetic-release registry.invalid/web@sha256:{"e" * 64}
+''', TEST_ARCHIVE=str(archive))
+    return result, json.loads(state.read_text())["calls"]
+
+
+def _streamed(calls):
+    return [c for c in calls if c[:2] == ["exec", "-i"]]
+
+
+@pytest.mark.parametrize("transfer, where", [
+    ("/data/gsj-install/transfer", "/data/gsj-install/transfer/" + "a" * 24 + " on node synthetic-node"),
+    ("", "emptyDir on node synthetic-node's own filesystem"),
+])
+def test_a_transfer_directory_without_room_for_the_archive_is_refused_before_the_stream(runtime, tmp_path, transfer, where):
+    """restore_files streamed the decrypted archive into /transfer without
+    asking whether it fits; a full node disk would end the stream partway,
+    after all the time the transfer took."""
+    result, calls = _staging(runtime, tmp_path, transfer, free=268435456)
+    assert result.returncode != 0
+    assert _streamed(calls) == [], "refused before a byte was streamed"
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert refusal.startswith("GSJ: restore staging space is insufficient"), refusal
+    assert where in refusal
+    # the encrypted archive is 1000 bytes; the margin is the larger of 256 MiB and a tenth of it
+    assert "268435456 bytes free" in refusal and str(1000 + 268435456) in refusal
+    assert "nothing was streamed" in refusal
+    assert any(c[:1] == ["exec"] and "statvfs" in " ".join(c) for c in calls), "measured inside the Pod"
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith("restore-repair --operation " + "a" * 24), hint
+
+
+def test_a_tenth_of_a_large_archive_is_the_margin(runtime, tmp_path):
+    size = 3 * 1024 ** 3                                  # a tenth of it is more than 256 MiB
+    result, calls = _staging(runtime, tmp_path, "/data/gsj-install/transfer", free=size + 268435456, size=size)
+    assert result.returncode != 0
+    assert _streamed(calls) == []
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert str(size + size // 10) in refusal, refusal
+
+
+def test_a_transfer_directory_with_room_is_streamed_into(runtime, tmp_path):
+    result, calls = _staging(runtime, tmp_path, "/data/gsj-install/transfer", free=1000 + 268435456)
+    assert "restore staging space" not in result.stderr
+    assert len(_streamed(calls)) == 1, "the measurement admitted the stream"
+
+
+def test_an_unmeasured_transfer_directory_is_refused_before_the_stream(runtime, tmp_path):
+    result, calls = _staging(runtime, tmp_path, "/data/gsj-install/transfer", free="")
+    assert result.returncode != 0
+    assert _streamed(calls) == []
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert refusal.startswith("GSJ: restore staging space is unmeasured"), refusal
+    assert "nothing was streamed" in refusal
+
+def _refusal(result):
+    return next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+
+
+def test_fifteen_percent_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path):
+    """An emptyDir lives on the node's root filesystem, where the kubelet
+    evicts Pods by default below 10 % free (nodefs.available) and, where the
+    images share that filesystem as on a single-disk node, below 15 %
+    (imagefs.available): an archive that fit with 256 MiB to spare could push
+    the node under that line and get the restore Pod evicted after the whole
+    transfer. A tenth kept free was still under the image line. What stays
+    free after the stream is at least 15 % of the filesystem."""
+    transfer, total, size = "", 100 * GIB, 1000
+    margin = total * 15 // 100
+    result, calls = _staging(runtime, tmp_path, transfer, free=size + margin - 1, total=total, size=size)
+    assert result.returncode != 0
+    assert _streamed(calls) == [], "refused before a byte was streamed"
+    refusal = _refusal(result)
+    assert refusal.startswith("GSJ: restore staging space is insufficient"), refusal
+    assert f"a margin of {margin}" in refusal and str(size + margin) in refusal, refusal
+    assert f"15 % of the filesystem's {total} bytes" in refusal, refusal
+    assert "eviction thresholds" in refusal and "imagefs.available" in refusal, refusal
+    result, calls = _staging(runtime, tmp_path, transfer, free=size + margin, total=total, size=size)
+    assert "restore staging space" not in result.stderr
+    assert len(_streamed(calls)) == 1
+
+
+HOST_PATH = "/data/gsj-install/transfer"
+
+
+def test_a_transfer_hostpath_is_not_held_to_a_share_of_its_filesystem(runtime, tmp_path):
+    """The kubelet's eviction thresholds watch the node's root filesystem,
+    where an emptyDir lives. storage.transfer_path is a directory the operator
+    chose, a dedicated data disk among others: a share of that disk kept free
+    refused restores that fit. There the least margin and a tenth of the
+    archive hold, and nothing about the filesystem's size."""
+    total, size = 2000 * GIB, 1000
+    result, calls = _staging(runtime, tmp_path, HOST_PATH, free=size + 268435456, total=total, size=size)
+    assert "restore staging space" not in result.stderr, _refusal(result)
+    assert len(_streamed(calls)) == 1, "the least margin admitted the stream"
+    result, calls = _staging(runtime, tmp_path, HOST_PATH, free=size + 268435456 - 1, total=total, size=size)
+    assert result.returncode != 0 and _streamed(calls) == []
+    refusal = _refusal(result)
+    assert "a margin of 268435456: 256 MiB, the least margin" in refusal, refusal
+    assert "of the filesystem's" not in refusal and "eviction" not in refusal, refusal
+
+
+@pytest.mark.parametrize("size, total, shared, floor, named", [
+    (1000, 100 * GIB, False, None, "256 MiB, the least margin"),
+    (3 * GIB, 100 * GIB, False, None, "a tenth of the archive"),
+    (1000, 100 * GIB, True, 20 * GIB, "storage.minimum_free_bytes"),
+    (30 * GIB, 100 * GIB, True, GIB, "a tenth of the archive"),       # a floor below the archive's tenth does not decide
+], ids=["least", "archive", "site-floor", "floor-below-the-archive"])
+def test_a_transfer_hostpath_refusal_names_only_the_floor_that_applied(runtime, tmp_path, size, total, shared, floor, named):
+    """On a hostPath the floors are the least margin, a tenth of the archive and,
+    on the application volumes' filesystem, storage.minimum_free_bytes: the
+    refusal names the one that decided and never the filesystem's share."""
+    result, calls = _staging(runtime, tmp_path, HOST_PATH, free=1000, total=total, size=size, shared=shared, floor=floor)
+    assert result.returncode != 0 and _streamed(calls) == []
+    refusal = _refusal(result)
+    assert named in refusal, refusal
+    for other in {"256 MiB, the least margin", "a tenth of the archive", "15 % of the filesystem's", "storage.minimum_free_bytes"} - {named}:
+        assert other not in refusal, (other, refusal)
+    margin = {"256 MiB, the least margin": 268435456, "a tenth of the archive": size // 10, "storage.minimum_free_bytes": floor}[named]
+    assert f"needs {size + margin} (" in refusal, refusal
+
+
+def test_a_transfer_directory_on_the_volumes_filesystem_leaves_the_sites_free_space_floor(runtime, tmp_path):
+    """/transfer on the filesystem the restored volumes live on: the stream
+    spends the room the application needs there, which the backup's capacity
+    check keeps at storage.minimum_free_bytes. The same floor holds here."""
+    total, size, floor = 100 * GIB, 1000, 20 * GIB
+    result, calls = _staging(runtime, tmp_path, "", free=size + 15 * GIB, total=total, size=size, shared=True, floor=floor)
+    assert result.returncode != 0
+    assert _streamed(calls) == []
+    refusal = _refusal(result)
+    assert f"a margin of {floor}" in refusal and str(size + floor) in refusal, refusal
+    assert "storage.minimum_free_bytes" in refusal, refusal
+    # the same room on a filesystem of its own is enough: the floor is the volumes'
+    result, calls = _staging(runtime, tmp_path, "", free=size + 15 * GIB, total=total, size=size, shared=False, floor=floor)
+    assert "restore staging space" not in result.stderr and len(_streamed(calls)) == 1
+    result, calls = _staging(runtime, tmp_path, "", free=size + floor, total=total, size=size, shared=True, floor=floor)
+    assert "restore staging space" not in result.stderr and len(_streamed(calls)) == 1
+
+
+@pytest.mark.parametrize("size, total, shared, floor, named", [
+    (1000, GIB, False, None, "256 MiB, the least margin"),
+    (3 * GIB, GIB, False, None, "a tenth of the archive"),
+    (1000, 100 * GIB, False, None, "15 % of the filesystem's"),
+    (1000, 100 * GIB, True, 20 * GIB, "storage.minimum_free_bytes"),
+    (1000, 100 * GIB, True, 12 * GIB, "15 % of the filesystem's"),    # a floor below the 15 % does not decide
+], ids=["least", "archive", "filesystem", "site-floor", "floor-below-the-share"])
+def test_the_refusal_names_the_floor_that_decided_the_margin(runtime, tmp_path, size, total, shared, floor, named):
+    result, calls = _staging(runtime, tmp_path, "", free=1000, total=total, size=size, shared=shared, floor=floor)
+    assert result.returncode != 0 and _streamed(calls) == []
+    refusal = _refusal(result)
+    assert named in refusal, refusal
+    for other in {"256 MiB, the least margin", "a tenth of the archive", "15 % of the filesystem's", "storage.minimum_free_bytes"} - {named}:
+        assert other not in refusal, (other, refusal)
+
+
+def test_the_measurement_reads_the_filesystem_size_and_the_volumes_filesystem_ids(runtime, tmp_path):
+    """The filesystem measured is the one /transfer is on: the free bytes, the
+    size and the filesystem id the three volumes' ids are compared with all
+    come from one os.statvfs("/transfer"). The words alone were held before:
+    a program that measured "/" instead, or compared the volumes' ids with
+    another filesystem's, printed three numbers and passed."""
+    result, calls = _staging(runtime, tmp_path, "", free=GIB, total=2 * GIB)
+    call = next(c for c in calls if c[:1] == ["exec"] and "statvfs" in " ".join(c))
+    command = " ".join(call)
+    assert "f_blocks" in command and "f_fsid" in command, command
+    for mount in ("/volumes/gsj", "/volumes/forgejo", "/volumes/chroma"):
+        assert mount in command, command
+    program = ast.parse(call[call.index("-c") + 1])
+
+    def statvfs_of(node):
+        return (isinstance(node, ast.Call) and ast.unparse(node.func) == "os.statvfs"
+                and len(node.args) == 1 and not node.keywords and node.args[0])
+    measured = [node.targets[0].id for node in ast.walk(program)
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and isinstance(statvfs_of(node.value), ast.Constant) and statvfs_of(node.value).value == "/transfer"]
+    assert len(measured) == 1, ast.unparse(program)
+    t = measured[0]
+    printed = [node for node in ast.walk(program) if isinstance(node, ast.Call) and ast.unparse(node.func) == "print"]
+    assert len(printed) == 1 and len(printed[0].args) == 3, ast.unparse(program)
+    free, total, shared = (ast.unparse(arg) for arg in printed[0].args)
+    assert free == f"{t}.f_bavail * {t}.f_frsize" and total == f"{t}.f_blocks * {t}.f_frsize", (free, total)
+    # the one comparison: a volume's filesystem id with the id of that same measurement
+    compared = [node for node in ast.walk(printed[0].args[2]) if isinstance(node, ast.Compare)]
+    assert len(compared) == 1 and [type(op) for op in compared[0].ops] == [ast.Eq], shared
+    left, right = compared[0].left, compared[0].comparators[0]
+    volume = right if ast.unparse(left) == f"{t}.f_fsid" else left
+    assert f"{t}.f_fsid" in (ast.unparse(left), ast.unparse(right)), shared
+    assert isinstance(volume, ast.Attribute) and volume.attr == "f_fsid", shared
+    assert isinstance(statvfs_of(volume.value), ast.Name), shared
+    loop = next(node for node in ast.walk(printed[0].args[2]) if isinstance(node, ast.comprehension))
+    assert ast.unparse(loop.target) == statvfs_of(volume.value).id, shared
+    assert ast.literal_eval(loop.iter) == ("/volumes/gsj", "/volumes/forgejo", "/volumes/chroma"), shared
+
+
+
+PRIOR = "b" * 24
+
+
+def _prior_restore(work, checkpoint, canonical):
+    """The site directory of a deployment an earlier restore made: its
+    checkpoint, and the canonical record as abandon, sweep or a later
+    operation left it (None: no canonical record at all)."""
+    (work / "restoration.json").write_text(json.dumps({
+        "format": "gsj.restore/1", "archive": "/earlier/snapshot.tar.gz.enc", "archive_sha256": "e" * 64,
+        "operation": PRIOR, "release_identity": "synthetic-release", "target_namespace_uid": "replaced-namespace-uid",
+        "status": checkpoint}))
+    if canonical is None:
+        return
+    operation, status = canonical
+    (work / "operation.json").write_text(json.dumps({"operation": operation, "kind": "restore",
+                                                     "target": "synthetic-release", "status": status}))
+    if status == "abandoned":
+        (work / f"abandoned-{operation}.json").write_text(json.dumps({"format": "gsj.operation-abandoned/1", "operation": operation}))
+    if status == "swept":
+        (work / f"swept-20260101T000000Z-{operation}.json").write_text(json.dumps({"format": "gsj.target-swept/1"}))
+
+
+@pytest.mark.parametrize("canonical", [(PRIOR, "complete"), (PRIOR, "abandoned"), (PRIOR, "swept"), ("c" * 24, "backup-complete")])
+def test_a_fresh_restore_retires_the_completed_checkpoint_of_an_ended_restore(runtime, tmp_path, canonical):
+    # One cluster: the namespace was deleted and is restored again from the
+    # same site directory, where the restore that made the deployment left its
+    # completed checkpoint. Retired beside that operation's evidence, it no
+    # longer refuses the fresh restore, which records its own.
+    invoke, _ = _restore_fixture(runtime, tmp_path)
+    _, state, work = runtime
+    _prior_restore(work, "complete", canonical)
+    original = (work / "restoration.json").read_bytes()
+    result = invoke()
+    assert result.returncode == 0, result.stderr
+    retired = work / f"restore-{PRIOR}" / "retired-restoration.json"
+    assert retired.read_bytes() == original
+    assert f"Retired the completed restore checkpoint of ended operation {PRIOR}" in result.stderr
+    current = json.loads((work / "restoration.json").read_text())
+    assert current["operation"] not in (PRIOR, "c" * 24) and current["status"] == "complete"
+    assert json.loads((work / "operation.json").read_text())["operation"] == current["operation"]
+
+
+@pytest.mark.parametrize("checkpoint,canonical", [
+    ("files-restored", (PRIOR, "verifying")),   # an unfinished restore whose operation has not ended
+    ("restoring-files", None),
+    ("complete", (PRIOR, "verifying")),         # its operation has not ended
+    ("complete", None),                         # nothing proves it ended
+])
+def test_any_other_restore_checkpoint_still_refuses_a_fresh_restore(runtime, tmp_path, checkpoint, canonical):
+    invoke, _ = _restore_fixture(runtime, tmp_path)
+    _, state, work = runtime
+    _prior_restore(work, checkpoint, canonical)
+    original = (work / "restoration.json").read_bytes()
+    result = invoke()
+    assert result.returncode != 0
+    assert "restore checkpoint already exists; use restore-repair --operation ID" in result.stderr, result.stderr
+    assert (work / "restoration.json").read_bytes() == original
+    assert not (work / f"restore-{PRIOR}").exists()
+    assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
+                   for call in json.loads(state.read_text())["calls"])
+
+
+@pytest.mark.parametrize("checkpoint,ended", [("files-restored", "abandoned"), ("restoring-files", "swept")])
+def test_the_unfinished_checkpoint_of_an_ended_restore_names_a_fresh_restore_from_a_new_site_directory(runtime, tmp_path, checkpoint, ended):
+    """The unfinished checkpoint of a restore the operator has since abandoned
+    or swept still refuses a fresh restore from its site directory -- it is
+    that operation's own evidence -- but the refusal named restore-repair and
+    resume, and both refuse an ended operation. It names the route that is
+    left: this site directory kept as it is, and a restore from a new one.
+    abandon refuses an ended operation too, so that route starts at the
+    uninstall."""
+    invoke, _ = _restore_fixture(runtime, tmp_path)
+    _, state, work = runtime
+    _prior_restore(work, checkpoint, (PRIOR, ended))
+    original = (work / "restoration.json").read_bytes()
+    result = invoke()
+    assert result.returncode != 0
+    route = ("into an empty namespace synthetic-namespace from a new site directory: on another cluster, or on this one "
+             "once the deployment is removed (helm -n synthetic-namespace uninstall synthetic-release, sweep, "
+             "then delete namespace synthetic-namespace)")
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert "abandon --operation" not in refusal, refusal
+    assert refusal == (f"GSJ: restore checkpoint already exists for operation {PRIOR}, which was {ended} before its restore "
+                       f"completed, so restore-repair and resume refuse it; keep this site directory as it is, and restore {route}"), refusal
+    assert "use restore-repair" not in result.stderr
+    assert (work / "restoration.json").read_bytes() == original
+    assert not (work / f"restore-{PRIOR}").exists()
+    assert not any(call[0] in ("create", "replace", "apply", "delete", "scale", "exec", "patch", "label")
+                   for call in json.loads(state.read_text())["calls"])
+
+
+def test_the_fresh_restore_refusal_names_both_routes_for_one_cluster(runtime):
+    # Most sites have one cluster: the empty namespace is on another cluster,
+    # or this one recreated once the deployment is removed; a new site
+    # directory either way, keeping the retained operation's as it is.
+    run, _, work = runtime
+    operation = "a" * 24
+    result = run(f'''OPERATION={operation}; LEASE_ACQUIRED=true; GSJ_WORK="$TEST_WORK/throwaway"; mkdir -p "$GSJ_WORK"
+install_exit_traps
+restore_fresh_fail 'the restored evidence changed'
+''')
+    assert result.returncode != 0
+    route = ("into an empty namespace synthetic-namespace from a new site directory: on another cluster, or on this one "
+             f"once the deployment is removed (abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release, sweep, "
+             "then delete namespace synthetic-namespace)")
+    fresh = "its verified archive with the exact source installer"
+    assert (f"GSJ: the restored evidence changed; keep operation {operation} retained with this site directory as it is, "
+            f"and restore {fresh} {route}\n") in result.stderr, result.stderr
+    assert (f"Use restore of {fresh} {route}; keep operation {operation} retained with this site directory as it is."
+            ) in result.stderr, result.stderr
+    assert "Kubernetes context" not in result.stderr
+    assert "managed add-ons" not in result.stderr, "this site selects none"
+
+
+@pytest.mark.parametrize("key, profile", [("ingress", "managed-traefik"), ("tls", "managed-acme"), ("storage", "managed-local-path")])
+def test_the_one_cluster_route_removes_the_managed_add_ons_a_recreated_namespace_would_refuse(runtime, key, profile):
+    """Each managed add-on's owner record hashes the namespace's uid: once the
+    namespace is deleted and made again, the restore's add-on step refuses
+    the add-ons the old identity owns. The route named only the application's
+    release, and spelled its uninstall without the namespace it lives in. The
+    steps run in the guide's order: abandon, the uninstall, sweep, the
+    namespace, and last the add-ons with their CRDs."""
+    run, _, work = runtime
+    site = json.loads((work / "site.json").read_text())
+    site[key]["profile"] = profile
+    (work / "site.json").write_text(json.dumps(site))
+    operation = "a" * 24
+    result = run(f'''OPERATION={operation}; LEASE_ACQUIRED=true; GSJ_WORK="$TEST_WORK/throwaway"; mkdir -p "$GSJ_WORK"
+install_exit_traps
+restore_fresh_fail 'the restored evidence changed'
+''')
+    assert result.returncode != 0
+    route = (f"(abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release, sweep, "
+             "delete namespace synthetic-namespace, then remove its managed add-ons and their CRDs (see the guide))")
+    refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert route in refusal, refusal
+    assert route in result.stderr.rsplit("Use restore of", 1)[1], "the closing line names the same route"

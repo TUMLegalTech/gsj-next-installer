@@ -70,6 +70,8 @@ capacity_qualify() {{ :; }}
 capacity_scan_pod() {{ :; }}
 backup_credential_fingerprint() {{ printf '%064d\\n' 0; }}
 maintenance_pod() {{ :; }}
+# the image pull probe runs for every site; test_installer_registry_base.py drives it
+relocated_images_probe() {{ :; }}
 offbox_backup() {{ :; }}
 backup_resources() {{ for f in cluster-private.json volumes-private.json site_inputs.json; do printf '{{}}' > "$GSJ_WORK/$f"; done; }}
 secret_inputs() {{ printf 'secrets\\n' >> "$STATE_DIR/actions"; }}

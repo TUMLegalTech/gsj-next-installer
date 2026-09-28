@@ -16,6 +16,8 @@ import tarfile
 
 import pytest
 
+from tests.pinned_web import chart, needs_web
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "ops/installer"
@@ -693,6 +695,10 @@ def _restore_fixture(runtime, tmp_path, damage=None, fallback=False, password_ne
 SITE="$TEST_WORK/target-site.json"; GSJ_PAYLOAD="$TEST_PAYLOAD"
 ARCHIVE="$TEST_ARCHIVE"; BACKUP_PASSWORD="$TEST_BACKUP_PASSWORD"; OP_PASSWORD="$TEST_WORK/operator-password"
 managed_dependencies() { :; }
+# The image pull probe runs for every site and polls its Pod's container
+# statuses, which this fake does not serve; test_installer_registry_base.py
+# drives it.
+relocated_images_probe() { :; }
 # This fixture tests Kubernetes/credential reconciliation. File extraction and
 # its killed-process replay are exercised with real archives in their own tests.
 restore_files() {
@@ -980,14 +986,17 @@ def test_acquire_refuses_a_running_or_backing_off_initializer(runtime, status, r
         assert lease["spec"]["holderIdentity"]
 
 
+# the Pods are this release's own: each one's controller is the ReplicaSet
+# below, whose controller is the Deployment the wait reads (by name and uid)
 _WAIT_BODY = '''OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; CONFIG=/secure/site.json
 assert_owner() { :; }; helm_application_validate() { :; }; sleep() { :; }
 k() {
  case "$1 $2" in
   "get deploy")
-   if [[ -f $TEST_WORK/ready ]]; then printf '%s' '{"metadata":{"generation":1},"status":{"observedGeneration":1,"updatedReplicas":1,"availableReplicas":1,"readyReplicas":1}}'
-   else touch "$TEST_WORK/ready"; printf '%s' '{"metadata":{"generation":1},"status":{}}'; fi;;
+   if [[ -f $TEST_WORK/ready ]]; then printf '%s' '{"metadata":{"generation":1,"uid":"synthetic-deploy-uid"},"status":{"observedGeneration":1,"updatedReplicas":1,"availableReplicas":1,"readyReplicas":1}}'
+   else touch "$TEST_WORK/ready"; printf '%s' '{"metadata":{"generation":1,"uid":"synthetic-deploy-uid"},"status":{}}'; fi;;
   "get pods") cat "$TEST_WORK/pods.json";;
+  "get replicasets") [[ $3 == synthetic-web-rs ]] && printf '%s' '{"metadata":{"name":"synthetic-web-rs","uid":"synthetic-web-rs-uid","ownerReferences":[{"kind":"Deployment","name":"synthetic-release-web","uid":"synthetic-deploy-uid","controller":true}]}}';;
   *) :;;
  esac
 }
@@ -999,7 +1008,8 @@ def _initializer_pods(name, state, last=None, deleting=False):
     status = {"name": name, "state": state}
     if last is not None:
         status["lastState"] = {"terminated": {"exitCode": 1, "message": last}}
-    metadata = {"name": "synthetic-web"}
+    metadata = {"name": "synthetic-web", "uid": "synthetic-web-uid",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "synthetic-web-rs", "uid": "synthetic-web-rs-uid", "controller": True}]}
     if deleting:
         metadata["deletionTimestamp"] = "2026-09-14T00:00:00Z"
     return {"items": [{"metadata": metadata, "status": {"phase": "Pending", "initContainerStatuses": [status]}}]}
@@ -1067,6 +1077,25 @@ initializer_stop deadline-exceeded
 ''')
     assert result.returncode != 0
     assert "Use repair --operation aaaaaaaaaaaaaaaaaaaaaaaa --config /secure/site.json --non-interactive." in result.stderr
+    assert "Use resume" not in result.stderr
+
+
+@pytest.mark.parametrize("kind", ["install", "upgrade"])
+def test_a_failed_helm_apply_names_repair_instead_of_resume_on_exit(runtime, kind):
+    """A failed install or upgrade apply stops in phase applying, where resume
+    refuses (the target Helm revision has not completed) and repair re-applies
+    the saved target: the closing line names repair, as a restore's did."""
+    run, _, work = runtime
+    (work / "operation.json").write_text(json.dumps({"operation": "a" * 24, "kind": kind, "target": "synthetic-release", "status": "applying"}))
+    result = run('''GSJ_WORK="$TEST_WORK/throwaway"; mkdir -p "$GSJ_WORK"
+OPERATION=aaaaaaaaaaaaaaaaaaaaaaaa; CONFIG=/secure/site.json; LEASE_ACQUIRED=true; GSJ_PAYLOAD=/synthetic/payload
+install_exit_traps
+assert_owner() { :; }; sleep() { :; }; read_installed() { :; }; stage_operation_config() { :; }; helm_application_prepare() { :; }
+helm() { printf 'Error: UPGRADE FAILED: synthetic\\n' >&2; return 1; }
+helm_apply
+''')
+    assert result.returncode == 1 and "Helm provisioning failed" in result.stderr and "unbound variable" not in result.stderr, result.stderr
+    assert "Use repair --operation aaaaaaaaaaaaaaaaaaaaaaaa --config /secure/site.json --non-interactive after fixing the cause." in result.stderr, result.stderr
     assert "Use resume" not in result.stderr
 
 
@@ -1448,6 +1477,9 @@ k() {
    esac;;
  esac
 }
+# the site's other references are read by preflight_site_checks, pinned in
+# test_installer_preflight_checks.py; this body answers every Secret with the pull Secret
+preflight_site_checks() { :; }
 preflight
 '''
 
@@ -1458,7 +1490,14 @@ preflight
     ({"type": "kubernetes.io/dockerconfigjson", "data": {}}, "", "install", False),
     ({"type": "kubernetes.io/dockerconfigjson", "data": {".dockerconfigjson": "e30="}}, "", "install", True),
     (None, "registry.json", "install", True),
+    # a restore recreates the pull Secret; sweep and abandon clear what a dead
+    # run left, even after the namespace (and an operator-made pull Secret in
+    # it) is gone; lease-repair restores a Lease's holder. None pulls an image.
     (None, "", "restore", True),
+    (None, "", "restore-repair", True),
+    (None, "", "sweep", True),
+    (None, "", "abandon", True),
+    (None, "", "lease-repair", True),
 ])
 def test_referenced_pull_secret_is_checked_read_only_before_mutation(runtime, secret, config_file, command, accepted):
     run, _, work = runtime
@@ -1475,7 +1514,7 @@ def test_referenced_pull_secret_is_checked_read_only_before_mutation(runtime, se
         assert "registry.pull_secret must name an existing image pull Secret" in result.stderr
     assert "c3ludGhldGlj" not in result.stdout + result.stderr
     reads = (work / "secret-reads").read_text().split() if (work / "secret-reads").exists() else []
-    assert reads == ([] if config_file or command == "restore" else ["registry-auth"])
+    assert reads == ([] if config_file or command != "install" else ["registry-auth"])
 
 
 def test_trust_bundle_uses_the_system_probe_and_never_the_download_override(runtime, tmp_path):
@@ -1623,7 +1662,7 @@ def test_success_summary_reports_identity_status_and_redacted_settings(runtime):
                                        "skipped": [], "endpoints": {}, "public_https": "passed", "networkpolicy": "passed"}
     assert summary["settings"]["operator"]["password_file"] == "(protected file)"
     assert summary["settings"]["llm"]["credential"] == {"file": "(protected file)", "secret": ""}
-    assert summary["settings"]["llm"]["base_url"] == "https://llm.example"      # the origin: review B2
+    assert summary["settings"]["llm"]["base_url"] == "https://llm.example"      # the origin, never the path
     assert "/secure/" not in result.stdout + result.stderr
     assert summary["installed_record"] == str(work / "installed.json")
     assert summary["verification_report"] == str(work / "verification.json")
@@ -1974,8 +2013,8 @@ def test_the_partial_closing_line_states_what_the_probe_established_per_reason(r
         assert f"answered HTTP {status}" in line, line
         for w in words: assert w in line, (status, w, line)
         for w in absent: assert w not in line, (status, w, line)
-    # an OCR endpoint that gave no HTTP answer at all: unreachable -- and nothing else (review finding M5:
-    # an HTTP or schema failure is never "unreachable")
+    # an OCR endpoint that gave no HTTP answer at all: unreachable -- and nothing else (an HTTP
+    # or schema failure is never "unreachable")
     line, summary = _partial_summary_run(runtime, {"llm": "working", "ocr": "unreachable"}, [
         {"name": "operator-login", "status": "passed"},
         {"name": "scanned-ingest-search", "status": "skipped", "reason": "ocr-unreachable"},
@@ -2198,19 +2237,197 @@ def test_a_site_file_with_a_byte_order_mark_is_refused_as_that(runtime, tmp_path
     assert "byte-order mark" in line and str(config) in line
 
 
+# The label families that have reached shipped text: review rounds, phase and
+# record names, and an address that names a machine. A reader of this public
+# repository, of the installer it ships or of the chart inside it can resolve
+# none of them. The product's reserved account name is legitimate prose (the
+# schema and the guide's login rules name it) and is deliberately not here.
+# An address is a dotted quad outside the ranges an example may use because
+# they reach no one's machine (unspecified, loopback, the private RFC 1918 and
+# the documentation RFC 5737 ranges), or four number groups, dotted or dashed,
+# that open a host name: a wildcard-DNS host, whatever address it carries.
+# A review's finding ids are an uppercase letter and digits: a bracketed
+# review note that ends in one, even left open on its line; a review, a
+# finding or a sweep named by one, bare or in parentheses; one anywhere inside
+# square brackets, a ruling number or range among them; and one with a dash
+# and digits after it anywhere. The letter is case-sensitive and the id a
+# word of its own, so a version, an architecture or a digest's name is not
+# one. A record's name is hyphenated upper-case words inside brackets; one
+# that is quoted (a value), carries a digit (an algorithm, a challenge) or
+# opens on a single letter (a header) is not.
+# A record's, a phase's or a pass's own name is one to three words joined by
+# a dash or a space, and is listed only by its SHA-256, so this public file
+# never spells one: NAMED_ANY in any case, NAMED_CAPS only as written in
+# capitals (in lower case the same words are the guide's prose).
+NAMED_ANY = frozenset({
+    "08dc27546298d9820b5f122897e69b2c3b3a580117f7fe7f12faf919ec96f99d",
+    "19ee4d9ebdf5210944ddbb525c2da1b9050155732f598f07641f7c3775659327",
+    "598b54324af74449ee621269e2f8500c1895523b4a6ac5fa4ee74145dea4c28f",
+    "59da401a19ff17caea8ed5c75bb61b99e53cb4786c0d91d03dc350fa17bd4ae3",
+    "62c7f50ae0cff9c65355789c23d549afd9316a2884ceb380cf65dcef1ae3e0df",
+    "7674e7036999e5d3fc1a97dc6a286af9aa064cd3dea8ac3f22072eba49a9631a",
+    "df7000677e186e4c75b46071a478fe5aa9e9db38e7c211c5f33b135163a3ca37",
+    "dfffdbbc291156195f81a0a145c14eb24bc181413cdd805eadb882285b75c050",
+    "ec55092b3c2cf9ab2538d8f425d98b38448f262030f00fd639ef4e1b4cd93242",
+    "fef0a7df684c624d51e011c0623e6bbe1948874babe94600123b51cd083ba450",
+})
+NAMED_CAPS = frozenset({
+    "6c5825c88c13ba107887f8ded7004e82c70cbc526a1cc0dc256fe23ed59ac1ae",
+    "9312f11cf8997c749a499045ccc974c1344e5ab98138374f0ee9c9c0b3c4f158",
+    "9e359102b540e3967488313b12ac3080a828562c399247cc19ee129fa9d852f9",
+    "afb783c15f7f1fa9b52b14c9450ead5d03c91671c1ec66cc5bfb713be0312248",
+    "ceeeabc893bfc8b35d97b150ab33283deb834f97cc27a2e994a9991c66e9d227",
+    "d1434510de44b539245b33edc5a00f8312aae028ec4ec0bcf45e0574499c5d0c",
+})
+# Every remaining alternative is spelled apart by concatenation or by escaped
+# dots, so this file never matches itself; the three scans below import this
+# one list and the digests above through internal_labels.
+INTERNAL_LABEL = re.compile(
+    "(?i:" + "|".join([r"\b(?!(?:0|10|127)\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)"
+                       r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}\b",
+                       r"\b[0-9]{1,3}(?:[.-][0-9]{1,3}){3}\.[a-z]"]) + ")|"
+    + "|".join([r"\bBETA" + "[0-9]", r"\bPATCH" + "-?[0-9]",
+                r"\[(?i:rev" + r"iew)(?:[ ,]+[A-Za-z]+)*[ ,]+[A-Z][0-9]+\b", r"\b(?i:rev" + r"iew)(?: (?i:finding|sweep))? [A-Z][0-9]+\b",
+                r"\[[^\]]*\b[A-Z]" + r"[0-9]+\b[^\]]*\]", r"\b[A-Z]" + r"[0-9]+-[0-9]+\b",
+                r"\[[^\]]*(?<![-\w'\"])[A-Z]{2,}(?:-[A-Z]" + r"{2,})+(?![-\w'\"])[^\]]*\]"]))
+
+
+_WORD = re.compile(r"[A-Za-z0-9]+")
+
+
+def named_label(line, any_case=NAMED_ANY, caps=NAMED_CAPS):
+    """Whether LINE carries a name listed by digest: every run of one to three
+    words that a single dash or space joins is hashed as written and in
+    capitals."""
+    words = list(_WORD.finditer(line))
+    for i in range(len(words)):
+        window = words[i].group()
+        for j in range(i, min(i + 3, len(words))):
+            if j > i:
+                gap = line[words[j - 1].end():words[j].start()]
+                if gap not in ("-", " "):
+                    break
+                window += gap + words[j].group()
+            if hashlib.sha256(window.upper().encode()).hexdigest() in any_case \
+                    or hashlib.sha256(window.encode()).hexdigest() in caps:
+                return True
+    return False
+
+
+def labelled(line):
+    return bool(INTERNAL_LABEL.search(line)) or named_label(line)
+
+
+def internal_labels(name, text):
+    """NAME:LINE for every line of TEXT that carries an internal label."""
+    return [f"{name}:{n}" for n, line in enumerate(text.splitlines(), 1) if labelled(line)]
+
+
+def test_the_label_guard_finds_a_name_by_its_digest():
+    """A listed name is found in any case, or only in capitals, as one to
+    three words that a dash or a space joins, alone or inside a longer run.
+    The names are synthetic and their digests made at run time."""
+    digest = lambda text: hashlib.sha256(text.encode()).hexdigest()
+    anywhere, capitals = "-".join(["SAMPLE", "PHASE", "ONE"]), "-".join(["SAMPLE", "CUT"])
+    sets = ({digest(anywhere)}, {digest(capitals)})
+    for text in (f"the {anywhere} record", f"the {anywhere.lower()} record", f"as {anywhere}-3 held ({capitals})",
+                 f"the x-{capitals} ran"):
+        assert named_label(text, *sets), text
+    for text in (f"the {capitals.lower()} ran", "a sample phase-one", "SAMPLE PHASE ONE", "the SAMPLE, CUT"):
+        assert not named_label(text, *sets), text
+
+
+def test_the_label_guard_finds_an_address_and_a_host_built_on_one():
+    """An address outside the ranges an example may use names a machine, and
+    so does a wildcard-DNS host whatever address it carries: four number
+    groups, dotted or dashed, opening the host name. Each is found. The
+    addresses are joined at run time so this file stays clean."""
+    address = ".".join(["198", "18", "0", "1"])     # a benchmarking address: no example range holds it
+    private = ["10", "0", "0", "5"]
+    for text in (f"the node answers at {address}", f"--connect-to cases.example.org:443:{address}:8443",
+                 f"https://gsj.{'.'.join(private)}.wildcard.example/", f"https://gsj-{'-'.join(private)}.wildcard.example/"):
+        assert internal_labels("line", text) == ["line:1"], text
+
+
+def test_the_label_guard_finds_a_review_s_finding_ids():
+    """A review's finding ids reach comments and docstrings in these shapes: a
+    review, a finding or a sweep named by its id -- bare, in parentheses, or
+    in a bracketed note left open on its line; an uppercase letter and digits
+    anywhere inside square brackets, a ruling number or range among them; a
+    letter, digits, a dash and digits anywhere; and a bracketed record name
+    of hyphenated upper-case words. Each is found. The ids and the record
+    name are synthetic and joined at run time so this file stays clean."""
+    review, ident, record = "rev" + "iew", "Q" + "7", "-".join(["SAMPLE", "RECORD"])
+    for text in (f"its words are kept, never repeated [{review} {ident}]", f"the fixed word [{review} sweep {ident},",
+                 f"a pre-release is not the release ({review} finding {ident})", f"{review.capitalize()} sweep {ident}: three reads",
+                 f"{review.capitalize()} {ident}: the summary echoed a path", f"the origin: {review} {ident}",
+                 f"the qualification ({review} {ident}): the pure parts",
+                 f"the owner record is immutable [{ident}]", f"one Lease per target [{ident}-6]",
+                 f"a stop after the apply [see {ident} and the notes]", f"the product deployment [{ident}].",
+                 f"the claims stay (as {ident}-2 held)", f"the listener is polled first ({ident}-5, and then the API)",
+                 f"a pod selector needs 1.27 [{record}]", f"the probe page [see {record} item 1]"):
+        assert internal_labels("line", text) == ["line:1"], text
+
+
+# the negative control: the words the guide uses for its own work, and the
+# addresses an example may use, are not labels
+GUIDE_PROSE = [
+    "Promotion of a release candidate follows its review; apply the patch release first.",
+    "Patch the Deployment only through the installer: review the plan, then promote it.",
+    "Every release attaches the chart as an audit copy.",
+    "helm v3.13.0, kubectl v1.31.2 and jq 1.7.1 are the floors; the previous release is v0.10.0-beta.6.",
+    "curl --connect-to cases.example.org:443:127.0.0.1:8443 https://cases.example.org/",
+    "the web container listens on 0.0.0.0:8780",
+    '"NO_PROXY": "llm.internal.example.org,10.20.0.9"',
+    '{"verification": {"connect_host": "192.0.2.7", "connect_port": 8443}}',
+    "example addresses: 172.20.0.4, 192.168.1.20, 198.51.100.7, 203.0.113.9",
+    "[Review the saved settings](#upgrade-and-recover-a-named-operation) before a repair; a review finding is not a refusal.",
+    "the documentation ranges [TEST-NET-1, TEST-NET-3] and a kubectl within [v1.30-1.32] on x86-64",
+    '[[ $holder =~ ^[a-f0-9]{24}$ ]] || shown="[R]"',
+    # a digest's, a key's or an architecture's name in brackets is no id
+    "the release is checked by [SHA256 digests, RSA-2048 keys and x86-64 images] on IPv6 nodes",
+    # nor is a standard's name, a curve's or a time stamp with its dashes
+    "SHA-256, UTF-8, ISO-8859-1 and a P-256 key; the stamp 2025-01-31T12:30:00Z",
+    # upper-case hyphenated words in brackets that are quoted (a value), carry
+    # a digit (an algorithm, a challenge) or open on one letter (a header)
+    'nodeAffinity values: ["STORAGE-NODE"]',
+    "[[ $(init_json_line \"$descriptor\" '  ' signature) == RSA-SHA256 ]]",
+    "[the X-FORWARDED-FOR header, TLS-ALPN-01 and HTTP-01 challenges]",
+    # the word review before a number, a lower-case word or a colon
+    "review the v2 plan, then review 12 findings. Review: the plan.",
+]
+
+
+def test_the_label_guard_leaves_the_guide_s_prose_and_the_example_addresses_alone():
+    assert [text for text in GUIDE_PROSE if labelled(text)] == []
+
+
 def test_the_public_tree_carries_no_internal_review_labels():
     """The installer repository is public and runtime.sh is the header of the
-    shipped installer: a reader there cannot resolve a review round or a
-    phase record by name."""
-    hits = []
-    for path in sorted(list((INSTALLER).glob("*.sh")) + list((INSTALLER).glob("*.md")) + list((INSTALLER.parent.parent / "tests").glob("*.py"))):
-        for n, l in enumerate(path.read_text(errors="replace").splitlines(), 1):
-            if re.search("audit" + " rounds?|FIX" + "-PASS|misattribution" + "[- ]pass", l, re.I):   # spelled apart: this line must not match itself
-                hits.append(f"{path.name}:{n}")
+    shipped installer: a reader there cannot resolve a review round, a phase
+    record or a machine by name. Every text file under ops/installer (its
+    programs, jq, schemas, examples, guides and the release tooling in ci/),
+    the tests, the workflow and the root README."""
+    paths = [p for p in INSTALLER.rglob("*") if p.is_file() and p.suffix in (".sh", ".md", ".py", ".jq", ".json", ".txt")]
+    paths += list((ROOT / "tests").glob("*.py")) + list((ROOT / ".github").rglob("*.yml")) + [ROOT / "README.md"]
+    hits = [hit for path in sorted(paths) for hit in internal_labels(str(path.relative_to(ROOT)), path.read_text(errors="replace"))]
     assert not hits, hits
 
 
-# --- review finding B3: the Helm 4 verbs are refused in the first seconds, before the Lease ---
+@needs_web
+def test_the_pinned_chart_carries_no_internal_review_labels():
+    """The pinned chart is public text as well: every installer packages it
+    (chart.tgz) and every release attaches it as an audit copy. The scan
+    reads each of its files with the same list. Red while the pinned chart's
+    comments still carry the product's own record names; the product's next
+    cut removes them and the pin that follows it turns this green."""
+    root = chart()
+    hits = [hit for path in sorted(root.rglob("*")) if path.is_file()
+            for hit in internal_labels(str(path.relative_to(root)), path.read_text(errors="replace"))]
+    assert not hits, hits
+
+
+# --- the Helm 4 verbs are refused in the first seconds, before the Lease ---
 
 def _fake_helm_on_path(work, version):
     fake = work.parent / "bin" / "helm"
@@ -2227,7 +2444,7 @@ def _fake_helm_on_path(work, version):
     ("restore", None, False), ("restore-repair", None, False), ("sweep", None, False), ("abandon", None, False),
 ])
 def test_a_verb_that_needs_helm_4_is_refused_in_the_first_seconds_before_the_lease(runtime, command, kind, refused):
-    """Review finding B3: two paths serialize a release with no
+    """Two paths serialize a release with no
     cluster at all (`KUBECONFIG=/dev/null helm install --dry-run=client`),
     which only Helm 4 does: the managed add-on repair (addon-repair) and the
     repair of a restore stopped at its application Helm revision. A Helm 3
@@ -2335,7 +2552,7 @@ def test_the_verb_preflight_runs_before_the_cluster_is_read_and_before_the_lease
     assert load < first < preflight < acquire
 
 
-# --- review finding B2: a refusal names the condition and the field, never the payload ---
+# --- a refusal names the condition and the field, never the payload ---
 
 def test_a_site_file_that_is_not_an_object_is_refused_without_repeating_its_contents(runtime, tmp_path):
     """the review's canary `site-merge-echo`: a site file whose whole JSON value
@@ -2414,7 +2631,7 @@ def test_url_origin_only_strips_the_path_and_the_userinfo(runtime):
 
 
 def test_the_summary_keeps_and_prints_only_the_origin_of_every_site_url(runtime):
-    """Review B2: the closing summary echoed a schema-valid,
+    """The closing summary once echoed a schema-valid,
     credential-bearing URL PATH to stdout -- llm.base_url may carry a path,
     ocr.url must, and the summary printed the site's values whole and kept
     them in summary.json. Every URL the summary keeps or prints now goes
@@ -2473,16 +2690,48 @@ def test_the_summary_keeps_and_prints_only_the_origin_of_every_site_url(runtime)
     assert "@" not in origins.replace("[^/@?#:", "").replace("[^/@?#", "") and origins.endswith("*$(?![\\s\\S])")
 
 
-# --- the URL scan [review B2; review B2: the three shapes the review proved] ---
+# --- the URL scan, and the three shapes a review proved past its previous form ---
 
 URLISH = (r"\$\(j '?\.?[a-z_.]*(url|base_url|acme_server|offbox_url|vectors_url)\b"
           r"|\$\(jq [^)]*\.(public_url|base_url|url|acme_server|vectors_url|offbox_url)\b"
           r"|\$\{?([A-Za-z_]*url|URL|base|[a-z_]*_server)\b")
 URL_SINKS = re.compile(r"(\b(log|fail|printf|echo|[a-z_]*fail[a-z_]*|lease_still_live) ['\"]"
                        r"|\b(RECOVERY_HINT|note|hint|found|next|fresh|resume|message|line)=)")
-# a filter that DERIVES from its input -- a digest, a field, a count, a file written
-# by the installer's own writers -- so what comes out is not the URL
-URL_DERIVES = re.compile(r"\|\s*(cut|tr|sed|awk|grep|head|tail|sha256sum|shasum|md5sum|openssl|base64|jq|wc|sort|uniq|od|xxd|fold|rev|atomic|immutable_file)\b")
+# a filter that DERIVES from its input -- a digest, a count, a file written by
+# the installer's own writers -- so what comes out is not the URL; sort, uniq,
+# cut, tr, fold, rev and the encoders hand the URL on or can be undone
+URL_DERIVES = re.compile(r"\|\s*(sha256sum|shasum|md5sum|openssl dgst|wc|atomic|immutable_file)\b")
+# head, tail, sed, awk, grep and jq hand their input on (`| head -n 1`, `| sed -n p`,
+# `| jq -R .` print the URL itself); only these forms of them extract: a sed
+# under -n whose substitution replaces with its first group and prints with
+# the p flag, where the pattern reads an authority's host or its port and
+# nothing else --
+#   ^https://(CLASS)TAIL          the host
+#   ^https://CLASS:([0-9]+)TAIL   the port after it
+# CLASS a bracket expression that excludes '@', ':', '/', '?' and '#' (it
+# stops before a userinfo's '@' and ':', the port, the path, the query and the
+# fragment) and TAIL the anchored host tail (:[0-9]+)?([/?#].*)?$, either
+# part optional, its class a subset of '/', '?' and '#': nothing after the
+# group can be an '@', so the group is never the userinfo -- and a grep that
+# counts or only tests. Without -n a line the pattern misses is printed whole;
+# a group before a bare .* is the userinfo whenever there is one
+# (https://token@host/ through ^https://([^/:@?#]+).* prints token, and a port
+# group after [^/:]+: prints a numeric password); without the ^ sed keeps the
+# text before the match, without the $ the text after it; a group after the
+# authority is a path segment; and every other group -- `(.*)`, `([^ ]+)`,
+# `([^/:]*@)`, `([^/:@]+)` -- keeps a whole URL, a userinfo or a query. In a
+# program delimited by '#' a class writes it `\#`, and in one delimited by '/'
+# the scheme's slashes are `\/`. Matched on the raw text, where the quoted sed
+# program still is.
+URL_SED_REPEAT = r"(?:[*+]|\{[0-9,]+\})"
+URL_SED_CLASS = r"\[\^(?=[^\]]*@)(?=[^\]]*:)(?=[^\]]*/)(?=[^\]]*\?)(?=[^\]]*#)[^\]]*\]" + URL_SED_REPEAT
+URL_SED_SCHEME = r"\^https:(?:\\?/){2}"
+URL_SED_TAIL = r"(?:\(:\[0-9\]" + URL_SED_REPEAT + r"\)\??)?(?:\(\[[/?#\\]+\]\.\*\)\??)?\$"
+URL_SED_GROUP = (URL_SED_SCHEME + r"(?:\(" + URL_SED_CLASS + r"\)|" + URL_SED_CLASS + r":\(\[0-9\]" + URL_SED_REPEAT + r"\))"
+                 + URL_SED_TAIL)
+URL_EXTRACTS = re.compile(r"\|\s*(sed\s+(?=(?:-[nE]+\s+)*-E*n)(?:-[nE]+\s+)+'s([#/|,])"
+                          + URL_SED_GROUP + r"\2\\1\2p'"
+                          r"|grep\s+-[A-Za-z]*[cq])")
 URL_ASSIGN = re.compile(r"(?:^|[;&|({]\s*|\bthen\s+|\belse\s+|\bdo\s+|\blocal\s+(?:-[A-Za-z]+\s+)*|\bexport\s+|\bdeclare\s+(?:-[A-Za-z]+\s+)*|\s)([A-Za-z_][A-Za-z0-9_]*)=")
 URL_FUNCTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{")
 URL_LOCAL = re.compile(r"\blocal\s+((?:-[A-Za-z]+\s+)*)([^;|&]*)")
@@ -2520,20 +2769,22 @@ def _logical_lines(text):
     return out
 
 
-def _expandable(line):
-    """the line with its single-quoted segments blanked: nothing expands there"""
+def _expandable(line, at=None):
+    """the line with its single-quoted segments blanked: nothing expands there
+    (`at`, a list, receives the index in `line` of every character returned)"""
     out, i, double = [], 0, False
+    at = [] if at is None else at
     while i < len(line):
         c = line[i]
         if c == "\\" and double:
-            out.append(line[i:i + 2]); i += 2; continue
+            out.append(line[i:i + 2]); at.extend(range(i, min(i + 2, len(line)))); i += 2; continue
         if c == '"':
             double = not double
         elif c == "'" and not double:
             end = line.find("'", i + 1)
             end = len(line) - 1 if end < 0 else end
-            out.append("''"); i = end + 1; continue
-        out.append(c); i += 1
+            out.append("''"); at.extend((i, end)); i = end + 1; continue
+        out.append(c); at.append(i); i += 1
     return "".join(out)
 
 
@@ -2562,9 +2813,10 @@ def _value_word(line, start):
                         break
                 j += 1
             inner = line[i + 2:j].strip()
-            if inner.split(" ", 1)[0] in ("j", "jq") and not URL_DERIVES.search(inner):
+            derives = URL_DERIVES.search(inner) or URL_EXTRACTS.search(inner)
+            if inner.split(" ", 1)[0] in ("j", "jq") and not derives:
                 parts.append(line[i:j + 1])             # a site field read: the URL itself
-            elif inner.split(" ", 1)[0] in ("printf", "echo", "cat") and not URL_DERIVES.search(inner):
+            elif inner.split(" ", 1)[0] in ("printf", "echo", "cat") and not derives:
                 parts.append(inner)
             i = j + 1; continue
         if not double and c in " \t;&|":
@@ -2592,9 +2844,13 @@ def _printed_urls(directory):
     `fail "...$where"`), within its function when it is `local` there and
     everywhere in the file otherwise. A backslash-continued line and a quoted
     string that spans lines are scanned whole. A printf piped into a filter
-    that derives (cut, tr, sed, a digest...) does not print; one piped into
-    anything else (cat, tee, less, a function) does. Nothing expands inside
-    single quotes, so text there is not a URL."""
+    that derives (cut, tr, a digest...) does not print, nor one piped into a
+    sed -n that prints with p the host or the port of ^https:// before an
+    anchored host tail, so that nothing after it can be an '@' (URL_EXTRACTS
+    says which), or a grep that counts or tests; one piped into anything else
+    (cat, tee, less, a function, head, tail, awk, grep or jq, and sed in any
+    other form) does. Nothing expands inside single quotes, so text there is
+    not a URL."""
     hits = []
     for path in sorted(Path(directory).glob("*.sh")):
         lines, current = [], None
@@ -2627,12 +2883,14 @@ def _printed_urls(directory):
                     scope = fn if name in locals_of.get(fn, ()) else None
                     if (scope, name) not in aliases and any(True for _ in _unwrapped(urlish, _value_word(line, m.end()))):
                         aliases.add((scope, name)); changed = True
-        for fn, n, line in lines:
+        for fn, n, raw in lines:
             urlish = urlish_in(fn)
-            line = _expandable(line)
+            at = []
+            line = _expandable(raw, at)
             for sink in URL_SINKS.finditer(line):
                 printed = line[sink.start():]
-                if printed.startswith("printf") and "|" in printed and URL_DERIVES.search(printed) and "| tee" not in printed:
+                derives = URL_DERIVES.search(printed) or URL_EXTRACTS.search(raw[at[sink.start()]:])
+                if printed.startswith("printf") and "|" in printed and derives and "| tee" not in printed:
                     continue                            # a printf piped into a filter derives, it does not print
                 for found in _unwrapped(urlish, printed):
                     hits.append(f"{path.name}:{n}: {found}")
@@ -2640,11 +2898,11 @@ def _printed_urls(directory):
 
 
 def test_no_printed_url_bypasses_url_origin_only():
-    """The bypass test [review B2]: in every shell file of the installer, the
+    """The bypass test: in every shell file of the installer, the
     text a line prints or records that names a URL must wrap it in
     url_origin_only, immediately -- see _printed_urls for what prints, what
     is a URL, and the three shapes the pre-release review proved past the
-    previous scan [review B2]: a quoted string continued on the next
+    previous scan: a quoted string continued on the next
     line, an aliased URL under another name, and a printf piped into `cat`.
     A new print that bypasses the function fails here by file and line; the
     summary's jq is held by the canary test above to its six --arg origins."""
@@ -2661,15 +2919,71 @@ URL_SCAN_MUTANTS = {
     "a printf piped into tee": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | tee "$GSJ_WORK/x"\n}\n',
     "a printf piped into a pager": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | less\n}\n',
     "an echo of the site field": 'mutant() {\n echo "at $(j .llm.base_url)"\n}\n',
+    # head, tail, sed, awk, grep and jq hand their input on unchanged in these
+    # forms: the URL itself is printed, or aliased and printed later
+    "a printf piped into head": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | head -n 1\n}\n',
+    "a printf piped into tail": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | tail -n 1\n}\n',
+    "a printf piped into sed -n p": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -n p\n}\n',
+    "a printf piped into awk": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | awk \'{print}\'\n}\n',
+    "a printf piped into grep": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | grep https\n}\n',
+    # sort, uniq, cut, tr, fold and base64 reorder, trim or encode the URL: it is still printed
+    "a printf piped into sort": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sort\n}\n',
+    "a printf piped into uniq": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | uniq\n}\n',
+    "a printf piped into fold": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | fold -w 500\n}\n',
+    "a printf piped into cut": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | cut -c1-\n}\n',
+    "a printf piped into base64": 'mutant() {\n local url=$1\n printf \'%s\' "$url" | base64\n}\n',
+    "an alias through sort": 'mutant() {\n local url=$1 first\n first=$(printf \'%s\' "$url" | sort)\n fail "cannot reach $first"\n}\n',
+    "a site field through tr": 'mutant() {\n local where\n where=$(j .llm.base_url | tr -d "\\n")\n log "at $where"\n}\n',
+    "a printf piped into jq -R": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | jq -R .\n}\n',
+    "an alias through head": 'mutant() {\n local url=$1 first\n first=$(printf \'%s\' "$url" | head -n 1)\n fail "cannot reach $first"\n}\n',
+    "a site field through sed -n p": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -n p)\n log "at $where"\n}\n',
+    # a sed substitution extracts only under -n with the p flag, from a group
+    # narrower than the line: without -n a line the pattern misses is printed
+    # whole, and a group that opens on .* or .+ keeps the userinfo, the path
+    # and the query url_origin_only drops
+    "a printf piped into a sed capture without -n": 'mutant() {\n local url=$1\n printf \'%s\' "$url" | sed -E \'s#https://([^/:]+).*#\\1#\'\n}\n',
+    "a site field through a sed capture printed with p but without -n": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -E \'s#^https://([^/:]+).*#\\1#p\')\n log "at $where"\n}\n',
+    "a printf piped into a sed that keeps the whole line": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -E \'s#(.*)#\\1#\'\n}\n',
+    "a printf piped into sed -n and a group of the whole line": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^(.*)$#\\1#p\'\n}\n',
+    "a site field through sed -n and a group of all after the scheme": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#https://(.+)#\\1#p\')\n log "at $where"\n}\n',
+    # a group narrower than the line still prints what url_origin_only drops
+    # unless its class excludes '@', '/', '?' and '#': every non-space is the
+    # whole URL, a group that ends on an '@' or stands before one is the
+    # userinfo, and a class that admits '?' keeps a query after the host
+    "a printf piped into sed -n and a group of every non-space": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^([^ ]+)$#\\1#p\'\n}\n',
+    "a site field through sed -n and a group of the userinfo and its @": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:]*@)?.*#\\1#p\')\n log "at $where"\n}\n',
+    "a site field through sed -n and a group before an @": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:@?\\#]+)@.*#\\1#p\')\n log "at $where"\n}\n',
+    "a printf piped into sed -n and a group that keeps the query": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^https://([^/:@]+).*#\\1#p\'\n}\n',
+    # a class that stops before '@' is still the userinfo when a bare .* follows
+    # it: https://token@host/ prints token, and https://user:123@host/ prints
+    # 123 through a port group after the host. The group extracts only between
+    # ^https:// and an anchored host tail, (:[0-9]+)?([/?\#].*)?$: nothing
+    # after it can then be an '@'. Without the ^ sed keeps the text before the
+    # match, without the $ the text after it, and a group after the authority
+    # is a path segment
+    "a site field through sed -n and a host group before a bare .*": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:@?\\#]+).*#\\1#p\')\n log "at $where"\n}\n',
+    "a printf piped into sed -n and a port group after an unanchored host": 'mutant() {\n local url=$1 port\n port=$(printf \'%s\' "$url" | sed -nE \'s#https://[^/:]+:([0-9]+).*#\\1#p\')\n log "port $port"\n}\n',
+    "a printf piped into sed -n and a port group after the anchored host before a bare .*": 'mutant() {\n local url=$1 port\n port=$(printf \'%s\' "$url" | sed -nE \'s#^https://[^/:@?\\#]+:([0-9]+).*#\\1#p\')\n log "port $port"\n}\n',
+    "a site field through sed -n and a host group whose tail class admits an @": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:@?\\#]+)([/?\\#@].*)?$#\\1#p\')\n log "at $where"\n}\n',
+    "a site field through sed -n and a host group whose tail is not anchored at the end": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/:@?\\#]+)(:[0-9]+)?([/?\\#].*)?#\\1#p\')\n log "at $where"\n}\n',
+    "a printf piped into sed -n and a host group after an unanchored scheme": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#https://([^/:@?\\#]+)(:[0-9]+)?([/?\\#].*)?$#\\1#p\'\n}\n',
+    "a printf piped into sed -n and a group after the authority": 'mutant() {\n local url=$1\n printf \'%s\\n\' "$url" | sed -nE \'s#^https://[^/]*/([^/:@?\\#]+)(:[0-9]+)?([/?\\#].*)?$#\\1#p\'\n}\n',
+    "a site field through sed -n and a host group whose class admits a colon before a bare .*": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/@?\\#]+).*#\\1#p\')\n log "at $where"\n}\n',
+    # the rule holds the host alone: a class that admits ':' reads the port with it
+    "a site field through sed -n and a host group whose class admits a colon": 'mutant() {\n local where\n where=$(j .llm.base_url | sed -nE \'s#^https://([^/@?\\#]+)(:[0-9]+)?([/?\\#].*)?$#\\1#p\')\n log "at $where"\n}\n',
 }
 URL_SCAN_CLEAN = {
     "the origin": 'clean() {\n local url=$1\n log "could not be acquired from $(url_origin_only "$url")"\n}\n',
     "an alias of the origin": 'clean() {\n local url=$1 origin\n origin=$(url_origin_only "$url")\n fail "cannot reach $origin"\n}\n',
-    "a derivation": 'clean() {\n local url=$1 host\n host=$(printf \'%s\' "$url" | sed -E \'s#https://([^/:]+).*#\\1#\')\n log "host $host"\n}\n',
+    "a derivation": 'clean() {\n local url=$1 host\n host=$(printf \'%s\' "$url" | sed -nE \'s#^https://([^/:@?\\#]+)(:[0-9]+)?([/?\\#].*)?$#\\1#p\')\n log "host $host"\n}\n',
     "a printf piped into a digest": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sha256sum\n}\n',
     "a single-quoted literal": "clean() {\n log 'set corpus.vectors_url in the site file'\n}\n",
     "a URL passed to a command": 'clean() {\n local url=$1 code\n code=$(curl --silent --output /dev/null --write-out \'%{http_code}\' "$url" || true)\n log "answered HTTP $code"\n}\n',
     "a local of the same name in another function": 'other() {\n local where=$1\n where="registry.base ($(url_origin_only "$where"))"\n}\nclean() {\n local where=$1\n log "$where is not a plain file"\n}\n',
+    "a printf piped into sed -n and a capture": 'clean() {\n local url=$1\n printf \'%s\' "$url" | sed -nE \'s#^https://([^/:@?\\#]+)(:[0-9]+)?([/?\\#].*)?$#\\1#p\'\n}\n',
+    "a site field through sed -E -n and a capture": 'clean() {\n local host\n host=$(j .public_url | sed -E -n \'s#^https://([^/:@?\\#]+)(:[0-9]+)?([/?\\#].*)?$#\\1#p\')\n log "host $host"\n}\n',
+    "a port through sed -n and a capture": 'clean() {\n local url=$1 port\n port=$(printf \'%s\' "$url" | sed -nE \'s#^https://[^/:@?\\#]+:([0-9]+)([/?\\#].*)?$#\\1#p\')\n log "port $port"\n}\n',
+    "a count through grep": 'clean() {\n local url=$1 slashes\n slashes=$(printf \'%s\' "$url" | grep -c /)\n log "$slashes slashes"\n}\n',
 }
 
 
@@ -2697,7 +3011,7 @@ def test_the_url_scan_passes_the_forms_the_code_uses(tmp_path, shape):
     assert _printed_urls(tmp_path) == []
 
 
-# --- review finding M7: the guide names the key file the release carries ---
+# --- the guide names the key file the release carries ---
 
 def test_the_guide_names_the_key_file_the_release_carries():
     """the review's `guide-key-path` probe: three guide commands verified with
@@ -2716,7 +3030,7 @@ def test_the_guide_names_the_key_file_the_release_carries():
 
 
 def test_the_closing_line_knows_every_skip_reason_the_verifier_can_record():
-    """review finding M5: the skip reasons are a CONTRACT between the product's
+    """The skip reasons are a CONTRACT between the product's
     verifier (gsj_deploy.verify.SKIP_REASONS) and this installer's closing
     line (installation_summary): the words the line branches on are exactly
     the words the verifier can record, and each states only what the probe
@@ -2763,6 +3077,13 @@ def _foreign_pod():
             "status": {"phase": "Running", "containerStatuses": [{"name": "other", "ready": True, "state": {"running": {}}}]}}
 
 
+def _with_verdict(pod, code):
+    """the Pod with corpus-initialize backing off after the verdict CODE"""
+    pod["status"]["initContainerStatuses"] = [{"name": "corpus-initialize", "state": BACKING_OFF,
+                                               "lastState": {"terminated": {"exitCode": 1, "message": "gsj-corpus:" + code}}}]
+    return pod
+
+
 def _replicaset(owner_uid=DEPLOY_UID):
     return {"metadata": {"name": "synthetic-release-web-7c9d8", "uid": "rs-uid-0001",
                          "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "synthetic-release-web",
@@ -2778,7 +3099,9 @@ def _wait_application(runtime, staged_in_this_run, verdict_persists, waiting=Non
     """drives wait_application over a fake kubectl: `waiting` is the Pod list
     the labels select before the restart (the application Pod after its
     verdict by default), `deletion` what the API answers the recreation
-    (ok, or refused: the uid precondition failed / the Pod is gone)"""
+    (ok, or refused: the uid precondition failed / the Pod is gone), and
+    `replicaset` the ReplicaSet the chain reads, or "forbidden": the read
+    refused as RBAC refuses it, on stderr with exit 1"""
     run, _, work = runtime
     site = _site(); site["deadlines"] = {"initialization_seconds": 60, "dependencies_seconds": 60}
     (work / "site.json").write_text(json.dumps(site))
@@ -2786,16 +3109,20 @@ def _wait_application(runtime, staged_in_this_run, verdict_persists, waiting=Non
     (work / "pods-running.json").write_text(json.dumps({"items": [_application_pod("running", uid="installer-pod-uid-0002")]}))
     (work / "deploy-not-ready.json").write_text(json.dumps(_deploy(False)))
     (work / "deploy-ready.json").write_text(json.dumps(_deploy(True)))
-    (work / "replicaset.json").write_text(json.dumps(replicaset if replicaset is not None else _replicaset()))
+    if replicaset == "forbidden":
+        (work / "replicasets-forbidden").write_text("")
+    else:
+        (work / "replicaset.json").write_text(json.dumps(replicaset if replicaset is not None else _replicaset()))
     script = f'''
 k() {{
   case "$1 $2" in
     "get deploy") if [[ -f $TEST_WORK/recovered ]]; then cat "$TEST_WORK/deploy-ready.json"; else cat "$TEST_WORK/deploy-not-ready.json"; fi;;
     "get pods") if [[ -f $TEST_WORK/deleted && {'false' if verdict_persists else 'true'} == true ]]; then cat "$TEST_WORK/pods-running.json"; else cat "$TEST_WORK/pods-waiting.json"; fi;;
-    "get replicasets") [[ $3 == synthetic-release-web-7c9d8 ]] || return 1; cat "$TEST_WORK/replicaset.json";;
+    "get replicasets") if [[ -f $TEST_WORK/replicasets-forbidden ]]; then printf 'Error from server (Forbidden): replicasets.apps "%s" is forbidden: User "synthetic-operator" cannot get resource "replicasets" in API group "apps" in the namespace "synthetic-namespace"\\n' "$3" >&2; return 1; fi
+      [[ $3 == synthetic-release-web-7c9d8 ]] || return 1; cat "$TEST_WORK/replicaset.json";;
     "delete --raw") printf '%s %s\\n' "$*" "$(jq -c . "$5")" >> "$TEST_WORK/kubectl-deletes"; [[ {deletion} == ok ]] || return 1; : > "$TEST_WORK/deleted";;
     "delete pod") printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-deletes"; : > "$TEST_WORK/deleted";;
-    "logs "*) :;;
+    "logs "*) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-logs";;
     *) printf '%s\\n' "$*" >> "$TEST_WORK/kubectl-other";;
   esac
 }}
@@ -2874,18 +3201,21 @@ def test_the_restart_recreates_the_pod_that_reported_the_verdict_never_the_first
     assert "restarting it once on the staged blocks" in result.stderr
 
 
-def test_the_restart_refuses_a_verdict_pod_whose_owner_chain_is_not_the_release_deployment(runtime):
+def test_the_restart_never_takes_a_verdict_pod_whose_owner_chain_is_not_the_release_deployment(runtime):
     """The Pod with the verdict is recreated only when its owner chain leads
     to this release's own workload: Pod -> its controller ReplicaSet (by name
     and uid) -> the Deployment $RELEASE-web with the uid the wait just read.
     A chain that ends elsewhere (here: the ReplicaSet's controller is another
-    Deployment's uid) is a named refusal, no deletion at all."""
+    Deployment's uid) is no deletion at all; the verdict is named as not the
+    release's, like any other such Pod's, and the wait goes on (it used to
+    end the operation, while the same verdict outside the restart was only
+    named)."""
     result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
                                         replicaset=_replicaset(owner_uid="another-deployment-uid"))
-    assert result.returncode == 1, result.stderr
+    assert result.returncode == 97, result.stderr                     # every poll ran: the wait went on
     assert deletes == [], deletes
-    assert "synthetic-release-web-7c9d8-abcde" in result.stderr and "not the application Pod of release synthetic-release" in result.stderr
-    assert "stopped terminally" not in result.stderr
+    assert "Pod synthetic-release-web-7c9d8-abcde reported an initializer verdict but is not owned by release synthetic-release" in result.stderr
+    assert "stopped terminally" not in result.stderr and "restarting" not in result.stderr
 
 
 def test_a_refused_or_failed_recreation_is_an_error_never_a_restart_that_happened(runtime):
@@ -2898,3 +3228,124 @@ def test_a_refused_or_failed_recreation_is_an_error_never_a_restart_that_happene
     assert deletes == [_recreate(runtime[2])], deletes
     assert "could not be recreated" in result.stderr and "resume --operation aaaaaaaaaaaaaaaaaaaaaaaa" in result.stderr
     assert "stopped terminally" not in result.stderr
+
+
+# --- a verdict is judged only from this release's own Pod ---
+
+def test_a_terminal_verdict_from_a_pod_the_release_does_not_own_never_stops_the_wait(runtime):
+    """The two labels also list a foreign controller's Pod. One listed FIRST
+    with a terminal verdict stopped the operation as terminal (its code
+    judged, the named repair demanded) although this release's own Pod was
+    healthy: the verdict is judged only when the Pod that reported it is the
+    release's own by name, uid and owner chain -- otherwise that is logged,
+    and the wait goes on. The progress line and the initializer's log come
+    from the release's own Pod, never from the first one listed."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_foreign_pod(), "deadline-exceeded"), _application_pod("running")])
+    assert result.returncode == 97, result.stderr                     # every poll ran: the wait went on
+    assert "stopped terminally" not in result.stderr and deletes == []
+    assert f"Pod {FOREIGN_POD} reported an initializer verdict but is not owned by release synthetic-release" in result.stderr, result.stderr
+    assert '"pod":"synthetic-release-web-7c9d8-abcde"' in result.stdout and FOREIGN_POD not in result.stdout, result.stdout
+    logs = (work / "kubectl-logs").read_text().splitlines()
+    assert logs and all("synthetic-release-web-7c9d8-abcde" in line for line in logs), logs
+
+
+def test_a_terminal_verdict_from_the_releases_own_pod_stops_the_wait_after_a_foreign_one(runtime):
+    """The release's own Pod with a terminal verdict stops the wait with its
+    own code, listed after a foreign Pod carrying another terminal verdict."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_foreign_pod(), "checkpoint-identity-mismatch"),
+                                                 _with_verdict(_application_pod("running"), "deadline-exceeded")])
+    assert result.returncode == 1, result.stderr
+    assert "stopped terminally (deadline-exceeded)" in result.stderr and "checkpoint-identity-mismatch" not in result.stderr.split("GSJ:")[-1]
+    assert deletes == []
+
+
+# --- the restart and the stop act on one verdict: the release's own ---
+
+FOREIGN_NOT_OWNED = f"Pod {FOREIGN_POD} reported an initializer verdict but is not owned by release synthetic-release"
+OWN_PROGRESS = '"pod":"synthetic-release-web-7c9d8-abcde"'
+
+
+@pytest.mark.parametrize("own", ["waiting", "running"])
+def test_a_foreign_source_verification_verdict_listed_first_neither_restarts_nor_ends_the_wait(runtime, own):
+    """The restart on the staged blocks read only the FIRST verdict line
+    while the stop below it judged only the release's own Pods: a foreign Pod
+    listed first with the source-verification verdict ended the operation
+    through the restart's refusal. The verdict both act on is chosen once,
+    the first from a Pod the release owns, and the foreign one is named once
+    per poll: the release's own Pod gets its restart when it reported the
+    verdict (waiting), and the wait goes on when it reported none (running)."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
+                                        waiting=[_with_verdict(_foreign_pod(), "source-verification-failed"),
+                                                 _application_pod(own)])
+    assert "could not be recreated" not in result.stderr and "stopped terminally" not in result.stderr, result.stderr
+    assert result.stderr.count(FOREIGN_NOT_OWNED) == result.stdout.count(OWN_PROGRESS) >= 1, result.stderr
+    if own == "waiting":
+        assert result.returncode == 0, result.stderr
+        assert deletes == [_recreate(work)], deletes
+        assert "restarting it once on the staged blocks" in result.stderr
+    else:
+        assert result.returncode == 97, result.stderr                 # every poll ran: the wait went on
+        assert deletes == [] and "restarting" not in result.stderr
+
+
+def test_the_releases_own_source_verification_verdict_gets_its_restart_behind_a_foreign_verdict(runtime):
+    """A foreign Pod listed first with another verdict hid the release's own
+    source-verification verdict from its one restart: the restart read the
+    foreign code and passed, and the stop then judged the release's verdict
+    terminal, although it may predate the staging. The release's own verdict
+    gets its restart; the foreign one is named, never judged."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=True, verdict_persists=False,
+                                        waiting=[_with_verdict(_foreign_pod(), "deadline-exceeded"),
+                                                 _application_pod("waiting")])
+    assert result.returncode == 0, result.stderr
+    assert deletes == [_recreate(work)], deletes
+    assert "restarting it once on the staged blocks" in result.stderr and "stopped terminally" not in result.stderr
+    assert result.stderr.count(FOREIGN_NOT_OWNED) == 1, result.stderr
+
+
+# --- a kubeconfig that may not read ReplicaSets ---
+
+RS_GAP = "may not get replicasets.apps"
+
+
+def test_a_kubeconfig_that_may_not_read_replicasets_still_judges_the_releases_own_verdict(runtime):
+    """The owner chain runs through the Pod's ReplicaSet. A kubeconfig that
+    may not read ReplicaSets made the release's own Pod look foreign on every
+    poll: its progress and its log vanished, and its terminal verdict was
+    never judged -- the wait ran out its whole deadline and then named
+    resume. A read refused as forbidden is said once, naming the permission,
+    and the wait judges the Pod that carries the release's labels and is not
+    being deleted, as the release before the chain did. kubectl's own words
+    are not repeated."""
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_application_pod("running"), "deadline-exceeded")],
+                                        replicaset="forbidden")
+    assert result.returncode == 1, result.stderr
+    assert "stopped terminally (deadline-exceeded)" in result.stderr, result.stderr
+    assert result.stderr.count(RS_GAP) == 1, result.stderr
+    assert "not owned by release" not in result.stderr and "Forbidden" not in result.stderr, result.stderr
+    assert OWN_PROGRESS in result.stdout and deletes == []
+
+
+def test_the_replicaset_gap_is_said_once_and_a_pod_of_another_controller_stays_unjudged(runtime):
+    """Said once for the whole wait, not on every poll, while the release's own
+    Pod shows its progress and its log on each; a Pod whose own controller is
+    no ReplicaSet is still not the release's, and its verdict is named, never
+    judged."""
+    run, _, work = runtime
+    result, deletes = _wait_application(runtime, staged_in_this_run=False, verdict_persists=True,
+                                        waiting=[_with_verdict(_foreign_pod(), "deadline-exceeded"),
+                                                 _application_pod("running")],
+                                        replicaset="forbidden")
+    assert result.returncode == 97, result.stderr                     # every poll ran: the wait went on
+    assert result.stderr.count(RS_GAP) == 1, result.stderr
+    polls = result.stdout.count(OWN_PROGRESS)
+    assert polls == 4 and result.stderr.count(FOREIGN_NOT_OWNED) == polls, (polls, result.stderr)
+    logs = (work / "kubectl-logs").read_text().splitlines()
+    assert len(logs) == polls and all("synthetic-release-web-7c9d8-abcde" in line for line in logs), logs
+    assert "stopped terminally" not in result.stderr and deletes == []

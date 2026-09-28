@@ -39,7 +39,7 @@ COMPANIONS = ("verify-release.sh", "release.pem", "installer-descriptor.json", "
 # the system directories; nothing else is reachable. `jq` is real (inspect
 # runs it); openssl is wrapped like the clients tests do.
 UTILITIES = ("bash", "tar", "gzip", "base64", "awk", "cut", "mktemp", "sync", "sed", "head", "tail", "tr",
-             "cat", "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "ln", "stat", "getconf",
+             "cat", "sha256sum", "shasum", "chmod", "mkdir", "cp", "mv", "rm", "link", "stat", "getconf",
              "dirname", "basename", "grep", "wc", "sort", "sysctl", "env", "readlink", "perl", "sleep")
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 # Every diagnostic bash or a tool prints when a script walks into a trap; no
@@ -484,10 +484,12 @@ def test_altered_installer_bytes_fail_verification_and_init_stops_before_inspect
 
 
 def test_the_published_verifier_runs_after_the_internal_check_and_its_own_refusal_stops_init(tmp_path, keypair):
-    """A descriptor with a second installer sha256 line passes init's own
-    reading (the first line) and is refused by verify-release.sh, whose sed
-    demands one unique digest: the verifier is a check of its own, and its
-    refusal stops init before inspect."""
+    """The verifier is a check of its own, run after init's: its refusal stops
+    init before inspect, and its line is shown. init now reads the
+    descriptor exactly as the verifier does, so no signed descriptor passes
+    the one and fails the other; the refusal here is the verifier's own
+    reading of the key file, on a box whose openssl cannot parse it (init
+    itself never parses the key, it hashes it)."""
     box = Box(tmp_path, keypair)
     box.place(*COMPANIONS)
     result = box.run()
@@ -498,16 +500,35 @@ def test_the_published_verifier_runs_after_the_internal_check_and_its_own_refusa
     assert "was not executed" not in result.stdout + result.stderr
     assert "init: the published verify-release.sh confirms the signed descriptor and the exact bytes of this installer" in result.stdout
     assert result.stderr.index("init: running the published verify-release.sh") < result.stderr.index("init: running inspect")
-    descriptor = json.loads((box.assets / "installer-descriptor.json").read_text())
-    descriptor["zz"] = {"sha256": "0" * 64}
-    (box.assets / "installer-descriptor.json").write_bytes(builder.canonical(descriptor))
-    _sign(box.keypair[0], box.assets / "installer-descriptor.json", box.assets / "installer-descriptor.sig")
     again = Box(tmp_path / "again", keypair)
+    openssl = Path(again.path) / "openssl"
+    openssl.write_text(openssl.read_text().replace('if [ "${1:-}" = version ]', 'if [ "${1:-}" = pkey ]; then exit 1; elif [ "${1:-}" = version ]', 1))
     again.serve(box.assets)
     result = again.run()
     _stop(result, "release verification FAILED: verify-release.sh refused this installer")
-    assert "Descriptor has no unique installer/key digest" in result.stderr          # the published verifier's own line
+    assert "Trusted public key is not a readable PEM public key" in result.stderr   # the published verifier's own line
     assert again.kube_calls() == [] and again.beside() == []
+
+
+@pytest.mark.parametrize("second", [{"sha256": "0" * 64, "bytes": 1}, {"bytes": 1}, {"sha256": "0" * 64}])
+def test_a_descriptor_with_a_second_digest_or_length_line_is_refused_by_inits_own_check(tmp_path, keypair, second):
+    """The three readers of the descriptor disagreed on an unusual layout: a
+    second object whose sha256 or bytes sits at the installer's indent
+    (sorted after "installer", so the first matching line is the real one).
+    init took the first line and passed; the published verifier demands
+    exactly one line and refused the digest (it never reads bytes, so a
+    second bytes line passed both). init now reads like the verifier:
+    exactly one matching line, else no value -- refused by its own check,
+    before the verifier runs and before anything is saved or inspected."""
+    box = Box(tmp_path, keypair)
+    descriptor = json.loads((box.assets / "installer-descriptor.json").read_text())
+    descriptor["zz"] = second
+    (box.assets / "installer-descriptor.json").write_bytes(builder.canonical(descriptor))
+    _sign(box.keypair[0], box.assets / "installer-descriptor.json", box.assets / "installer-descriptor.sig")
+    result = box.run()
+    _stop(result, "the descriptor names no installer digest and length")
+    assert "init: running the published verify-release.sh" not in result.stderr
+    assert box.kube_calls() == [] and box.beside() == []
 
 
 def test_a_wrong_key_published_at_the_origin_is_refused_and_nothing_is_saved(tmp_path, keypair):
@@ -571,18 +592,39 @@ def test_a_missing_or_libressl_openssl_is_refused_by_bootstrap_before_init_runs(
     assert json.loads(state.read_text())["calls"] == []
 
 
-def test_a_box_without_a_sha256_tool_is_named_for_init_and_unchanged_for_every_other_verb(runtime, tmp_path):
-    """init names the missing tool; every other verb keeps its refusal as it
-    was (the payload check, which blames the payload)."""
-    run, _, _ = runtime
+@pytest.mark.parametrize("verb", ["init", "inspect", "install", "upgrade", "backup", "restore", "repair"])
+def test_a_box_without_a_sha256_tool_is_named_for_every_verb(runtime, tmp_path, verb):
+    """Every verb names the missing tool in bootstrap's first seconds: without
+    it the payload check further on fails as 'embedded payload integrity
+    failed', which blames the payload for what is the box's."""
+    run, state, _ = runtime
     path = _tools(tmp_path / "tools", **FLOORS)
     for name in ("sha256sum", "shasum"):
         (Path(path) / name).unlink(missing_ok=True)
-    result = run("COMMAND=init; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    result = run(f"COMMAND={verb}; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path, TMPDIR=str(tmpdir))
     assert result.returncode != 0 and "REACHED" not in result.stdout
-    assert "bootstrap utility required: sha256sum or shasum" in result.stderr and "integrity" not in result.stderr
-    other = run("COMMAND=install; FETCH_TOOLS=false; bootstrap; echo REACHED", PATH=path)
-    assert other.returncode != 0 and "sha256sum or shasum" not in other.stderr
+    assert "bootstrap utility required: sha256sum or shasum" in result.stderr and "integrity" not in result.stderr, result.stderr
+    assert list(tmpdir.iterdir()) == [] and json.loads(state.read_text())["calls"] == []
+
+
+@pytest.mark.parametrize("verb", ["init", "install"])
+def test_a_bootstrap_failure_after_its_work_directory_exists_leaves_nothing_under_tmpdir(runtime, tmp_path, verb):
+    """bootstrap makes the private work directory, then unpacks the payload
+    and fetches clients -- each of which can stop the run. main installed the
+    exit trap that removes the directory only after bootstrap returned, so
+    such a stop left a gsj-install.* directory behind. The script run here
+    carries no payload below its marker: the stop is 'installer payload
+    missing', after the directory exists."""
+    run, _, work = runtime
+    path = _tools(tmp_path / "tools", **FLOORS)
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    (work / "no-payload.sh").write_text(f'source "$TEST_FUNCTIONS"\nCOMMAND={verb}; FETCH_TOOLS=false; RENEWER=\'\'\nbootstrap\necho REACHED\n')
+    result = run('exec bash "$TEST_WORK/no-payload.sh"', PATH=path, TMPDIR=str(tmpdir))
+    assert result.returncode == 1 and "installer payload missing" in result.stderr and "REACHED" not in result.stdout, result.stderr
+    assert sorted(p.name for p in tmpdir.iterdir()) == [], "the work directory was left behind"
 
 
 def test_bootstrap_skips_only_the_client_refusal_for_init(runtime, tmp_path):
@@ -597,9 +639,12 @@ def test_bootstrap_skips_only_the_client_refusal_for_init(runtime, tmp_path):
     assert "REACHED" not in reached.stdout
 
 
-def test_init_refuses_fetch_tools_by_name_before_bootstrap_downloads_anything(tmp_path, keypair):
+@pytest.mark.parametrize("flag", ["--fetch-tools", "--fetch-tools=helm", "--fetch-tools=kubectl,jq"])
+def test_init_refuses_fetch_tools_by_name_before_bootstrap_downloads_anything(tmp_path, keypair, flag):
+    """init reports on the clients this machine has: the single-client form
+    downloads a client just as the bare flag does, and is refused the same."""
     box = Box(tmp_path, keypair, helm=None)
-    result = box.run("--fetch-tools")
+    result = box.run(flag)
     _stop(result, "run it without --fetch-tools")
     assert box.curl_calls() == [] and box.kube_calls() == []
     assert not (box.home / "gsj-operator").exists()
@@ -615,7 +660,7 @@ def test_several_missing_tools_are_all_named_in_one_run(tmp_path, keypair):
     for tool in ("helm", "kubectl", "jq"):
         row = _check(report, tool)
         assert row["status"] == "FAIL" and f"requires {tool} >= {FLOORS[tool]}" in row["detail"] and "none on PATH" in row["detail"], row
-        assert "any other command accepts --fetch-tools" in row["fix"] and f"pins a {tool} for linux/amd64" in row["fix"], row
+        assert f"any other command accepts --fetch-tools={tool} (this release pins a {tool} for linux/amd64" in row["fix"], row
         assert f"FAIL    {tool}" in result.stdout
     assert _check(report, "openssl")["status"] == "PASS" and "--fetch-tools does not supply OpenSSL" in _check(report, "openssl")["detail"]
     assert _check(report, "cluster")["status"] == "UNKNOWN"
@@ -635,7 +680,19 @@ def test_the_fetch_tools_advice_says_what_this_release_pins_for_this_platform(tm
     box.serve(box.assets)
     report = _report(box.run())
     assert "--fetch-tools cannot help here: this release pins no helm for linux/amd64" in _check(report, "helm")["fix"]
-    assert "any other command accepts --fetch-tools (this release pins a jq for linux/amd64" in _check(report, "jq")["fix"]
+    assert "any other command accepts --fetch-tools=jq (this release pins a jq for linux/amd64" in _check(report, "jq")["fix"]
+
+
+@pytest.mark.parametrize("tool", ["helm", "kubectl", "jq"])
+def test_the_fetch_tools_advice_names_the_single_client_form_for_its_row(tmp_path, keypair, tool):
+    """Each row names the fetch of its own client alone; the Helm row says the
+    other two stay this box's, the kubectl row points at the version note."""
+    box = Box(tmp_path, keypair, **{tool: None})
+    fix = _check(_report(box.run()), tool)["fix"]
+    assert f"--fetch-tools={tool} (this release pins a {tool} for linux/amd64 for that run only" in fix, fix
+    assert ("fetches Helm alone and keeps this box's kubectl and jq" in fix) == (tool == "helm"), fix
+    assert ("read the guide's note on kubectl and your server's version first" in fix) == (tool == "kubectl"), fix
+    assert "--fetch-tools " not in fix and "--fetch-tools (" not in fix, fix
 
 
 def test_a_too_old_client_is_named_with_floor_and_finding(tmp_path, keypair):
@@ -1007,6 +1064,32 @@ def test_an_installer_folder_that_cannot_be_written_keeps_the_verified_copies_in
         assert box.beside() == []
 
 
+def test_an_installer_folder_without_hard_links_is_named_as_that_and_the_copies_go_to_the_working_folder(tmp_path, keypair):
+    """A FAT or exFAT stick, or some network shares, take the temporary copy
+    but refuse the hard link that puts it in place (link(2) fails with EPERM
+    or ENOTSUP). That folder was reported as not writable, though init had
+    just written there; it is named for what it lacks, and the checked
+    copies still go to the working folder's releases/<version>/."""
+    box = Box(tmp_path, keypair)
+    fake, real = Path(box.path) / "link", shutil.which("link", path=SYSTEM_PATH)
+    fake.unlink()
+    fake.write_text('#!/bin/sh\ncase "$2" in "$TEST_NO_LINKS"/*) echo "link: cannot create link: Operation not permitted" >&2; exit 1;; esac\n'
+                    f'exec {real} "$@"\n')
+    fake.chmod(0o755)
+    result = box.run(TEST_NO_LINKS=str(box.installer.parent))
+    assert result.returncode == 0, result.stderr + result.stdout
+    report = _report(result)
+    kept = box.home / "gsj-operator" / "releases" / VERSION
+    assert report["verification"]["status"] == "PASS" and report["verification"]["companions_saved"] == 4
+    assert report["verification"]["saved_in"] == str(kept) and sorted(p.name for p in kept.iterdir()) == sorted(COMPANIONS)
+    here = box.installer.parent
+    lines = [l for l in result.stderr.splitlines() if "not saved in" in l]
+    assert len(lines) == 1 and lines[0].endswith(f"not saved in {here}: {here} is on a file system without hard links (FAT, exFAT, "
+                                                  "some network shares), and init puts a checked copy in place only by linking it"), result.stderr
+    assert "not writable" not in result.stderr and "Operation not permitted" not in result.stderr
+    assert box.beside() == []                                           # no temporary copy is left beside the installer
+
+
 def test_a_file_that_appears_beside_the_installer_during_the_download_is_never_replaced(tmp_path, keypair):
     box = Box(tmp_path, keypair)
     result = box.run(TEST_CURL_PLANT=str(box.installer.parent))
@@ -1026,6 +1109,129 @@ def test_a_link_that_appears_beside_the_installer_is_never_written_through(tmp_p
     assert result.returncode == 0, result.stderr + result.stdout
     assert target.read_text() == "precious"
     assert _report(result)["verification"]["companions_saved"] == 0
+
+
+# init_publish in the background, in a process group of its own: a run that
+# blocks on the destination is reported as HUNG and its group killed, so the
+# test fails by name instead of leaving a writer blocked on a FIFO.
+_PUBLISH = """INIT_STAGE="$TEST_STAGE"
+set -m
+( rc=0; init_publish release.pem "$TEST_DEST" || rc=$?; printf 'rc=%s why=%s temp=%s\\n' "$rc" "${INIT_WHY:-}" "${INIT_PUBLISH_TEMP-unset}" ) > "$TEST_WORK/publish.out" 2>&1 & pid=$!
+set +m
+for i in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "-$pid"; echo HUNG; exit 0; fi
+wait "$pid" || true
+cat "$TEST_WORK/publish.out"
+"""
+
+
+# ln as macOS ships it: BSD's, which has no -T.
+_BSD_LN = """ln() { case "$1" in -T) echo "ln: illegal option -- T" >&2; return 1;; esac; command ln "$@"; }
+"""
+
+
+def _publish(runtime, tmp_path, plant=None, bsd_ln=False):
+    run, _, _ = runtime
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    (stage / "release.pem").write_text("the checked copy\n")
+    if plant:
+        plant(dest / "release.pem")
+    return run((_BSD_LN if bsd_ln else "") + _PUBLISH, TEST_STAGE=str(stage), TEST_DEST=str(dest)), dest
+
+
+@pytest.mark.parametrize("planted", ["a FIFO", "a link to a FIFO", "a link to a file", "a dangling link", "a directory", "a link to a directory"])
+def test_a_name_planted_where_a_companion_is_published_is_never_opened_nor_replaced(runtime, tmp_path, planted):
+    """Between discovery and publication a name can appear where a companion
+    is to be saved. noclobber refused only an existing regular file: a FIFO
+    there (or a link to one) was opened for writing -- the run blocked until
+    something read it -- and the unguarded write that followed opened the
+    name again. The copy is written to a fresh private name and linked into
+    place with link(1) -- link(2), which fails for an existing name of any
+    type and never opens it or descends into it (a plain ln links INTO a
+    directory, or a link to one):
+    the planted name is left exactly as it was, nothing is left beside it or
+    in it, and the result is the 'appeared' refusal (2)."""
+    fifo, precious, elsewhere = tmp_path / "fifo", tmp_path / "precious", tmp_path / "elsewhere"
+    precious.write_text("precious")
+    elsewhere.mkdir()
+
+    def plant(name):
+        if planted == "a FIFO":
+            os.mkfifo(name)
+        elif planted == "a link to a FIFO":
+            os.mkfifo(fifo); name.symlink_to(fifo)
+        elif planted == "a link to a file":
+            name.symlink_to(precious)
+        elif planted == "a directory":
+            name.mkdir()
+        elif planted == "a link to a directory":
+            name.symlink_to(elsewhere)
+        else:
+            name.symlink_to(tmp_path / "absent")
+    result, dest = _publish(runtime, tmp_path, plant)
+    assert "HUNG" not in result.stdout, "init_publish opened the planted name and blocked on it"
+    assert "rc=2" in result.stdout and "appeared during the download and was not replaced" in result.stdout, result.stdout + result.stderr
+    name = dest / "release.pem"
+    if planted == "a FIFO":
+        assert stat.S_ISFIFO(os.lstat(name).st_mode)
+    elif planted == "a directory":
+        assert name.is_dir() and not name.is_symlink() and list(name.iterdir()) == []
+    else:
+        assert name.is_symlink()
+    assert precious.read_text() == "precious" and not (tmp_path / "absent").exists() and list(elsewhere.iterdir()) == []
+    assert sorted(p.name for p in dest.iterdir()) == ["release.pem"], "a temporary name was left beside the planted one"
+    assert result.stdout.rstrip().endswith(" temp="), "the name kept for the exit trap was not cleared after the rm"
+
+
+def test_a_companion_is_published_by_an_ln_without_minus_T(runtime, tmp_path):
+    """init supports a macOS box, whose ln is BSD's and has no -T: every
+    companion's publication failed there and was reported as 'not writable'.
+    link(1) is POSIX and the same call on both."""
+    result, dest = _publish(runtime, tmp_path, bsd_ln=True)
+    assert "rc=0" in result.stdout, result.stdout + result.stderr
+    assert (dest / "release.pem").read_text() == "the checked copy\n"
+    assert sorted(p.name for p in dest.iterdir()) == ["release.pem"]
+
+
+def test_a_companion_is_published_whole_and_private_and_an_unwritable_folder_is_named(runtime, tmp_path):
+    result, dest = _publish(runtime, tmp_path)
+    assert "rc=0" in result.stdout, result.stdout + result.stderr
+    assert (dest / "release.pem").read_text() == "the checked copy\n"
+    assert stat.S_IMODE((dest / "release.pem").stat().st_mode) == 0o600 and not (dest / "release.pem").is_symlink()
+    assert sorted(p.name for p in dest.iterdir()) == ["release.pem"]
+    assert result.stdout.rstrip().endswith(" temp="), "the name kept for the exit trap was not cleared after the rm"
+    if os.geteuid() != 0:                                               # root writes through mode 555
+        again = tmp_path / "again"
+        again.mkdir()
+        os.chmod(tmp_path / "again", 0o755)
+        result, dest = _publish(runtime, again, lambda name: os.chmod(name.parent, 0o555))
+        os.chmod(dest, 0o755)
+        assert "rc=1" in result.stdout and f"{dest} is not writable" in result.stdout, result.stdout + result.stderr
+        assert list(dest.iterdir()) == []
+        assert result.stdout.rstrip().endswith(" temp="), "the name kept for the exit trap was not cleared on the refusal"
+
+
+def test_a_stop_during_publication_leaves_no_hidden_copy_beside_the_installer(runtime, tmp_path):
+    """init_publish writes the checked copy to a hidden name beside the
+    installer and links it into place; init stopped by a signal between that
+    write and the removal of the hidden name left the copy there for good.
+    The name is kept where the exit trap finds it, and the trap removes it:
+    the stop comes from link itself, after the write and before the rm."""
+    run, _, _ = runtime
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    (stage / "release.pem").write_text("the checked copy\n")
+    result = run('''INIT_STAGE="$TEST_STAGE"; GSJ_WORK="$TEST_WORK/run"; mkdir "$GSJ_WORK"
+install_exit_traps
+link() { ls -A "$TEST_DEST" > "$TEST_WORK/at-the-stop"; kill -TERM $$; }
+init_publish release.pem "$TEST_DEST"
+echo NOT-STOPPED
+''', TEST_STAGE=str(stage), TEST_DEST=str(dest))
+    _, _, work = runtime
+    assert result.returncode == 143 and "NOT-STOPPED" not in result.stdout, result.stdout + result.stderr
+    assert (work / "at-the-stop").read_text().startswith(".release.pem."), "the stop came before the write"
+    assert list(dest.iterdir()) == [], "the hidden temporary copy was left beside the installer"
 
 
 def test_run_through_a_symlink_beside_the_installer_means_beside_the_file(tmp_path, keypair):
@@ -1064,14 +1270,17 @@ def test_init_is_read_only_against_the_cluster(tmp_path, keypair):
     one of them -- no create, apply, delete, patch, exec, run, label, scale,
     no Lease, no --raw, no --watch -- even with an operator's exported
     leftovers that cleanup_exit would otherwise act on. The process-group
-    leftovers name a sentinel this test owns; it must outlive the run. helm
-    is recorded too and answers only `version --short`."""
+    leftovers name a sentinel this test owns; it must outlive the run, and so
+    must the file the publication leftover names. helm is recorded too and
+    answers only `version --short`."""
     box = Box(tmp_path, keypair)
+    precious = tmp_path / "precious"
+    precious.write_text("an operator's file")
     sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
     try:
         result = box.run(PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true", TRANSFER_HANDBACK_POD="leftover-pod",
                          RENEWER=str(sentinel.pid), HELM_PID=str(sentinel.pid), GSJ_ADDON_COMMAND_PID=str(sentinel.pid),
-                         CONTEXT="c", NAMESPACE="ns", RELEASE="r", SITE="/nonexistent")
+                         INIT_PUBLISH_TEMP=str(precious), CONTEXT="c", NAMESPACE="ns", RELEASE="r", SITE="/nonexistent")
         assert sentinel.poll() is None, "init's exit signalled a process group it did not own"
     finally:
         sentinel.kill()
@@ -1083,22 +1292,102 @@ def test_init_is_read_only_against_the_cluster(tmp_path, keypair):
     assert {_verb(call) for call in calls} <= READ_ONLY, sorted({_verb(call) for call in calls})
     assert not any(flag in call for call in calls for flag in ("--watch", "-w", "--raw", "exec", "delete", "replace", "create", "apply", "patch"))
     assert box.helm_calls() and all(call == ["version", "--short"] for call in box.helm_calls()), box.helm_calls()
+    assert precious.exists() and precious.read_text() == "an operator's file", "the exit trap removed a file an exported leftover named"
+
+
+@pytest.mark.parametrize("verb", [["inspect"], ["install", "--non-interactive", "--config", "/nonexistent/site.json"]])
+def test_leftover_variables_never_reach_a_cluster_or_a_process_group_from_any_verb(tmp_path, keypair, verb):
+    """cleanup_exit acts on what these name: a process group to signal, a
+    probe Pod to delete, a Lease to release, an operation to name, a file to
+    remove. main cleared an operator's exported leftovers for init alone; an
+    exported HELM_PID made inspect's exit signal a process group it never
+    started. Every verb clears them before bootstrap: the sentinel and the
+    named file outlive inspect (which succeeds) and an install that stops at
+    its missing configuration, no mutating kubectl call is made and the
+    leftover operation is not named."""
+    box = Box(tmp_path, keypair)
+    precious = tmp_path / "precious"
+    precious.write_text("an operator's file")
+    sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
+    try:
+        env = {**box.env, "PROBE_POD": "leftover-probe", "OPERATION": "leftover-op", "LEASE_ACQUIRED": "true",
+               "TRANSFER_HANDBACK_POD": "leftover-pod", "RECOVERY_HINT": "leftover-hint", "RENEWER": str(sentinel.pid),
+               "HELM_PID": str(sentinel.pid), "GSJ_ADDON_COMMAND_PID": str(sentinel.pid), "INIT_PUBLISH_TEMP": str(precious)}
+        result = subprocess.run([shutil.which("bash", path=SYSTEM_PATH), str(box.installer), *verb], env=env,
+                                cwd=str(box.installer.parent), capture_output=True, text=True, timeout=180)
+        assert sentinel.poll() is None, f"{verb[0]}'s exit signalled a process group it did not own"
+    finally:
+        sentinel.kill()
+        sentinel.wait()
+    assert result.returncode == (0 if verb[0] == "inspect" else 1), result.stderr
+    if verb[0] == "install":
+        assert "configuration file is missing" in result.stderr, result.stderr
+    assert "leftover" not in result.stderr, result.stderr
+    assert "MUTATION-REFUSED" not in result.stderr
+    assert not any(v in call for call in box.kube_calls() for v in ("delete", "replace", "create", "apply", "patch", "exec"))
+    assert list(box.tmpdir.iterdir()) == []
+    assert precious.exists() and precious.read_text() == "an operator's file", "the exit trap removed a file an exported leftover named"
 
 
 def test_leftover_variables_never_reach_a_cluster_even_when_init_stops_before_its_own_code(runtime):
-    """A recovery bundle refuses init after the exit trap exists: the unset
-    lives in main, before the trap, so the leftovers are gone by then."""
+    """A recovery bundle refuses init after the exit trap exists (bootstrap
+    installs it): the unset lives in main, before bootstrap, so the leftovers
+    are gone by then."""
     run, state, work = runtime
     payload = work / "payload"
     (payload / "helpers").mkdir(parents=True)
     (payload / "helpers" / "lease-repair-source-release.json").write_text("{}")
     for name in ("verification-cleanup.sh", "startup-recovery.sh"):
         (payload / "helpers" / name).write_text("")
-    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { :; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n',
-                 PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true")
+    precious = state.parent / "precious"
+    precious.write_text("an operator's file")
+    result = run('GSJ_PAYLOAD="$TEST_WORK/payload"\nbootstrap() { install_exit_traps; }\ninit_box() { touch "$TEST_WORK/init-ran"; }\nmain init\n',
+                 PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true", INIT_PUBLISH_TEMP=str(precious))
     assert result.returncode != 0 and "supports only inspect and lease-repair" in result.stderr
     assert not (work / "init-ran").exists()
     assert json.loads(state.read_text())["calls"] == [], "the exit trap acted on an exported leftover"
+    assert precious.exists() and precious.read_text() == "an operator's file", "the exit trap removed a file an exported leftover named"
+
+
+def test_leftover_variables_never_reach_a_cluster_when_bootstrap_stops_after_its_exit_trap(runtime, tmp_path):
+    """bootstrap installs the exit trap the moment its work directory exists,
+    so a stop while it unpacks the payload or fetches a client already runs
+    cleanup_exit: main must clear the leftovers before bootstrap, not after
+    it. The script run here carries no payload below its marker, so install
+    stops at 'installer payload missing' with the trap in place (the work
+    directory it removes is gone). The process-group leftover names a
+    sentinel this test owns and the context is exported, so a leftover probe
+    Pod would reach the recording kubectl: the sentinel outlives the run, no
+    kubectl call is recorded and no leftover name reaches the closing line."""
+    run, state, work = runtime
+    tools = Path(_tools(tmp_path / "tools", **FLOORS))
+    # sleep paces the exit trap's wait on a signalled group, as on any box:
+    # without it a trap acting on a leftover stops there, before the Pods.
+    (tools / "sleep").symlink_to(shutil.which("sleep", path=SYSTEM_PATH))
+    # The client preflight's version question is answered at the floor here;
+    # any other call reaches the fixture's recording kubectl.
+    (tools / "kubectl").write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = version ]; then printf \'{"clientVersion": {"gitVersion": "v%s"}}\\n\' "' + FLOORS["kubectl"] + '"; exit 0; fi\n'
+        f'exec "{sys.executable}" "{tmp_path / "bin" / "kubectl"}" "$@"\n')
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    (work / "no-payload.sh").write_text('source "$TEST_FUNCTIONS"\nmain install --non-interactive --config "$TEST_WORK/site.json"\necho REACHED\n')
+    sentinel = subprocess.Popen([shutil.which("sleep", path=SYSTEM_PATH), "300"], start_new_session=True)
+    try:
+        result = run('exec bash "$TEST_WORK/no-payload.sh"', PATH=str(tools), TMPDIR=str(tmpdir),
+                     CONTEXT="synthetic-context", NAMESPACE="synthetic-namespace",
+                     PROBE_POD="leftover-probe", OPERATION="leftover-op", LEASE_ACQUIRED="true",
+                     TRANSFER_HANDBACK_POD="leftover-pod", RECOVERY_HINT="leftover-hint",
+                     HELM_PID=str(sentinel.pid), GSJ_ADDON_COMMAND_PID=str(sentinel.pid))
+        assert sentinel.poll() is None, "the exit trap signalled a process group it did not own"
+    finally:
+        sentinel.kill()
+        sentinel.wait()
+    assert result.returncode == 1 and "installer payload missing" in result.stderr and "REACHED" not in result.stdout, result.stderr
+    assert list(tmpdir.iterdir()) == [], "the exit trap never ran: the work directory was left behind"
+    assert json.loads(state.read_text())["calls"] == [], "the exit trap acted on an exported leftover"
+    assert "leftover" not in result.stderr, result.stderr
 
 
 def test_no_secret_or_full_url_reaches_any_message_or_the_report(tmp_path, keypair):
@@ -1148,11 +1437,12 @@ def test_help_lists_init_and_the_verifier_and_inspect_are_pinned(runtime):
     pinned = re.search(r"^INIT_VERIFIER_SHA256=([0-9a-f]{64})$", source, re.M).group(1)
     assert pinned == hashlib.sha256((INSTALLER / "verify-release.sh").read_bytes()).hexdigest(), \
         "verify-release.sh changed: update INIT_VERIFIER_SHA256 in runtime.sh (init executes only the published verifier)"
-    # inspect_cluster is byte-identical to the text init was built on: the
-    # base head be7b2e7, whose proxy field goes through url_origin_only
-    # (re-pinned deliberately at that merge; before it, base 833fe99's text)
+    # inspect_cluster is byte-identical to the text init was built on
+    # (re-pinned deliberately when one comment about its proxy field was
+    # reworded; only that comment changed, every other line is the text init
+    # was built on)
     body = source[source.index("\ninspect_cluster() {"):source.index("\nquantity_bytes() {")]
-    assert hashlib.sha256(body.encode()).hexdigest() == "861eee2b780591f89ea8dc1b7c1d07082554717af04d98278aa337744c629788", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
+    assert hashlib.sha256(body.encode()).hexdigest() == "5296031fb5e8736420135a9cfbbec8f2bc952e6c5ec7004ae2dc2244afe7596d", "inspect_cluster changed; init runs it unchanged -- re-pin deliberately"
 
 
 def test_the_guides_check_table_names_exactly_the_checks_init_writes():
@@ -1239,6 +1529,80 @@ def test_a_release_without_a_corpus_fingerprint_asks_the_homepage_and_says_so(tm
     _no_leak(box, result)
 
 
+def _corpus_tag_findings(runtime, guide, examples):
+    """Where the corpus release's tag is spelled otherwise than the runtime
+    composes it (the github row's probe): the prefix before the fingerprint in
+    the guide's formulas, in every tag the guide and the example sites name
+    literally and in every example's corpus.vectors_url, and the one
+    eight-character fingerprint prefix all those literals share. `examples`
+    maps a file name to its site document. An empty list: no drift."""
+    composed = re.findall(r'corpus_tag="(corpus-[^"$]+\.)\$\{corpus_fp:0:8\}"', runtime)
+    base = re.findall(r'"(https://[^"$]+/releases/download/)\$corpus_tag/vectors\.json"', runtime)
+    if len(composed) != 1 or len(base) != 1:
+        return [f"runtime.sh composes {len(composed)} corpus tags under {len(base)} release URLs"]
+    prefix, base, findings, fingerprints = composed[0], base[0], [], {}
+    formulas = re.findall(r'releases/download/([^"/$]*)\$\{FP:0:8\}/vectors\.json', guide)
+    if len(formulas) < 2 or set(formulas) != {prefix}:
+        findings.append(f"OPERATOR.md: the vectors_url formulas compose {formulas}, the runtime {prefix!r}")
+    for tag in re.findall(r"\bcorpus-[0-9]+\.[A-Za-z0-9.-]*", guide):
+        if tag == prefix:
+            continue                                                # a formula's, checked above
+        fingerprint = tag[len(prefix):].rstrip(".") if tag.startswith(prefix) else ""
+        if not re.fullmatch(r"[0-9a-f]{8}", fingerprint):
+            findings.append(f"OPERATOR.md: {tag}")
+        fingerprints.setdefault(fingerprint, []).append("OPERATOR.md")
+    for name, site in sorted(examples.items()):
+        url = site.get("corpus", {}).get("vectors_url")
+        if url is None:
+            continue                                                # a vectors_path site
+        tag = url[len(base):-len("/vectors.json")] if url.startswith(base) and url.endswith("/vectors.json") else ""
+        if not (tag.startswith(prefix) and re.fullmatch(r"[0-9a-f]{8}", tag[len(prefix):])):
+            findings.append(f"{name}: {url}")
+        fingerprints.setdefault(tag[len(prefix):], []).append(name)
+    if len(fingerprints) != 1:
+        findings.append(f"the literal tags name {len(fingerprints)} fingerprint prefixes: {sorted(fingerprints)}")
+    return findings
+
+
+def _corpus_tag_places():
+    examples = {path.name: json.loads(path.read_text()) for path in sorted((INSTALLER / "examples").glob("*.site.json"))}
+    return (INSTALLER / "runtime.sh").read_text(), (INSTALLER / "OPERATOR.md").read_text(), examples
+
+
+def test_the_corpus_release_tag_is_spelled_as_the_runtime_composes_it_everywhere():
+    """The corpus release's tag -- corpus-1.snowflake-m-v2-int8-768. and the
+    first eight characters of the corpus fingerprint -- is composed by the
+    runtime (the github row's probe), by the guide's two vectors_url
+    formulas, spelled out in the guide's worked text and example documents,
+    in every example site's corpus.vectors_url, and in this module's
+    CORPUS_TAG. A prefix changed in one place and not the others would send
+    the operator, the probe or a test to another release; so would two
+    examples naming different corpus releases."""
+    runtime, guide, examples = _corpus_tag_places()
+    assert _corpus_tag_findings(runtime, guide, examples) == []
+    prefix = re.search(r'corpus_tag="(corpus-[^"$]+\.)\$\{corpus_fp:0:8\}"', runtime).group(1)
+    assert CORPUS_TAG == prefix + CORPUS_FINGERPRINT[:8]
+    assert sum("vectors_url" in site.get("corpus", {}) for site in examples.values()) >= 1
+
+
+@pytest.mark.parametrize("drift", ["the runtime's prefix", "a guide formula", "the guide's worked text", "an example's fingerprint", "an example's prefix"])
+def test_the_corpus_tag_check_names_a_place_that_drifted(drift):
+    runtime, guide, examples = _corpus_tag_places()
+    prefix, other = "corpus-1.snowflake-m-v2-int8-768.", "corpus-2.snowflake-m-v2-int8-768."
+    name = next(n for n, site in sorted(examples.items()) if "vectors_url" in site.get("corpus", {}))
+    if drift == "the runtime's prefix":
+        runtime = runtime.replace('corpus_tag="' + prefix, 'corpus_tag="' + other, 1)
+    elif drift == "a guide formula":
+        guide = guide.replace(prefix + "${FP:0:8}", other + "${FP:0:8}", 1)
+    elif drift == "the guide's worked text":
+        guide = guide.replace("`" + prefix + "13c5dee7`", "`" + prefix + "0badc0de`", 1)
+    else:
+        url = examples[name]["corpus"]["vectors_url"]
+        examples[name]["corpus"]["vectors_url"] = url.replace(prefix + "13c5dee7", prefix + "0badc0de" if drift == "an example's fingerprint" else other + "13c5dee7")
+    assert (runtime, guide) != _corpus_tag_places()[:2] or examples != _corpus_tag_places()[2], "the drift was not planted"
+    assert _corpus_tag_findings(runtime, guide, examples) != []
+
+
 @pytest.mark.parametrize("code,status", [("401", "PASS"), ("200", "PASS"), ("403", "FAIL"), ("500", "FAIL")])
 def test_the_ghcr_row_reports_what_the_answer_established(tmp_path, keypair, code, status):
     """The same rule for ghcr.io, whose PASS includes 401 -- how a registry
@@ -1257,7 +1621,7 @@ def test_the_ghcr_row_reports_what_the_answer_established(tmp_path, keypair, cod
 
 
 def test_the_full_report_carries_only_the_proxy_s_origin(tmp_path, keypair):
-    """Review B2: a full init run -- inspect included, its profile spliced
+    """A full init run -- inspect included, its profile spliced
     into the report -- with a proxy whose URL carries userinfo, a path, a
     query and a fragment, each a canary. The report's
     .inspect.profile.networking.egress.proxy_origin is the origin alone (the

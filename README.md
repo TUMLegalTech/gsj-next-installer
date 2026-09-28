@@ -40,7 +40,24 @@ install and when you would find out.
   volumes you make yourself — and a single node that can hold the three
   volumes (the deployment is single-node, ReadWriteOnce). An ingress
   controller and a TLS route, or the installer's managed Traefik and ACME
-  profiles. A CNI that enforces NetworkPolicy, if the isolation is to be real.
+  profiles. A CNI that enforces NetworkPolicy: on one that does not, the
+  install does not complete — it stops at its own network check, after the
+  corpus import and before any acceptance check has run. Every pull of the
+  release's images is proven on the storage node before anything is applied,
+  for every site, one probe Pod per image in turn, so nodes that cannot pull
+  stop an install at its start, not hours in. A pull that fails in a way no
+  retry changes (a refused credential, a name or digest the registry does not
+  hold, an invalid name) is refused after 90 s, or sooner when
+  `deadlines.dependencies_seconds` is shorter; any other failure within
+  `deadlines.dependencies_seconds` (900 s by default) of its first report;
+  a probe Pod the scheduler cannot place — each asks for 100m CPU and
+  128Mi, one at a time, beside the running deployment on an upgrade — after
+  300 s; and one that ends, is deleted or is replaced by another Pod of its
+  name before its pull, at once. With
+  `registry.base` (or on the upgrade that drops it) all six images must
+  arrive within `deadlines.dependencies_seconds`, which a slow link to the
+  mirror may need raised; without it a pull still under way then is waited
+  for up to `deadlines.initialization_seconds` more.
 - **A Linux machine to run the installer from**, with Bash, curl, tar/gzip,
   base64 and a SHA-256 tool, a kubeconfig for the cluster, **OpenSSL ≥ 3.0**
   (OpenSSL, not LibreSSL: macOS's `/usr/bin/openssl` is LibreSSL, which has
@@ -51,9 +68,20 @@ install and when you would find out.
   LibreSSL or an OpenSSL below the floor, are named with the tool, the floor
   and what was found; an `openssl` absent from the PATH altogether is refused
   by name alone, as a required utility. `--fetch-tools` downloads its own
-  pinned clients instead (it does not supply OpenSSL). `init` is the one
-  command that does not stop at the first: it names them all at once, in its
-  report (below).
+  pinned clients instead (it does not supply OpenSSL), and
+  `--fetch-tools=TOOL[,TOOL]` only the ones it names: `--fetch-tools=helm`
+  downloads Helm alone — the pinned Helm 4 that four recovery paths need —
+  and keeps your own kubectl and jq, floors still checked. An `install` or
+  `upgrade` warns, before the operation Lease, about a kubectl more than one
+  minor from the API server, and refuses one that `--fetch-tools` brought
+  (*kubectl version skew*) — on `upgrade --to` too, whose target installer
+  is told which clients the run fetched and fetches its own release's pins
+  of them: from the cache when they are the same pins, otherwise downloaded,
+  which needs their download addresses reachable. That hand-off needs the
+  installer running `upgrade --to` to be this release or a later one: from
+  v0.10.0-beta.6 the target only warns about the skew. `init` is the
+  one command that does not stop at the first: it names them all at once, in
+  its report (below).
 - **A vision-capable OCR endpoint**, for scanned pages: an OpenAI-compatible
   chat-completions route whose model can read an image. Step 0 of the guide
   has a probe you can run with `curl` and `jq` before you start, and the
@@ -72,7 +100,9 @@ install and when you would find out.
   registry auth file you point it at. TUM Legal Tech hands the token over
   directly, with the release; it never travels through this repository.
 - About 3.5 GB free on the machine you install from (the corpus vectors and
-  their envelope), and the volume sizes in the guide on the cluster.
+  their envelope, under the cache directory and `TMPDIR` — on a box with a
+  small root filesystem, both belong on the data disk: step 1 of the guide),
+  and the volume sizes in the guide on the cluster.
 
 ## `init`: one file, one command, one report
 
@@ -101,15 +131,16 @@ published with. Then the installer's own bytes are held to the signed
 descriptor (SHA-256 and length, under the embedded key), the published
 verifier is run over the same files from that private copy, and only when
 both pass are the downloaded files put beside the installer (or, when that
-folder cannot be written, in `$HOME/gsj-operator/releases/<version>/`); an
-unverified run keeps none.
+folder cannot be written or is on a file system without hard links, such as
+FAT, exFAT and some network shares, in
+`$HOME/gsj-operator/releases/<version>/`); an unverified run keeps none.
 
 Then it checks the box, all at once, and writes every result as PASS, FAIL
 or UNKNOWN with the reason and the fix: helm, kubectl (and its skew
-against the cluster) and jq against their floors, saying what to install and
-which of them `--fetch-tools` can supply for the other commands (never
-OpenSSL), with OpenSSL, bash, curl, tar, gzip, base64 and the SHA-256 tool
-recorded as found (a box that lacks one of those is refused before `init`
+against the cluster) and jq against their floors, saying what to install and,
+for each one this release pins for the platform, the `--fetch-tools=TOOL` that
+fetches it alone for the other commands (never OpenSSL), with OpenSSL, bash,
+curl, tar, gzip, base64 and the SHA-256 tool recorded as found (a box that lacks one of those is refused before `init`
 can run, one at a time); the
 cluster its kubeconfig points at, named by its context, and its version
 against the floor; `github.com`, where the corpus release lives, and
@@ -144,9 +175,9 @@ published verifier; it refuses `--fetch-tools`, which would download and
 run three clients. Without a network it still produces its report from what
 is on the box, and says what the no-egress route needs instead. A missing or
 LibreSSL `openssl`, a missing bash, curl, tar, gzip or base64, or a machine
-without `sha256sum` or `shasum`, is refused by name before `init` runs, one
-at a time, like before every other command: those are the tools `init`
-cannot report around.
+without `sha256sum` or `shasum` (*bootstrap utility required: sha256sum or
+shasum*), is refused by name before `init` runs, one at a time, like before
+every other command: those are the tools `init` cannot report around.
 
 **The honest limit.** `init` proves that the installer arrived intact and
 matches its published descriptor. It cannot prove that the installer is

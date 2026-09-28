@@ -19,7 +19,7 @@ url_origin() { local rest=${1#*://}; printf '%s://%s' "${1%%://*}" "${rest%%/*}"
 url_origin_only() {
  # scheme://host[:port] of a URL, the path, query, fragment AND any userinfo
  # dropped: a credential can sit in any of them, and a log line or a record
- # names the endpoint, never what it carries [review B2]. Not a URL: printed
+ # names the endpoint, never what it carries. Not a URL: printed
  # as it is (no scheme). A URL whose authority is not a host and a numeric
  # port -- a password with an unencoded "/" cut the authority short, a
  # bracketless IPv6 -- is named by the fixed words below, never repeated.
@@ -37,14 +37,13 @@ known_word() {
  # condition type or reason, a PersistentVolume phase -- is repeated only
  # when it is one of the values this installer knows: the API does not
  # constrain a reason string, so anything else (a crafted status, a value a
- # newer API adds) becomes the fixed word "other" [review sweep B2,
- # review sweep B2]. Usage: known_word VALUE KNOWN...
+ # newer API adds) becomes the fixed word "other". Usage: known_word VALUE KNOWN...
  local value=$1 word; shift
  for word in "$@"; do [[ $value == "$word" ]] && { printf '%s' "$value"; return; }; done
  printf 'other'
 }
 validator_words() {
- # validate.jq's stderr, made printable [review B2]. The validator's OWN
+ # validate.jq's stderr, made printable. The validator's OWN
  # line (`field: reason`, no quote, brace or bracket in it) passes through
  # with the line jq reported; a jq diagnostic -- a type error quotes the
  # input it choked on, a compile error the program -- is named by its line
@@ -60,27 +59,37 @@ validator_words() {
 }
 pull_failure_condition() {
  # The CONDITION a container runtime's pull message establishes, in this
- # installer's words. The message itself is untrusted text -- a registry or
- # a proxy composes it, a bearer can ride in it -- and is never repeated
- # [review B2]; it is kept in the state directory for the operator.
+ # installer's words, printed after the word that says whether the kubelet's
+ # retries can change it and a tab. "definitive": the registry's answer about
+ # this credential or this name, or a reference that is not a name, which
+ # every retry gets again. "retryable": the rest -- a connection, a rate
+ # limit, a certificate or a disk the node's side can put right while the
+ # kubelet retries, and words this installer does not classify, which a
+ # retry may clear. The message itself is untrusted text -- a registry or
+ # a proxy composes it, a bearer can ride in it -- and is never repeated;
+ # it is kept in the state directory for the operator.
  local m; m=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
  case $m in
-   *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'the registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
-   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'the registry does not hold that name and digest (not found: the digest was not copied there unchanged, or the prefix is not exact)';;
-   *"no such host"*|*"server misbehaving"*|*"lookup "*|*"i/o timeout"*|*"connection refused"*|*"no route"*|*"dial tcp"*|*"network is unreachable"*|*"connection reset"*) printf 'the node could not connect to the registry (DNS, a route, a proxy, or a refused or timed-out connection)';;
-   *x509*|*certificate*|*"tls handshake"*) printf 'the node does not trust the registry'"'"'s certificate (a CA the container runtime does not know)';;
-   *toomanyrequests*|*"too many requests"*|*"rate limit"*) printf 'the registry rate-limited the pull (a limit or an outage on its side)';;
-   *"no space"*|*"disk pressure"*) printf 'the node'"'"'s disk is full';;
-   *) printf 'a condition this installer does not classify';;
+   *unauthorized*|*"authentication required"*|*forbidden*|*denied*) printf 'definitive\tthe registry refused the pull (unauthorized or forbidden: the credential in registry.pull_secret, or its access to that repository)';;
+   *"manifest unknown"*|*"not found"*|*notfound*|*"no such manifest"*|*"unknown blob"*) printf 'definitive\tthe registry does not hold that name and digest (not found)';;
+   *"invalid reference format"*|*"couldn't parse image"*|*invalidimagename*) printf 'definitive\tthe reference is not a valid image name (an invalid name)';;
+   *"no such host"*|*"server misbehaving"*|*"lookup "*|*"i/o timeout"*|*"connection refused"*|*"no route"*|*"dial tcp"*|*"network is unreachable"*|*"connection reset"*) printf 'retryable\tthe node could not connect to the registry (DNS, a route, a proxy, or a refused or timed-out connection)';;
+   *x509*|*certificate*|*"tls handshake"*) printf 'retryable\tthe node does not trust the registry'"'"'s certificate (a CA the container runtime does not know)';;
+   *toomanyrequests*|*"too many requests"*|*"rate limit"*) printf 'retryable\tthe registry rate-limited the pull (a limit or an outage on its side)';;
+   *"no space"*|*"disk pressure"*) printf 'retryable\tthe node'"'"'s disk is full';;
+   *) printf 'retryable\ta condition this installer does not classify';;
  esac
 }
 kubectl_failure_condition() {
  # The same rule for kubectl's stderr on a refused create: classified, kept,
  # never repeated (an admission webhook's message is whatever its author
- # wrote) [review B2].
+ # wrote).
  local m; m=$(tr '[:upper:]' '[:lower:]' < "$1")
  case $m in
    *podsecurity*|*"admission webhook"*|*"denied the request"*|*admission*) printf 'an admission policy refused it';;
+   # LimitRange and ResourceQuota answer "forbidden" too, and their cure is
+   # the namespace's policy, never the kubeconfig's permissions.
+   *"exceeded quota"*|*"failed quota"*|*limitrange*|*"minimum "*|*"maximum "*|*"limit to request ratio"*) printf 'an admission policy (LimitRange or ResourceQuota) refused the Pod';;
    *forbidden*) printf 'the API server refused it as forbidden (the kubeconfig'"'"'s permissions in this namespace)';;
    *"already exists"*) printf 'a Pod of that name already exists';;
    *"connection refused"*|*"unable to connect"*|*"no such host"*|*"i/o timeout"*|*"timed out"*) printf 'the API server could not be reached';;
@@ -271,17 +280,22 @@ client_preflight() {
  # A missing or too-old client is a TEN-SECOND refusal, here — before the
  # payload is even unpacked, before the site is read, before the Lease, before
  # the first cluster object exists. It names the tool, the floor, and what was
- # actually found, and it names the escape hatch.
+ # actually found, and it names the escape hatch: the single-client fetch of
+ # exactly that tool.
+ # A client this run fetches (FETCH_SET) is the release's checksum-pinned one,
+ # never judged by this box's copy; every other one still is, so
+ # --fetch-tools=helm refuses a too-old kubectl or jq here, by name.
  local tool floor found
  for tool in jq kubectl helm; do
+   [[ " ${FETCH_SET:-} " != *" $tool "* ]] || continue
    case "$tool" in jq) floor=$GSJ_JQ_FLOOR;; kubectl) floor=$GSJ_KUBECTL_FLOOR;; helm) floor=$GSJ_HELM_FLOOR;; esac
    command -v "$tool" >/dev/null \
-     || fail "requires $tool >= $floor, found none on PATH. Install $tool, or re-run with --fetch-tools to download this release's pinned clients for this run only."
+     || fail "requires $tool >= $floor, found none on PATH. Install $tool, or re-run with --fetch-tools=$tool to download this release's pinned $tool for this run only."
    found=$(client_version "$tool")
    [[ -n $found ]] \
-     || fail "requires $tool >= $floor, but $(command -v "$tool") did not report a version. Check the binary, or re-run with --fetch-tools."
+     || fail "requires $tool >= $floor, but $(command -v "$tool") did not report a version. Check the binary, or re-run with --fetch-tools=$tool."
    version_at_least "$found" "$floor" \
-     || fail "requires $tool >= $floor, found $found ($(command -v "$tool")). Upgrade $tool, or re-run with --fetch-tools to download this release's pinned clients for this run only."
+     || fail "requires $tool >= $floor, found $found ($(command -v "$tool")). Upgrade $tool, or re-run with --fetch-tools=$tool to download this release's pinned $tool for this run only."
  done
 }
 helm_dialect() {
@@ -336,15 +350,16 @@ require_offline_render() {
  (( HELM_MAJOR > 0 )) || helm_dialect
  # Refuse only on a POSITIVELY KNOWN Helm 3. A zero here means no helm reported
  # a version at all, and that cannot happen on a real run: client_preflight is
- # fail-CLOSED on exactly that case at startup, and --fetch-tools installs a
- # known Helm 4. The two checks are one design -- the strict one runs early,
- # where it can still be acted on, so refusing an unknown a second time here
- # would add no safety and would instead break every caller that legitimately
- # never had a helm binary to model.
- (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "this step serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools."
+ # fail-CLOSED on exactly that case at startup for a helm the run does not
+ # fetch, and --fetch-tools (bare or =helm) installs a known Helm 4. The two
+ # checks are one design -- the strict one runs early, where it can still be
+ # acted on, so refusing an unknown a second time here would add no safety and
+ # would instead break every caller that legitimately never had a helm binary
+ # to model.
+ (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "this step serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools=helm (this release's pinned Helm 4 for this run only, beside your own kubectl and jq)."
 }
 helm_verb_preflight() {
- # THE HELM 4 VERBS, refused in the first seconds [review B3] -- after the
+ # THE HELM 4 VERBS, refused in the first seconds -- after the
  # clients are known and the site is read, before the cluster is read and
  # before the Lease. Four paths reach the offline render above (the sites of
  # require_offline_render, all four): addon-repair always
@@ -402,31 +417,43 @@ helm_verb_preflight() {
  esac
  [[ -n $verb ]] || return 0
  (( HELM_MAJOR > 0 )) || helm_dialect
- (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "$verb serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm) at $(command -v helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools (this release's pinned Helm 4 for this run only); every other command runs on Helm >= $GSJ_HELM_FLOOR"
+ (( HELM_MAJOR == 0 || HELM_MAJOR >= 4 )) || fail "$verb serializes a release without contacting the cluster, which only Helm 4 can do (found helm $(client_version helm) at $(command -v helm)). Install Helm 4 alongside, or re-run this command with --fetch-tools=helm (this release's pinned Helm 4 for this run only, beside your own kubectl and jq); every other command runs on Helm >= $GSJ_HELM_FLOOR"
 }
 bootstrap() {
  for utility in bash curl tar gzip base64 openssl awk cut uname mktemp date sync; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
- # init alone names a box without a SHA-256 tool here (the payload check below would blame the payload).
- [[ ${COMMAND:-} != init ]] || command -v sha256sum >/dev/null || command -v shasum >/dev/null || fail 'bootstrap utility required: sha256sum or shasum'
+ # Every verb names a box without a SHA-256 tool here: the payload check below
+ # would fail as 'embedded payload integrity failed', blaming the payload.
+ command -v sha256sum >/dev/null || command -v shasum >/dev/null || fail 'bootstrap utility required: sha256sum or shasum'
  openssl_preflight
  # ${FETCH_TOOLS:-false}: main sets it while parsing arguments, but bootstrap
  # must not abort with an unbound variable if it is ever reached without that.
+ # FETCH_SET names the clients this run downloads (main sets it beside
+ # FETCH_TOOLS); the flag without a set means all three, as the bare flag does.
+ if ${FETCH_TOOLS:-false}; then FETCH_SET=${FETCH_SET-jq kubectl helm}; else FETCH_SET=''; fi
  # init reports every missing or too-old client at once instead of stopping
- # at the first; every other verb keeps the ten-second refusal.
- ${FETCH_TOOLS:-false} || [[ ${COMMAND:-} == init ]] || client_preflight
+ # at the first; every other verb keeps the ten-second refusal for each client
+ # it does not fetch.
+ [[ ${COMMAND:-} == init ]] || client_preflight
  DOWNLOAD_AUTH_FILE=''
  local os arch tool info url checksum packed marker
  os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m)
  case "$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; *) fail "unsupported installer architecture: $arch";; esac
  GSJ_PLATFORM="$os/$arch"; GSJ_WORK=$(mktemp -d "${TMPDIR:-/tmp}/gsj-install.XXXXXXXX")
+ # The exit trap removes this directory, so it goes in the moment the
+ # directory exists: the unpack and the client fetches below can stop the
+ # run, and a trap installed after bootstrap returned left it behind.
+ install_exit_traps
  GSJ_PAYLOAD="$GSJ_WORK/payload"; GSJ_PRIVATE_BIN="$GSJ_WORK/bin"; mkdir -p "$GSJ_PAYLOAD" "$GSJ_PRIVATE_BIN"
  marker=$(awk '/^__GSJ_PAYLOAD_BELOW__$/ {print NR+1; exit}' "$0"); [[ -n $marker ]] || fail 'installer payload missing'
  tail -n "+$marker" "$0" | base64 --decode | tar -xz -C "$GSJ_PAYLOAD"
  (cd "$GSJ_PAYLOAD"; if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS >/dev/null; else shasum -a 256 -c SHA256SUMS >/dev/null; fi) || fail 'embedded payload integrity failed'
  # The download path is KEPT, intact and checksum-pinned, for an
- # air-gapped or under-provisioned box — but it is now opt-in.
+ # air-gapped or under-provisioned box — but it is now opt-in, and per client:
+ # only what FETCH_SET names goes into the private directory, so every other
+ # client on PATH stays this box's own (the one the preflight admitted).
  if ${FETCH_TOOLS:-false}; then
    for tool in jq kubectl helm; do
+     [[ " $FETCH_SET " == *" $tool "* ]] || continue
      info=$(gsj_client_info "$tool" "$GSJ_PLATFORM") || fail "unqualified client platform: $GSJ_PLATFORM/$tool"
      IFS=$'\t' read -r url checksum <<< "$info"
      packed="${XDG_CACHE_HOME:-$HOME/.cache}/gsj-install/$tool/$GSJ_PLATFORM/$checksum"; mkdir -p "$(dirname "$packed")"; chmod 700 "$(dirname "$packed")"; fetch "$url" "$packed" "$checksum"
@@ -495,7 +522,7 @@ validate_site() {
  fi
  # The top-level shape, named before the merge: a site whose whole value is
  # a string or a list would reach `.[0] * .[1]`, and jq's diagnostic for
- # that quotes the value -- a secret pasted in the wrong place [review B2].
+ # that quotes the value -- a secret pasted in the wrong place.
  local shape; shape=$(jq -r type "$CONFIG")
  [[ $shape == object ]] || fail "the site file must be a JSON object at the top level, and $CONFIG holds a $shape. Its contents are not repeated here; the payload's site.schema.json is the field reference"
  if ! { jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" | jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" > "$SITE"; } 2> "$GSJ_WORK/validate.err"; then
@@ -584,16 +611,34 @@ wizard_credential() {
  esac
 }
 wizard_discover() {
- local context=$1 nodes classes ingress
+ local context=$1 nodes classes ingress workloads="$GSJ_WORK/wizard-workloads.json"
  nodes=$(kubectl --context "$context" get nodes -o json)
  classes=$(kubectl --context "$context" get storageclasses -o json)
  ingress=$(kubectl --context "$context" get ingressclasses -o json)
- jq --argjson nodes "$nodes" --argjson classes "$classes" --argjson ingress "$ingress" '
+ # ingress.namespace is the one namespace the application's NetworkPolicy
+ # admits, so it must be where the controller's Pods RUN. The class's Helm
+ # release namespace says where its chart was recorded, and a class applied
+ # from plain manifests carries none (the default then named a namespace with
+ # no controller in it). The controller is found by inspect's rule, narrowed
+ # to the image family the class's spec.controller names; the annotation and
+ # then the default stay the fallback. Read into a file: every Deployment and
+ # DaemonSet of a cluster can exceed what one argument may carry.
+ printf '{"items":[]}' > "$workloads"
+ if jq -e '.items|length==1' <<< "$ingress" >/dev/null; then kubectl --context "$context" get deployments,daemonsets -A -o json > "$workloads" 2>/dev/null || printf '{"items":[]}' > "$workloads"; fi
+ jq --argjson nodes "$nodes" --argjson classes "$classes" --argjson ingress "$ingress" --slurpfile workloads "$workloads" '
    if ($nodes.items|length)==1 then .storage.node=$nodes.items[0].metadata.name else . end |
    if ($classes.items|length)==0 then .storage.profile="managed-local-path"|.storage.class="gsj-local"
    else .storage.class=($classes.items|sort_by(.metadata.annotations["storageclass.kubernetes.io/is-default-class"]!="true",.metadata.name)|.[0].metadata.name) end |
    if ($ingress.items|length)==0 then .ingress.profile="managed-traefik"
-   elif ($ingress.items|length)==1 then .ingress.class=$ingress.items[0].metadata.name | .ingress.namespace=($ingress.items[0].metadata.annotations["meta.helm.sh/release-namespace"] // .ingress.namespace)
+   elif ($ingress.items|length)==1 then .ingress.class=$ingress.items[0].metadata.name |
+     ($ingress.items[0].spec.controller // "") as $controller |
+     ([["ingress-nginx","traefik","haproxy","contour"][] as $family|select($controller|contains($family))|$family]|first) as $family |
+     ([($workloads[0].items // [])[]|
+       select((.metadata.name|test("ingress|traefik|nginx|haproxy|contour|istio"))
+           or any((.spec.template.spec.containers // [])[]; (.image // "")|test("ingress-nginx|traefik|haproxy|contour")))|
+       select($family != null and any((.spec.template.spec.containers // [])[]; (.image // "")|contains($family)))|
+       .metadata.namespace]|unique) as $homes |
+     .ingress.namespace=(if ($homes|length)==1 then $homes[0] else ($ingress.items[0].metadata.annotations["meta.helm.sh/release-namespace"] // .ingress.namespace) end)
    else . end
  ' "$WIZARD" | atomic "$WIZARD"
 }
@@ -602,7 +647,7 @@ wizard() {
  mkdir -p "$(dirname "$CONFIG")"; WIZARD="$GSJ_WORK/wizard.json"
  if [[ -f $CONFIG ]]; then
    # the saved site's shape first: a string or a list would reach the merge,
-   # whose diagnostic quotes the value [review sweep B2]
+   # whose diagnostic quotes the value
    local shape; shape=$(jq -r type "$CONFIG" 2>/dev/null || printf 'value that is not valid JSON')
    [[ $shape == object ]] || fail "the saved site file must be a JSON object at the top level, and $CONFIG holds a $shape. Its contents are not repeated here"
    jq -s '.[0] * .[1]' "$GSJ_PAYLOAD/defaults.json" "$CONFIG" > "$WIZARD"
@@ -644,7 +689,7 @@ wizard() {
  # Validate to a private file first: a refused answer must never replace the
  # saved site with an empty one, and the refusal is a named one.
  if ! jq --slurpfile schema "$GSJ_PAYLOAD/site.schema.json" -f "$GSJ_PAYLOAD/validate.jq" "$WIZARD" > "$GSJ_WORK/wizard-validated.json" 2> "$GSJ_WORK/validate.err"; then
-   # the validator's own line passes; a jq diagnostic is kept, never printed [review B2]
+   # the validator's own line passes; a jq diagnostic is kept, never printed
    local kept; kept="$(dirname "$CONFIG")/.gsj"; mkdir -p "$kept"; chmod 700 "$kept"; atomic "$kept/site-refusal.err" < "$GSJ_WORK/validate.err"
    words=$(validator_words "$GSJ_WORK/validate.err" "$kept/site-refusal.err")
    # The effective site is the saved file merged with these answers; a refused
@@ -727,13 +772,13 @@ inspect_cluster() {
  done
  # A proxy is reported by PRESENCE and origin only: a proxy URL may carry
  # user:password@, which must never reach this document (proxy_file_check
- # refuses one at the site input for the same reason). Through
- # url_origin_only, the one function -- the hand-made cut before it dropped
- # the userinfo, the scheme and the path and KEPT the query and the fragment
- # (an init report carried `proxy.example?REVIEW_PROXY_QUERY_SECRET`)
- # [review B2]. A proxy variable may omit its scheme: one is lent for
- # the parse and taken back, so the field keeps its host[:port] shape; an
- # authority that is not a host is named by the function's fixed words.
+ # refuses one at the site input for the same reason). It goes through
+ # url_origin_only, the one function: the hand-made cut before it dropped
+ # the userinfo, the scheme and the path and KEPT the query and the fragment,
+ # so an init report carried a proxy's query string. A proxy variable may
+ # omit its scheme: one is lent for the parse and taken back, so the field
+ # keeps its host[:port] shape; an authority that is not a host is named by
+ # the function's fixed words.
  local proxy_set proxy_origin=''
  proxy_set=$( [[ -n ${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}} ]] && printf true || printf false)
  if [[ $proxy_set == true ]]; then
@@ -1242,15 +1287,16 @@ endpoint_preflight() {
 }
 preflight() {
  k cluster-info >/dev/null
- local platform nodes pull server
+ local platform nodes pull server versions permissions
  # The server floor, asserted HERE so a too-old cluster is refused before the
  # first write rather than by Helm after the Lease, the Secrets and the add-ons.
  # `|| true` inside the substitution: under `set -Eeuo pipefail` a kubectl that
  # cannot answer `version` would otherwise make this ASSIGNMENT abort preflight
  # outright rather than leave $server empty. An unreadable server version must
  # skip the floor check, not kill the run -- the same trap that cost 43 test
- # regressions in client_version.
- server=$( { k version -o json 2>/dev/null || true; } | jq -r '.serverVersion.gitVersion // ""' 2>/dev/null || true)
+ # regressions in client_version. The answer is kept for the client's skew.
+ versions=$( { k version -o json 2>/dev/null || true; } )
+ server=$(jq -r '.serverVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
  [[ -z $server ]] || version_at_least "${server#v}" "$GSJ_SERVER_FLOOR" \
    || fail "requires Kubernetes >= $GSJ_SERVER_FLOOR, found $server. This release selects the provisioning Job by batch.kubernetes.io/job-name, a label the Job controller stamps only from 1.27; on an older server that Job is silently denied its dependencies by a NetworkPolicy that matches nothing."
  nodes=$(k get nodes -o json)
@@ -1258,13 +1304,25 @@ preflight() {
  initializer_memory_check "$nodes"
  [[ -n $platform ]] || fail 'selected storage node is unavailable'
  while IFS= read -r nodes; do jq -e --arg p "$nodes" '.platforms | index($p)' "$GSJ_PAYLOAD/release.json" >/dev/null || fail "release has no qualified native images for $nodes"; done <<< "$platform"
- for permission in 'get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps' 'create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io'; do
-   read -r verb resource <<< "$permission"; [[ $(k auth can-i "$verb" "$resource") == yes ]] || fail "missing deployment permission: $permission"
+ # get replicasets.apps: the initializer wait proves its Pod is this release's
+ # own through the ReplicaSet that owns it. It is asked for by the verbs that
+ # reach that wait, and by them alone, and a denial is named, never refused:
+ # the previous release asked for none, a Role that ran it must still run
+ # this one, and the wait judges the Pod by its labels when the read is refused.
+ permissions=('get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps')
+ if [[ $COMMAND =~ ^(install|upgrade|resume|repair|restore|restore-repair)$ ]]; then permissions+=('get replicasets.apps'); fi
+ permissions+=('create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io')
+ for permission in "${permissions[@]}"; do
+   read -r verb resource <<< "$permission"; [[ $(k auth can-i "$verb" "$resource") == yes ]] && continue
+   [[ $permission == 'get replicasets.apps' ]] || fail "missing deployment permission: $permission"
+   log "This kubeconfig may not get replicasets.apps in namespace $NAMESPACE, so the corpus initializer wait cannot prove that an application Pod is Deployment $RELEASE-web's own and judges a Pod that a ReplicaSet controls, carries release $RELEASE's labels and is not being deleted. Grant get on replicasets.apps to restore the proof"
  done
  # A referenced pull Secret is never created here. Refuse before the first
- # write instead of after image pulls back off; restore recreates it.
+ # write instead of after image pulls back off; restore recreates it. sweep,
+ # abandon and lease-repair pull no image, and sweep must clear a dead run's
+ # residue even once the namespace, and any pull Secret in it, is gone.
  pull=$(j .registry.pull_secret)
- if [[ -n $pull && -z $(j .registry.config_file) && $COMMAND != restore && $COMMAND != restore-repair ]]; then
+ if [[ -n $pull && -z $(j .registry.config_file) && ! $COMMAND =~ ^(restore|restore-repair|sweep|abandon|lease-repair)$ ]]; then
    k get secret "$pull" -o json 2>/dev/null | jq -e '(.type=="kubernetes.io/dockerconfigjson" and (.data[".dockerconfigjson"]|type=="string" and length>0)) or (.type=="kubernetes.io/dockercfg" and (.data[".dockercfg"]|type=="string" and length>0))' >/dev/null || fail "registry.pull_secret must name an existing image pull Secret in namespace $NAMESPACE; create it or set registry.config_file"
  fi
  registry_base_preflight
@@ -1275,6 +1333,227 @@ preflight() {
    jq -e '.provisioner | IN("rancher.io/local-path","rancher.io/gsj-local-path","kubernetes.io/no-provisioner")' "$STATE_DIR/storage-class.json" >/dev/null || fail 'storage driver needs SQLite/fsync/locking qualification; only qualified local-path/static-local profiles are admitted'
    [[ $(j .storage.node) != '' ]] || fail 'SQLite local storage requires an explicit placement node'
  fi
+ # The site's own references and kubectl's distance from the server, read
+ # before the Lease. Only an install or an upgrade writes what they would
+ # stop; every recovery verb runs against what is already there.
+ if [[ $COMMAND == install || $COMMAND == upgrade ]]; then preflight_site_checks "$versions"; fi
+}
+preflight_site_checks() {
+ # What an install or an upgrade used to meet only after the Lease -- the TLS
+ # Secret and certificate files (managed_dependencies), the operator Secret
+ # (secret_file: an upgrade met a changed password file after its backup had
+ # quiesced the application), leftover add-on CRDs (managed_helm_addon) -- or
+ # hours in, at the acceptance check: an expired or foreign certificate, a
+ # controller namespace with no controller, a host another Ingress serves.
+ # Every call here is a get. A refusal is a fixed sentence and the names
+ # involved; what kubectl said on a failed read, and what jq said of a site
+ # file, is kept in the state directory and never repeated. A read this
+ # credential may not make is logged and passed, as the capacity check does:
+ # a namespace-scoped operator is a supported shape, and the later checks
+ # still stand.
+ local versions=$1 host secret existing crt key ca ns found others class pods controller counts total running controllers client server cv='' sv='' cm sm crds owner names selected traefik acme orphans='' homes='' strays='' stray_homes='' home where
+ host=$(j '.public_url // ""' | sed -nE 's#^https://([^/:@?\#]+)(:[0-9]+)?([/?\#].*)?$#\1#p')
+ # kubectl is supported within one minor of the server (init's kubectl-skew
+ # row). A kubectl this run downloaded is the release's pin, not the
+ # operator's choice, so a skew there is refused; a skew in this machine's own
+ # kubectl is said, and the run goes on. The refusal names installing a
+ # kubectl here first: every --fetch-tools that fetches kubectl brings the same
+ # pin back, and a machine with no kubectl of its own, or one below the floor,
+ # is sent to --fetch-tools=kubectl by client_preflight, so running without
+ # --fetch-tools, or with --fetch-tools=helm, works only once one is installed.
+ # Only the numbers are repeated: a gitVersion is what the server says.
+ client=$(jq -r '.clientVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
+ server=$(jq -r '.serverVersion.gitVersion // ""' <<< "$versions" 2>/dev/null || true)
+ if [[ $client =~ ^v?([0-9]+\.([0-9]+)(\.[0-9]+)?) ]]; then cv=${BASH_REMATCH[1]}; cm=${BASH_REMATCH[2]}; fi
+ if [[ $server =~ ^v?([0-9]+\.([0-9]+)(\.[0-9]+)?) ]]; then sv=${BASH_REMATCH[1]}; sm=${BASH_REMATCH[2]}; fi
+ if [[ -n $cv && -n $sv ]] && (( 10#$cm - 10#$sm > 1 || 10#$sm - 10#$cm > 1 )); then
+   [[ " ${FETCH_SET:-} " != *" kubectl "* ]] || fail "kubectl version skew: the kubectl --fetch-tools downloaded for this run is $cv and the server is $sv, more than one minor apart, and kubectl is supported within one minor of the server; it is this release's pinned kubectl, and any --fetch-tools that fetches kubectl downloads it again. Install a kubectl within one minor of $sv on this machine, then run without --fetch-tools, or with --fetch-tools=helm, which fetches only Helm and keeps this machine's kubectl"
+   log "kubectl $cv is more than one minor from the server ($sv), and kubectl is supported within one minor of the server. The run goes on with it; if a step fails on it, install a kubectl within one minor of $sv"
+ fi
+ # The operator Secret, when it exists, must hold this password file's
+ # password under secret_file's normalization (trailing newlines dropped, a
+ # control character refused), refused in secret_file's words. Compared
+ # inside jq: the password reaches no argument and no file. jq -e fails alike
+ # on a false verdict and on a file it cannot open, so a file this account
+ # cannot read is refused as that first, with its remedy, and never as a
+ # control character or a differing Secret; what jq says (the path and the
+ # system's words) is kept in the state directory, never printed.
+ secret=$(j '.operator.secret // ""')
+ if [[ -n $secret ]]; then
+   [[ -r $OP_PASSWORD ]] || fail "operator.password_file ($(j .operator.password_file)) cannot be read by the account that runs the installer; make that account its owner, with mode 0600 or 0400, then run the same command again"
+   jq -e -Rs 'sub("\\n+$";"")|length>0 and (any(explode[]; .<32 or .==127)|not)' "$OP_PASSWORD" >/dev/null 2> "$STATE_DIR/preflight-operator-password.err" || fail "operator.password_file holds a control character (a tab, a carriage return or another byte below 32) or nothing but newlines: write the password as one line of printable characters, then run the same command again"
+   existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-operator-secret.err") || fail "the operator Secret $secret in namespace $NAMESPACE could not be read: $(kubectl_failure_condition "$STATE_DIR/preflight-operator-secret.err"). kubectl's output is kept in $STATE_DIR/preflight-operator-secret.err; correct the access and run the same command again"
+   [[ -z $existing ]] || jq -e --rawfile password "$OP_PASSWORD" '.data.password == ($password|sub("\\n+$";"")|@base64)' <<< "$existing" >/dev/null 2> "$STATE_DIR/preflight-operator-password.err" || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite"
+ fi
+ case $(j '.tls.profile // ""') in
+ existing)
+   # managed_dependencies still asks for a complete Secret under the Lease.
+   secret=$(j .tls.secret); crt="$GSJ_WORK/preflight-tls.crt"
+   existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-tls-secret.err") || fail "TLS Secret is unavailable: $secret in namespace $NAMESPACE could not be read ($(kubectl_failure_condition "$STATE_DIR/preflight-tls-secret.err")). kubectl's output is kept in $STATE_DIR/preflight-tls-secret.err; correct the access and run the same command again"
+   [[ -n $existing ]] || fail "TLS Secret is unavailable: tls.profile existing serves the Secret $secret, and namespace $NAMESPACE holds none of that name. Create it there before installing: the namespace first if it does not exist yet (kubectl create namespace $NAMESPACE), then the kubernetes.io/tls Secret (kubectl -n $NAMESPACE create secret tls $secret --cert=FILE --key=FILE). A certificate that already lives in another namespace, under any name, is copied under the name $secret without its key touching disk: kubectl -n OTHER get secret NAME -o json | jq '{apiVersion,kind,type,data,metadata:{name:\"$secret\"}}' | kubectl -n $NAMESPACE create -f -"
+   jq -e '.type=="kubernetes.io/tls" and (.data["tls.crt"]|type=="string" and length>0) and (.data["tls.key"]|type=="string" and length>0)' <<< "$existing" >/dev/null || fail "TLS Secret is incomplete: $secret in namespace $NAMESPACE must be of type kubernetes.io/tls and hold a non-empty tls.crt and tls.key. Replace it with one that does (kubectl -n $NAMESPACE delete secret $secret, then kubectl -n $NAMESPACE create secret tls $secret --cert=FILE --key=FILE)"
+   { jq -r '.data["tls.crt"]' <<< "$existing" | base64 --decode > "$crt"; } 2>/dev/null && openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "TLS Secret is incomplete: the tls.crt of $secret in namespace $NAMESPACE is not a readable PEM certificate. Replace it with the certificate for $host"
+   # What is refused is the Secret: missing, unreadable, of another type,
+   # without both keys, or without a certificate. Its host and its expiry are
+   # said, not refused: where a proxy in front of the cluster terminates TLS
+   # with its own certificate, this Secret may hold a placeholder no client
+   # there sees, and a refusal would stop a site that works. Where the
+   # controller serves it, public_verify's curl, which verifies the host and
+   # the expiry, meets it before the Pod's acceptance check runs, and its
+   # refusal is the one that stops the install.
+   certificate_names_host "$crt" "$host" || log "The certificate in Secret $secret (namespace $NAMESPACE) does not name public_url's host $host. Where the ingress controller terminates TLS for $host, browsers refuse it, and the install stops, hours in, at the installer's own public HTTPS check (public HTTPS route is unreachable); where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a certificate for $host in that Secret, or correct public_url, unless such a proxy serves $host. The run goes on"
+   # The acceptance check verifies public_url from inside the application Pod
+   # with Python's default context against verification.ca_file: X.509-strict,
+   # and from 3.13 partial-chain too, so a CA file holding the intermediate
+   # that issued the certificate is trusted there as it is by -partial_chain
+   # here. A chain only a lax verifier accepts stops there as
+   # origin-tls-failed. Said, not refused: the chain the controller serves and
+   # the Pod's route (a proxy that carries the origin) decide that, not this
+   # Secret alone. An expired certificate needs a current one, not another
+   # CA, so it is said once, as that.
+   ca=$(j .verification.ca_file)
+   if ! openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
+     log "The certificate in Secret $secret (namespace $NAMESPACE) is past its expiry date. Where the ingress controller terminates TLS for $host, browsers refuse it, and the install stops, hours in, at the installer's own public HTTPS check (public HTTPS route is unreachable); where a proxy in front of the cluster terminates TLS with a certificate of its own, clients that reach $host through it see that one instead. Put a current certificate for $host in that Secret, unless such a proxy serves $host. The run goes on"
+   elif [[ -n $ca ]] && ! openssl verify -x509_strict -partial_chain -CAfile "$(resolve_file "$ca")" -untrusted "$crt" "$crt" >/dev/null 2>&1; then
+     log "The certificate in Secret $secret does not pass strict verification (openssl verify -x509_strict) against verification.ca_file ($ca). The acceptance check inside the application Pod verifies strictly and would stop at origin-tls-failed; supply the CA that issued it, or a certificate whose chain passes strict verification. The run goes on"
+   fi;;
+ files)
+   # Compared, never written here: creating the Secret stays under the Lease.
+   # Readable first, as the password file is: a key jq cannot open would read
+   # as a differing Secret, and a certificate openssl cannot open as no
+   # certificate at all. A missing certificate file is left to that verdict.
+   secret=$(j .tls.secret); crt=$(resolve_file "$(j .tls.certificate_file)"); key=$(resolve_file "$(j .tls.private_key_file)"); private_file "$key"
+   [[ -r $key ]] || fail "tls.private_key_file ($(j .tls.private_key_file)) cannot be read by the account that runs the installer; make that account its owner, with mode 0600 or 0400, then run the same command again"
+   [[ ! -e $crt || -r $crt ]] || fail "tls.certificate_file ($(j .tls.certificate_file)) cannot be read by the account that runs the installer; make it readable by that account, then run the same command again"
+   openssl x509 -in "$crt" -noout >/dev/null 2>&1 || fail "tls.certificate_file is not a readable PEM certificate ($(j .tls.certificate_file)); the host was not checked. Point it at the PEM certificate for $host"
+   certificate_names_host "$crt" "$host" || fail "TLS certificate host mismatch: tls.certificate_file ($(j .tls.certificate_file)) does not name public_url's host $host. Supply a certificate for $host, or correct public_url"
+   existing=$(k get secret "$secret" -o json --ignore-not-found 2> "$STATE_DIR/preflight-tls-secret.err") || fail "TLS Secret $secret in namespace $NAMESPACE could not be read ($(kubectl_failure_condition "$STATE_DIR/preflight-tls-secret.err")). kubectl's output is kept in $STATE_DIR/preflight-tls-secret.err; correct the access and run the same command again"
+   [[ -z $existing ]] || jq -e --rawfile crt "$crt" --rawfile key "$key" '.data["tls.crt"]==($crt|@base64) and .data["tls.key"]==($key|@base64)' <<< "$existing" >/dev/null 2> "$STATE_DIR/preflight-tls-files.err" || fail "Secret $secret differs from supplied credential; use explicit credential repair/rotation, never implicit overwrite";;
+ esac
+ # ingress.profile managed-traefik: managed_helm_addon installs Traefik only
+ # in a namespace of its own, and refused this one after the Lease.
+ [[ $(j '.ingress.profile // ""') != managed-traefik || $(j .ingress.namespace) != "$NAMESPACE" ]] || fail "ingress.namespace $NAMESPACE is the namespace this deployment is installed in (target.namespace), and ingress.profile managed-traefik installs Traefik in a namespace of its own, which it creates. Set ingress.namespace to another name (gsj-ingress is the default), or select ingress.profile reuse for a controller that already runs, then run the same command again"
+ # ingress.profile reuse: the application's NetworkPolicy admits
+ # ingress.namespace, and that namespace alone, to its web port, so a
+ # namespace without a controller is a site that never answers -- met at
+ # acceptance. Refused when it does not exist or holds no Running Pod. A
+ # Running Pod no rule here recognizes may still be the controller -- Kong,
+ # Ambassador, Gloo and OpenShift's router run under names and images of
+ # their own, and a refusal would leave a working site no way on -- and the
+ # NetworkPolicy admits it all the same: that is said, and the run goes on.
+ # A controller is recognized by inspect's rule, or by the controller the
+ # IngressClass preflight saved names (OpenShift's router-* Pods, Kong's
+ # images). Counts only, never what the API said.
+ if [[ $(j '.ingress.profile // ""') == reuse ]]; then
+   ns=$(j .ingress.namespace)
+   if ! found=$(kubectl --context "$CONTEXT" get namespace "$ns" -o name --ignore-not-found 2> "$STATE_DIR/preflight-ingress-namespace.err"); then
+     log "ingress.namespace $ns was not checked: this credential could not read that namespace (kubectl's output is kept in $STATE_DIR/preflight-ingress-namespace.err). The application's NetworkPolicy admits that namespace alone to its web port, so if no ingress controller runs there the site will not answer"
+   elif [[ -z $found ]]; then
+     fail "ingress.namespace $ns does not exist. Under ingress.profile reuse it must name the namespace the ingress controller's Pods run in, because the application's NetworkPolicy admits that namespace alone to its web port; kubectl get pods -A names it in its first column. Set ingress.namespace to it and run the same command again"
+   elif ! pods=$(kubectl --context "$CONTEXT" --namespace "$ns" get pods -o json 2> "$STATE_DIR/preflight-ingress-namespace.err"); then
+     log "ingress.namespace $ns was not checked: this credential could not list its Pods (kubectl's output is kept in $STATE_DIR/preflight-ingress-namespace.err). The application's NetworkPolicy admits that namespace alone to its web port, so if no ingress controller runs there the site will not answer"
+   else
+     controller=$(jq -r '.spec.controller // ""' "$STATE_DIR/ingress-class.json" 2>/dev/null || true)
+     counts=$(jq -r --arg controller "$controller" '[.items[]|select(.status.phase=="Running")] as $running | [$running[]|select((.metadata.name|test("ingress|traefik|nginx|haproxy|contour|istio")) or any((.spec.containers // [])[]; (.image // "")|test("ingress-nginx|traefik|haproxy|contour"))
+       or ($controller=="openshift.io/ingress-to-route" and (.metadata.name|startswith("router-")))
+       or ($controller=="konghq.com/ingress-controller" and any((.spec.containers // [])[]; (.image // "")|test("(^|/)kong[/:@-]"))))] as $controllers | "\(.items|length) \($running|length) \($controllers|length)"' <<< "$pods")
+     read -r total running controllers <<< "$counts"
+     (( running > 0 )) || fail "ingress.namespace $ns runs no ingress controller: it holds no Running Pod ($total Pod(s) in all). Under ingress.profile reuse it must name the namespace the controller's Pods run in, because the application's NetworkPolicy admits that namespace alone to its web port; kubectl get pods -A names it in its first column. Set ingress.namespace to it and run the same command again"
+     (( controllers > 0 )) || log "ingress.namespace $ns holds $running Running Pod(s), and none of them is an ingress controller this check recognizes by its name, its image or the controller IngressClass $(j .ingress.class) names. The application's NetworkPolicy admits every Pod in that namespace to its web port, so a controller running there under another name is served all the same; if no controller runs there, the install stops at its public HTTPS route check once the application is up. The run goes on"
+   fi
+ fi
+ # Two deployments cannot share one host on one controller: it routes the
+ # host to one of them, and the other's acceptance check fails hours in on a
+ # trust error. A collision is an Ingress this site's controller would serve:
+ # its class (spec.ingressClassName, else the older kubernetes.io/ingress.class
+ # annotation) is ingress.class, or it names none and ingress.class is the
+ # cluster's default class, the one class a class-less Ingress goes to: the
+ # IngressClass preflight saved under reuse carries
+ # ingressclass.kubernetes.io/is-default-class "true". The managed Traefik is
+ # never the default (installed with isDefaultClass false and its provider
+ # held to ingress.class), whatever an earlier reuse run saved. Any other
+ # Ingress on the host is named in a log line, never by its class, and the
+ # run goes on: one of another class is another controller's, which this
+ # site's never routes; one of no class under reuse may still be served by
+ # this site's controller, since some serve class-less Ingresses without
+ # being marked the default (OpenShift's ingress-to-route turns them into
+ # Routes), so its line says so; under the managed Traefik it is no
+ # controller's. Not a collision either:
+ # this installation's own Ingress (an upgrade's); one already being deleted;
+ # cert-manager's HTTP-01 solver Ingress (labelled
+ # acme.cert-manager.io/http01-solver), which serves public_url's host from
+ # this namespace while a renewal is pending, and removing it would only
+ # fight cert-manager; one without rules, which serves no host.
+ if [[ -n $host ]]; then
+   local default=false reuse=false classless
+   class=$(j .ingress.class)
+   [[ $(j '.ingress.profile // ""') != reuse ]] || reuse=true
+   if $reuse && jq -e '.metadata.annotations["ingressclass.kubernetes.io/is-default-class"]=="true"' "$STATE_DIR/ingress-class.json" >/dev/null 2>&1; then default=true; fi
+   if ! found=$(kubectl --context "$CONTEXT" get ingresses -A -o json 2> "$STATE_DIR/preflight-ingresses.err" | jq -r --arg host "$host" --arg ns "$NAMESPACE" --arg own "$RELEASE-web" --arg class "$class" --argjson default "$default" --argjson reuse "$reuse" '[.items[]|select((.metadata.namespace==$ns and .metadata.name==$own)|not)|select(.metadata.deletionTimestamp==null and .metadata.labels["acme.cert-manager.io/http01-solver"]!="true")|select(any((.spec.rules // [])[]; (.host // "")|ascii_downcase==($host|ascii_downcase)))
+       |{name:"\(.metadata.namespace)/\(.metadata.name)"} + ((.spec.ingressClassName // .metadata.annotations["kubernetes.io/ingress.class"] // "") as $named | {ours:($named==$class or ($named=="" and $default)), classless:($named=="" and $reuse)})]
+       |"\(map(select(.ours).name)|unique|join(", "))|\(map(select((.ours or .classless)|not).name)|unique|join(", "))|\(map(select(.classless and (.ours|not)).name)|unique|join(", "))"' 2>/dev/null); then
+     log "public_url's host $host was not checked against other Ingresses: this credential could not list Ingresses cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-ingresses.err). If another deployment serves $host, the acceptance check fails on it hours in rather than here"
+   else
+     # One line, "COLLISIONS|OTHERS|CLASSLESS": no namespace or Ingress name holds a "|".
+     IFS='|' read -r found others classless <<< "$found"
+     [[ -z $others ]] || log "public_url's host $host is also served by another controller's Ingress $others; nothing routes to it here, because it names an ingress class other than ingress.class $class, or names none and $class is not the cluster's default ingress class. Clients reach this deployment only where $host's address leads to this site's controller. The run goes on"
+     [[ -z $classless ]] || log "public_url's host $host is also named by Ingress $classless, of no ingress class, and $class is not the cluster's default ingress class, so it is not refused; it may still be served by this site's controller if that controller serves Ingresses without a class (OpenShift's ingress-to-route turns them into Routes), and then two deployments share one host on one controller and the install fails at its acceptance check, hours in, with a trust error. If this site's controller does that, remove that Ingress, give it an ingress class, or choose another public_url. The run goes on"
+     [[ -z $found ]] || fail "public_url's host $host is already served by Ingress $found, of ingress.class $class, or of no class where $class is the cluster's default ingress class: two deployments cannot share one host on one controller. Remove that Ingress, or choose another public_url, before installing; the install would otherwise run to its acceptance check and fail there, hours later, with a trust error"
+   fi
+ fi
+ # Leftover managed add-on CRDs: cluster-scoped, so they outlive the add-on's
+ # namespace and its owner record (the ConfigMap gsj-addon-owner there, with
+ # the same gsj.io/addon-owner label). managed_helm_addon refuses, under the
+ # Lease, those of the chart it renders; here, first, an orphan is refused
+ # when its API group (spec.group) is one of an add-on this site selects --
+ # Traefik's traefik.io, hub.traefik.io and the earlier traefik.containo.us,
+ # cert-manager's cert-manager.io and acme.cert-manager.io -- and an orphan of
+ # the other add-on is named in a log line and the run goes on. Each is named
+ # with the teardown, which this installer never performs: deleting a CRD
+ # deletes every object of its kind.
+ traefik=false; acme=false
+ [[ $(j '.ingress.profile // ""') != managed-traefik ]] || traefik=true
+ [[ $(j '.tls.profile // ""') != managed-acme ]] || acme=true
+ if $traefik || $acme; then
+   if ! crds=$(kubectl --context "$CONTEXT" get customresourcedefinitions -l gsj.io/addon-owner -o json 2> "$STATE_DIR/preflight-addon-crds.err"); then
+     log "Leftover managed add-on CustomResourceDefinitions were not checked: this credential could not list them (kubectl's output is kept in $STATE_DIR/preflight-addon-crds.err). One without its owner record is still refused after the Lease"
+   else
+     for owner in $(jq -r '[.items[].metadata.labels["gsj.io/addon-owner"]]|unique|.[]' <<< "$crds"); do
+       if ! found=$(kubectl --context "$CONTEXT" get configmaps -A -l "gsj.io/addon-owner=$owner" -o json 2> "$STATE_DIR/preflight-addon-crds.err"); then
+         log "Leftover managed add-on CustomResourceDefinitions were not checked against their owner records: this credential could not list ConfigMaps cluster-wide (kubectl's output is kept in $STATE_DIR/preflight-addon-crds.err). One without its owner record is still refused after the Lease"
+         break
+       fi
+       if jq -e 'any(.items[]; .metadata.name=="gsj-addon-owner")' <<< "$found" >/dev/null; then continue; fi
+       home=$( { kubectl --context "$CONTEXT" get namespaces -l "gsj.io/addon-owner=$owner" -o json 2>/dev/null || true; } | jq -r '[.items[]?.metadata.name]|join(" ")' 2>/dev/null || true)
+       # One line per verdict: "true NAMES" for the selected add-ons' groups,
+       # "false NAMES" for the rest.
+       while read -r selected names; do
+         if $selected; then orphans+="${orphans:+ }$names"; [[ -z $home ]] || homes+="${homes:+ }$home"
+         else strays+="${strays:+ }$names"; [[ -z $home ]] || stray_homes+="${stray_homes:+ }$home"; fi
+       done < <(jq -r --arg owner "$owner" --argjson traefik "$traefik" --argjson acme "$acme" '
+         [.items[]|select(.metadata.labels["gsj.io/addon-owner"]==$owner)|(.spec.group // "") as $group |
+          {selected:(($traefik and ($group|test("(^|[.])traefik[.](io|containo[.]us)$"))) or ($acme and ($group|IN("cert-manager.io","acme.cert-manager.io")))),
+           name:.metadata.name}] | group_by(.selected)[] | "\(.[0].selected) \(map(.name)|join(" "))"' <<< "$crds")
+     done
+     if [[ -n $strays ]]; then
+       where="no add-on namespace is left"; [[ -z $stray_homes ]] || where="add-on namespace: $stray_homes"
+       log "Managed add-on CustomResourceDefinitions of an add-on this site does not select are left without their owner record: $strays ($where). The run goes on: the managed add-ons this site selects do not create them, but a site that selects that add-on is refused on them. To remove them, tear the leftover add-on down; this installer deletes nothing: $(addon_crd_teardown "$strays" "$stray_homes")"
+     fi
+     if [[ -n $orphans ]]; then
+       where="no add-on namespace is left"; [[ -z $homes ]] || where="add-on namespace: $homes"
+       fail "managed add-on CustomResourceDefinitions are left without their owner record: $orphans ($where). The managed add-on this site selects would be refused on them after the Lease, as a resource that already exists without its owner record. Tear the leftover add-on down first; this installer deletes nothing: $(addon_crd_teardown "$orphans" "$homes"). Then run the same command again"
+     fi
+   fi
+ fi
+}
+addon_crd_teardown() {
+ # The teardown preflight_site_checks names for the leftover add-on CRDs $1
+ # whose add-on namespaces are $2: the Helm release and the namespace first,
+ # then each definition once no object of its kind is left.
+ local names=$1 homes=$2 home teardown='' gets
+ for home in $homes; do teardown+="helm -n $home list names the release; helm -n $home uninstall RELEASE; kubectl delete namespace $home; "; done
+ gets=$(printf 'kubectl get %s -A, ' $names)
+ printf '%s' "${teardown:+uninstall its Helm release and delete its namespace (${teardown%; }), then }once each of ${gets%, } lists no object any more, delete the definitions by name (kubectl delete customresourcedefinition $names)"
 }
 lease_still_live() {
  # Every "still live" refusal states what it measured: the Lease was renewed
@@ -1494,10 +1773,13 @@ cleanup_exit() {
  if (( rc != 0 )) && [[ -n ${TRANSFER_HANDBACK_POD:-} ]]; then transfer_handback "$TRANSFER_HANDBACK_POD" || true; fi
  # The pull probe is not state anyone resumes: it goes on every exit.
  if [[ -n ${PROBE_POD:-} ]]; then k delete pod "$PROBE_POD" --ignore-not-found --wait=false >/dev/null 2>&1 || true; fi
+ # init stopped while it published a companion: the hidden copy it wrote
+ # beside the installer is its own, and nothing else would ever remove it.
+ if [[ -n ${INIT_PUBLISH_TEMP:-} ]]; then rm -f "$INIT_PUBLISH_TEMP"; fi
  # Failure retains the lease and durable operation identity for named recovery.
  if (( rc == 0 )) && [[ -n ${OPERATION:-} ]]; then release_operation; fi
  # A terminal stage names its own recovery; resuming it would only repeat it.
- if (( rc != 0 )) && [[ ${LEASE_ACQUIRED:-false} == true ]]; then log "Operation $OPERATION incomplete; retained state at $STATE_DIR. Use ${RECOVERY_HINT:-resume --operation $OPERATION}."; fi
+ if (( rc != 0 )) && [[ ${LEASE_ACQUIRED:-false} == true ]]; then log "Operation ${OPERATION:-} incomplete; retained state at ${STATE_DIR:-}. Use ${RECOVERY_HINT:-resume --operation ${OPERATION:-}}."; fi
  [[ -n ${GSJ_WORK:-} ]] && rm -rf "$GSJ_WORK"
  exit "$rc"
 }
@@ -1513,14 +1795,25 @@ retained_site_matches() {
  # $1 selected site, $2 the site retained by an operation. Earlier installers
  # filled the two generated managed-local-ca trust paths into the saved site
  # after the operation was recorded; load_site now records them first.
- # Admit exactly that derivation of this operation's own CA, nothing else.
+ # Admit exactly that derivation of this operation's own CA. The one other
+ # difference admitted is corpus.allow_update, and only while the operation
+ # is complete and carries record_installed's corpus_update_reset marker: it
+ # was stopped between rewriting the operator's file and its saved site,
+ # which its resume finishes. record_installed writes the marker before it
+ # marks the operation complete and rewrites neither before that, so on an
+ # operation not yet complete the two still agree, and a difference is the
+ # operator's own edit. Nothing else.
  cmp -s "$1" "$2" && return
- [[ -f $STATE_DIR/tls/ca.crt && ! -L $STATE_DIR/tls/ca.crt ]] || return 1
- jq -e --arg ca "$STATE_DIR/tls/ca.crt" --slurpfile o "$2" '
-   $o[0] as $o | $o.tls.profile=="managed-local-ca" and .tls.profile=="managed-local-ca" and
+ local derive=false spent=false
+ [[ ! -f $STATE_DIR/tls/ca.crt || -L $STATE_DIR/tls/ca.crt ]] || derive=true
+ ! jq -e '.corpus_update_reset=="pending" and .status=="complete"' "$STATE_DIR/operation.json" >/dev/null 2>&1 || spent=true
+ jq -e --arg ca "$STATE_DIR/tls/ca.crt" --argjson derive "$derive" --argjson spent "$spent" --slurpfile o "$2" '
+   def admitted: if $spent then del(.corpus.allow_update) else . end;
+   ($o[0]|admitted) as $o | admitted | ($spent and .==$o) or ($derive and
+   $o.tls.profile=="managed-local-ca" and .tls.profile=="managed-local-ca" and
    $o.tls.ca_file=="" and $o.verification.ca_file=="" and
    .tls.ca_file==$ca and .verification.ca_file==$ca and
-   del(.tls.ca_file,.verification.ca_file)==($o|del(.tls.ca_file,.verification.ca_file))
+   del(.tls.ca_file,.verification.ca_file)==($o|del(.tls.ca_file,.verification.ca_file)))
  ' "$1" >/dev/null
 }
 lease_repair() {
@@ -1831,7 +2124,7 @@ sweep_target() {
      if (( age < 0 )); then renewed="its renewal time is ahead of this clock by $(( -age )) s, a clock skew between the renewing host and this one"; else renewed="renewed $age s ago"; fi
      if (( age < 180 )); then live=" -- and it is still live: abandon takes a Lease only after 180 s unrenewed, so if no installer process is running against this target, wait $(( 180 - age )) s first"; fi
      # the holder is printed only when it is an operation id this installer
-     # writes; a foreign Lease's text is not repeated [review sweep B2]
+     # writes; a foreign Lease's text is not repeated
      local shown=$holder; [[ $holder =~ ^[a-f0-9]{24}$ ]] || shown='<a holder identity this installer did not write>'
      fail "the operation Lease is held by $shown ($renewed); sweep clears only what abandon cannot: run abandon --operation $shown --reason ... first$live"
    fi
@@ -2407,7 +2700,7 @@ managed_dependencies() {
    if [[ $COMMAND == addon-repair ]]; then managed_helm_addon traefik "$ns" "$class" "$chart" "$GSJ_WORK/traefik-values.json" "$REVISION"; return;
    else managed_helm_addon traefik "$ns" "$class" "$chart" "$GSJ_WORK/traefik-values.json"; fi
  fi
- tlsprofile=$(j .tls.profile); secret=$(j .tls.secret); host=$(j .public_url | sed -E 's#https://([^/:]+).*#\1#')
+ tlsprofile=$(j .tls.profile); secret=$(j .tls.secret); host=$(j .public_url | sed -nE 's#^https://([^/:@?\#]+)(:[0-9]+)?([/?\#].*)?$#\1#p')
  case "$tlsprofile" in
  existing)
    k get secret "$secret" -o json | jq -e '.type=="kubernetes.io/tls" and .data["tls.crt"] and .data["tls.key"]' >/dev/null || fail 'TLS Secret is unavailable or incomplete';;
@@ -2471,11 +2764,14 @@ PY
  while (( SECONDS < end )); do phase=$(k get pod "$name" -o jsonpath='{.status.phase}'); [[ $phase == Succeeded || $phase == Failed ]] && break; sleep 3; done
  # The check's Pod never ran to an end: the disk was never tested, and the
  # verdict at the bottom must not call it a storage failure. Read what the
- # Pod reported while it still exists. Measured: with no registry.base the
- # pull probe does not run, so a pull Secret that is wrong, an expired token
- # or a node that cannot reach the registry is first met HERE -- the Pod sat
+ # Pod reported while it still exists. Measured, when the pull probe still
+ # ran only with registry.base: a pull Secret that is wrong, an expired token
+ # or a node that cannot reach the registry was first met HERE -- the Pod sat
  # in ImagePullBackOff for 300 s and the run ended `storage WAL/locking/
  # fsync/free-space qualification failed`, sending the operator to the disk.
+ # The probe now meets those first on every site; this Pod still pulls on its
+ # own (a token that expired in between, an image the node has evicted), so a
+ # pull that fails here is still named for what it is.
  # The operation's recorded status decides every hint of this check: "owned"
  # is a first install (nothing applied, nothing quiesced: resume repeats this
  # check, and abandon then install again takes a changed site value); after
@@ -2506,7 +2802,7 @@ PY
    [[ -n $never || $phase == Succeeded || $phase == Failed ]] || never="wait ${phase:-unknown}"
    # the reason and the phase are the API's words; the message is never read
    # here, and only a value this installer KNOWS is repeated -- any other
-   # reason is "other" [review sweep B2]
+   # reason is "other"
    case ${never%% *} in
      '') ;;                                        # the Pod ended between the last poll and the snapshot: the phase is the verdict
      pull) never="pull $(known_word "${never#* }" ErrImagePull ImagePullBackOff ErrImageNeverPull ImageInspectError InvalidImageName RegistryUnavailable)";;
@@ -2550,7 +2846,7 @@ PY
    elif ! $logs_read; then note=" The storage check itself passed (its Pod ended Succeeded), though its measurements could not be read (kubectl logs failed)."
    fi
    phase=$(k get pv "$volume" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-   [[ -z $phase ]] || phase=$(known_word "$phase" Pending Available Bound Released Failed)   # a phase this installer knows, or "other"; unreadable stays unknown [review sweep B2]
+   [[ -z $phase ]] || phase=$(known_word "$phase" Pending Available Bound Released Failed)   # a phase this installer knows, or "other"; unreadable stays unknown
    # After the backup a check whose Pod ended Failed (it started, and its own
    # asserts did not hold) is the backend's to correct, and resume will not
    # repeat the check: both refusals say so. A Pod that never ran is not that.
@@ -2628,7 +2924,13 @@ compatibility() {
    *) fail 'invalid compatibility source selection';;
  esac
  [[ -s $GSJ_WORK/installed.json ]] || return 0
- jq -e --slurpfile site "$SITE" '.site.target == $site[0].target and .site.operator == $site[0].operator and .site.storage == $site[0].storage' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade cannot change target, operator or storage identity; use a qualified migration/restore operation'
+ # storage.transfer_path and storage.minimum_free_bytes say where a maintenance
+ # Pod stages and how much free space it demands, not which volumes hold the
+ # data; both are read from the current site. Compared, they left a release
+ # installed with an empty transfer_path, on a node whose root filesystem
+ # cannot hold the archive twice, with no backup, no upgrade and no way to
+ # correct the path in place. Every other storage key stays frozen.
+ jq -e --slurpfile site "$SITE" 'def identity: del(.transfer_path,.minimum_free_bytes); .site.target == $site[0].target and .site.operator == $site[0].operator and (.site.storage|identity) == ($site[0].storage|identity)' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade cannot change target, operator or storage identity; use a qualified migration/restore operation'
  jq -e --slurpfile release "$GSJ_PAYLOAD/release.json" '.manifest.model == $release[0].model' "$GSJ_WORK/installed.json" >/dev/null || fail 'model change blocked until both case and decision index migration is supported'
  local source; source=$(jq -r .manifest.identity "$GSJ_WORK/installed.json")
  if [[ $source != "$RELEASE_ID" ]]; then
@@ -2639,7 +2941,18 @@ compatibility() {
  jq -e --slurpfile actual "$GSJ_WORK/storage.json" '.storage == $actual[0]' "$GSJ_WORK/installed.json" >/dev/null || fail 'persistent storage identity changed; restore bindings before upgrading'
  local actual_ns; actual_ns=$(k get namespace "$NAMESPACE" -o json | jq -r .metadata.uid)
  [[ $(jq -r .namespace_uid "$GSJ_WORK/installed.json") == "$actual_ns" ]] || fail 'namespace was recreated; this is a recovery target, not an upgrade'
- if [[ $(jq -r .manifest.corpus.fingerprint "$GSJ_WORK/installed.json") != $(jq -r .corpus.fingerprint "$GSJ_PAYLOAD/release.json") && $(j .corpus.allow_update) != true ]]; then fail 'corpus change requires explicit corpus.allow_update=true and a pre-migration backup'; fi
+ local recorded; recorded=$(jq -r .manifest.corpus.fingerprint "$GSJ_WORK/installed.json")
+ if [[ $recorded != $(jq -r .corpus.fingerprint "$GSJ_PAYLOAD/release.json") ]]; then
+   [[ $(j .corpus.allow_update) == true ]] || fail 'corpus change requires explicit corpus.allow_update=true and a pre-migration backup'
+   # corpus.allow_update=true is consent for this one change. Under the Lease
+   # the admitted change is recorded on the operation, where a resume or a
+   # repair still finds it, and record_installed spends the consent once the
+   # change is complete; the read-only preview before the Lease records nothing.
+   if [[ ${LEASE_ACQUIRED:-false} == true && -n ${OPERATION:-} ]]; then
+     assert_owner
+     jq --arg from "$recorded" '.corpus_update_from=$from' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
+   fi
+ fi
 }
 # GSJ_RUNTIME_HELPER: capacity.py
 capacity_host_filesystems() {
@@ -2801,7 +3114,11 @@ capacity_scan_pod() {
  fi
  capacity_host_filesystems
  local volumes='{"forgejo":"/volumes/forgejo","gsj":"/volumes/gsj","chroma":"/volumes/chroma"}'
- local minimum; minimum=$(jq -er '.site.storage.minimum_free_bytes' "${CAPACITY_CONTEXT_FILE:-$GSJ_WORK/installed.json}")
+ # The floor is the current site's: it is no longer part of the identity an
+ # upgrade or a backup compares, so an edit governs the very next measurement.
+ # (A restored context records this same site.) The recorded floor stands in
+ # only for a site that names none.
+ local minimum; minimum=$(jq -er --slurpfile site "$SITE" '$site[0].storage.minimum_free_bytes // .site.storage.minimum_free_bytes' "${CAPACITY_CONTEXT_FILE:-$GSJ_WORK/installed.json}")
  if [[ $stage == quiesced ]]; then
    k exec -i "$pod" -- python - --volumes "$volumes" --transfer /transfer --hosts "$(cat "$GSJ_WORK/capacity-host.json")" --minimum "$minimum" --mode "$mode" --quiesced < "$GSJ_PAYLOAD/helpers/capacity.py" > "$GSJ_WORK/capacity-report.json" || result=$?
  else
@@ -2900,144 +3217,356 @@ relocated_images_probe() {
  # Where this deployment's images are pulled from is
  # the one site value that decides whether ANY of its Pods can start, and the
  # only component that can answer is the one that consumes it: the container
- # runtime on the node that will run them. So ask it, once, before anything is
- # applied -- one Pod, one container per image, by digest. The containers never
- # run: their command does not exist, and a container that fails to START has
- # already been PULLED, which is the whole question.
+ # runtime on the node that will run them. So ask it before anything is
+ # applied -- one Pod per image, by digest, each created, judged and deleted
+ # before the next is created. The containers never run: their command does
+ # not exist, and a container that fails to START has already been PULLED,
+ # which is the whole question.
  #
- # WHEN. Whenever the location is site-chosen OR has CHANGED: registry.base is
- # set, or it differs from the base the installed deployment was recorded with.
- # The second half matters most. An upgrade that loses the base -- a stale copy
- # of site.json, a deleted line -- would otherwise render the release's original
- # repositories, the ones this site said its nodes cannot reach, with nothing
- # to catch it until the quiesced application failed to come back.
+ # WHEN. Always. It used to run only when registry.base was set or had changed
+ # from the base the installed deployment was recorded with; without one, a
+ # first install pulled only the web image before the Helm apply (the storage
+ # check's), so a pull credential that could not read the other five was first
+ # met by the provisioning hook, stalled for its whole timeout, or by the
+ # corpus initializer, hours into the initialization deadline. A changed base
+ # still matters most: an upgrade that loses it -- a stale copy of site.json, a
+ # deleted line -- renders the release's original repositories, the ones this
+ # site said its nodes cannot reach, and the words say so.
+ #
+ # HOW LONG. A container that REPORTS a definitive pull failure -- the
+ # registry refused the credential or does not hold the name, or the name is
+ # not one -- is refused once the failure has outlived 90 s of retries, on
+ # every site. Any other failure can clear on one of the kubelet's retries: it
+ # is said once and waited out for deadlines.dependencies_seconds from its
+ # first report -- what the previous release gave its Forgejo image, the
+ # provisioning hook's timeout -- and one still reported then is refused by
+ # its class. A Pod the scheduler has not placed pulls nothing: it is refused
+ # once PodScheduled has been False for 300 s, the storage check's bound and
+ # the capacity reader's. The 90 s, a failure's deadlines.dependencies_seconds
+ # and the 300 s each run from what the Pod in hand reported. A pull still in
+ # progress is bounded by deadlines.dependencies_seconds when registry.base is
+ # set or changed, as it always was for those sites. Otherwise the images come
+ # from where the previous release pulled them, and that release pulled web,
+ # runner, mcp and the corpus image under the initialization deadline (24 h by
+ # default): a slow link it installed over must not be refused by 900 s now,
+ # so the wait goes on to dependencies_seconds + initialization_seconds, said
+ # once when the first is spent while a container reports its pull. Only a
+ # Pod that may still pull is waited on: Pending or Running, its container
+ # waiting for its image or not yet reported. A Pod that can no longer pull is
+ # refused on the poll that reads it, since no wait can change it: one that
+ # ENDED without its image (phase Failed or Succeeded, or its container
+ # terminated: evicted, refused by the kubelet at admission, past its own
+ # activeDeadlineSeconds), one the API no longer holds, and one of the same
+ # name and another uid, which another client created and whose pull proves
+ # nothing about the Pod this probe asked for.
+ # The bound is the probe's, not each Pod's: the six Pods spend it together,
+ # as the six containers of one Pod once did. Every time here is wall time,
+ # $SECONDS, the bound from the probe's start and each rule from what the Pod
+ # in hand reported: counting the 5 s sleeps left out every API round trip,
+ # and a wait of a day ran past the Pod's own deadline. That deadline, each
+ # Pod's activeDeadlineSeconds, is the bound and a tenth of it, 300 s at the
+ # least: the kubelet times it on the node's clock from the Pod's start, and
+ # a margin that grows with the wait keeps the Pod alive until the probe
+ # itself refuses.
  #
  # WHERE IN THE CHAIN. Before backup quiesces a running deployment: a refusal
  # here leaves whatever was running, running.
- local base recorded='' pod spent=0 failing_since=-1 status verdict words='' where deadline want
- base=$(j '.registry.base // ""')
+ local base recorded='' pod uid began spent=0 failing_since=-1 unscheduled_since=-1 placed='' status verdict words='' words_rank=-1 said rank condition where deadline want bound within slow=false retrying=false refuse node refs role ref n=0 pulls
+ base=$(j '.registry.base // ""'); node=$(j .storage.node)
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
- [[ -n $base || $base != "$recorded" ]] || return 0
  # registry.base has no scheme (the schema holds it to host[:port][/path]), so
  # url_origin_only prints it as it is: routed like every printed address, so
- # the URL scan's alias rule sees the wrapper [review B2]
- if [[ -n $base ]]; then where="registry.base ($(url_origin_only "$base"))"; else where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"; fi
+ # the URL scan's alias rule sees the wrapper
+ if [[ -n $base ]]; then where="registry.base ($(url_origin_only "$base"))"
+ elif [[ -n $recorded ]]; then where="the release's own repositories (this site no longer sets registry.base; the installed deployment used $recorded)"
+ else where="the release's own repositories"; fi
+ # What a failed pull asks the operator to check: a relocation is a copy and a
+ # prefix; the release's own repositories are the credential alone.
+ local advice="The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host."
+ [[ -n $base || -n $recorded ]] || advice="The repositories and digests are the signed release's own. Check that registry.pull_secret (or the registry.config_file it is made from) carries a credential that can read every one of them; a node that cannot reach those registries at all needs a mirror it can reach, named in registry.base."
  deadline=$(j .deadlines.dependencies_seconds)
+ bound=$deadline; within="deadlines.dependencies_seconds ($deadline s)"
+ if [[ -z $base && $base == "$recorded" ]]; then
+   bound=$(( deadline + $(j .deadlines.initialization_seconds) ))
+   within="deadlines.dependencies_seconds plus deadlines.initialization_seconds ($bound s)"
+ fi
  want=$(jq '.images|length' "$GSJ_PAYLOAD/release.json")
- pod="gsj-pull-${OPERATION:0:12}"
+ # Which verb continues a restore stopped here depends on where it stopped:
+ # restoring-* is restore-repair's (resume refuses those phases),
+ # restore-files-verified is resume's (or restore-repair's under a corrected
+ # program), applying is the repair path's. After a restore-program
+ # transition only the corrected installer continues the restore:
+ # restore-repair before the application starts, repair at applying. Every
+ # caller writes the operation's status before this probe, so it is read
+ # once, here, for the refusal of a Pod that could not be created as for
+ # every refusal of one that was.
+ local kind opstatus verb=''
+ kind=$(jq -r '.kind // ""' "$STATE_DIR/operation.json" 2>/dev/null || true); opstatus=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
+ if [[ $kind == restore ]]; then
+   if [[ ${RESTORE_PROGRAM_ACTIVE:-false} == true ]]; then
+     case $opstatus in applying) verb="repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; *) verb="restore-repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; esac
+   else case $opstatus in restoring-resources|restoring-files) verb="restore-repair --operation $OPERATION with the exact saved target";; applying) verb="repair --operation $OPERATION with the exact saved target";; *) verb="resume --operation $OPERATION with the exact source installer";; esac; fi
+ fi
  registry_secret_input
  log "Proving $(if [[ -n $(j .storage.node) ]]; then printf 'node %s' "$(j .storage.node)"; else printf 'a node (storage.node is not set, so the scheduler picks one)'; fi) can pull all $want images from $where before anything is applied"
  # An earlier run's probe Pod, whatever its operation: the label is this
  # release's alone. Bounded -- a Pod stuck Terminating must not hang the verb.
  k delete pod -l "gsj.io/pull-probe=$RELEASE" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true
  # The label is deliberately NOT gsj.io/owner or app.kubernetes.io/instance:
- # restore refuses a target holding Pods under those, and this Pod is not part
- # of the deployment. cleanup_exit removes it on any exit, the line above
- # removes a predecessor, and sweep removes one a killed installer left behind.
- PROBE_POD=$pod
- if ! jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$(j .storage.node)" --arg base "$base" --argjson deadline "$deadline" --argjson pulls "$(jq '(.image.pullSecrets // [])|map({name:.})' "$GSJ_WORK/values.pending.json")" --slurpfile r "$GSJ_PAYLOAD/release.json" "$JQ_IMAGE"'
-   {apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"gsj.io/pull-probe":$release}},
-    spec:{restartPolicy:"Never",automountServiceAccountToken:false,enableServiceLinks:false,imagePullSecrets:$pulls,
-          activeDeadlineSeconds:($deadline+300),
-          nodeSelector:(if $node=="" then {} else {"kubernetes.io/hostname":$node} end),
-          containers:[$r[0].images|to_entries[]|{name:("pull-"+(.key|ascii_downcase)),image:(.value|image_ref($base)),imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:"1m",memory:"1Mi"},limits:{memory:"16Mi"}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
-   PROBE_POD=''
-   atomic "$STATE_DIR/pull-probe-create.err" < "$GSJ_WORK/pull-probe-create.err"
-   fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $(kubectl_failure_condition "$GSJ_WORK/pull-probe-create.err"); kubectl's own words are kept in $STATE_DIR/pull-probe-create.err. If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
- fi
- while :; do
-   status=$(k get pod "$pod" -o json 2>/dev/null) || status='{}'
-   # pulled: the runtime reports the image's ID, or the container got as far as
-   # being created. `terminated` alone is NOT proof -- a Pod evicted before its
-   # pull reports terminated/ContainerStatusUnknown with no imageID.
-   verdict=$(jq -r --argjson want "$want" '
-     [(.status.containerStatuses // [])[] | {image,
-        failed: ((.state.waiting.reason // "") | test("^(ErrImage|ImagePull|ImageInspect|InvalidImageName|RegistryUnavailable)")),
-        words: ((.state.waiting.message // .state.waiting.reason // "") | gsub("[\\r\\n\\t]+";" ")),
-        pulled: (((.imageID // "") != "") or (.state.running != null)
-                 or ((.state.terminated != null) and ((.state.terminated.reason // "") != "ContainerStatusUnknown"))
-                 or ((.state.waiting.reason // "") | IN("RunContainerError","CreateContainerError","CrashLoopBackOff")))}] as $c
-     | if ($c|length) == $want and all($c[]; .pulled) then "pulled"
-       elif any($c[]; .failed) then ([$c[]|select(.failed)]) as $f |
-         "failing " + ($f|length|tostring) + " of " + ($want|tostring) + " images: " + ([$f[].image]|join(", ")) + " SAID " + $f[0].words
-       else "waiting" end' <<< "$status")
-   case "$verdict" in
-     pulled) break;;
-     failing*)
-       (( failing_since >= 0 )) || failing_since=$spent
-       # The cause is in the FIRST failure message (ErrImagePull: "not found",
-       # "unauthorized", "no such host"); ImagePullBackOff replaces it with
-       # "Back-off pulling image". Keep the informative one.
-       if [[ -z $words || ( $words == Back-off* && ${verdict#* SAID } != Back-off* ) ]]; then words=${verdict#* SAID }; fi;;
-     *) failing_since=-1;;
-   esac
-   # The kubelet retries a failed pull with backoff, and a registry can stumble
-   # once: refuse only a failure that has outlived 90 s of retries -- or one that
-   # is still failing when the deadline arrives, which a short
-   # deadlines.dependencies_seconds would otherwise turn into a nameless timeout.
-   if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 || spent >= deadline )); then
-     verdict=${verdict%% SAID *}
-     # the Pod's status, kept 0600 for the operator: the runtime's own words
-     # live there, never in the refusal (the block below re-declares
-     # `status` for the operation's) [review B2]
-     printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
-     # The same ImagePullBackOff comes from a changed site (a wrong base, digest or
-     # pull Secret: a repair after the correction) and from the node's side (a
-     # registry CA it does not trust, DNS, a proxy, a full disk, a rate limit, an
-     # outage: resume once it can pull); the probe cannot tell them apart, so the
-     # hint names both. A restore stopped here is restore-repair's, not resume's.
-     # A restore keeps its site byte for byte (every continuation refuses a
-     # changed registry.base or registry.pull_secret), and which verb continues
-     # it depends on where it stopped: restoring-* is restore-repair's (resume
-     # refuses those phases), restore-files-verified is resume's (or
-     # restore-repair's under a corrected program), applying is the repair
-     # path's. For an install or upgrade the recorded status decides: "owned"
-     # is a first install with nothing applied or quiesced, which must not be
-     # sent to repair (it would complete without the storage check); past the
-     # backup the deployment is quiesced, abandon refuses, and a changed site
-     # value is repair's. Every caller writes that status before this probe.
-     # After a restore-program transition only the corrected installer
-     # continues the restore: restore-repair before the application starts,
-     # repair at applying.
-     # In main and resume's owned phase this probe runs BEFORE the backup, so
-     # the status is "owned" for an upgrade too: a first install is "owned"
-     # WITHOUT an installed record (read before the probe on both paths).
-     local kind status; kind=$(jq -r '.kind // ""' "$STATE_DIR/operation.json" 2>/dev/null || true); status=$(jq -r '.status // ""' "$STATE_DIR/operation.json" 2>/dev/null || true)
-     local nodeside="once the node can pull (a registry CA the node does not trust, node DNS or a proxy, a full node disk, a rate limit or an outage)"
-     if [[ $kind == restore ]]; then
-       local verb
-       if [[ ${RESTORE_PROGRAM_ACTIVE:-false} == true ]]; then
-         case $status in applying) verb="repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; *) verb="restore-repair --operation $OPERATION with this corrected installer (its recorded program; neither resume nor the source installer continues it)";; esac
-       else case $status in restoring-resources|restoring-files) verb="restore-repair --operation $OPERATION with the exact saved target";; applying) verb="repair --operation $OPERATION with the exact saved target";; *) verb="resume --operation $OPERATION with the exact source installer";; esac; fi
-       RECOVERY_HINT="$verb $nodeside, or after correcting the registry's contents (wait 180 s first: this operation's Lease must go unrenewed that long); a changed registry.base or registry.pull_secret cannot continue this restore, whose site is retained byte for byte"
-     elif [[ ( $status == owned || -z $status ) && ! -s $GSJ_WORK/installed.json ]]; then
-       RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file after correcting registry.base, the registry's contents or registry.pull_secret (a repair would complete this first install without the storage check), or resume --operation $OPERATION $nodeside"
-     elif [[ $status == owned || -z $status ]]; then
-       # the operation's own verb again: an interrupted upgrade is not told to install
-       local again="run install again"; [[ $kind != upgrade ]] || again="run upgrade --to VERSION again"
-       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and $again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $nodeside"
-     else
-       RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after correcting registry.base, the registry's contents or registry.pull_secret (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $nodeside"
+ # restore refuses a target holding Pods under those, and these Pods are not
+ # part of the deployment. cleanup_exit removes the one PROBE_POD names on
+ # any exit, the line above removes a predecessor, and sweep removes one a
+ # killed installer left behind.
+ #
+ # What each Pod asks for. Its container never runs, so the numbers only
+ # have to pass admission and the scheduler -- and a namespace that admits
+ # the deployment must admit its probe. The storage check, the capacity
+ # reader and the credential-repair Pod ask for 100m CPU and 128Mi, and every
+ # chart container that names a request asks for at least that, so a
+ # LimitRange's Container minimum up to those figures admits them all: 10m
+ # and 16Mi were refused by a 32Mi minimum, and 50m and 64Mi by one of 100m
+ # and 128Mi, the probe alone each time. So each Pod asks for the storage
+ # check's request, with both limits equal to it: ratio 1, and no CPU limit
+ # left for a LimitRange to inject (one injected over 10m made a
+ # limit-to-request ratio of 100). And ONE image per Pod, one Pod at a time:
+ # the probe asks before the backup, beside the running deployment's
+ # reservations, and six such containers together were 768Mi, all that a
+ # node sized to the operator guide's figures (9 GiB, the deployment
+ # reserving 8.25 GiB) leaves before the kubelet's own reservation and the
+ # system Pods -- the scheduler could not place them. One is 128Mi, and a
+ # node's kubelet pulls one image at a time anyway, so six Pods in turn take
+ # as long as one Pod of six.
+ local cpu=100m memory=128Mi room="node $node"
+ [[ -n $node ]] || room="a node the scheduler may use"
+ pulls=$(jq '(.image.pullSecrets // [])|map({name:.})' "$GSJ_WORK/values.pending.json")
+ refs=$(jq -r --arg base "$base" "$JQ_IMAGE"' .images|to_entries[]|[(.key|ascii_downcase), (.value|image_ref($base))]|@tsv' "$GSJ_PAYLOAD/release.json")
+ began=$SECONDS
+ while IFS=$'\t' read -r role ref; do
+   n=$(( n + 1 )); pod="gsj-pull-${OPERATION:0:12}-$role"
+   PROBE_POD=$pod
+   # The uid the API gave THIS Pod: a Pod of the same name and another uid is
+   # another client's.
+   if ! uid=$(jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$node" --arg role "$role" --arg image "$ref" --argjson deadline "$bound" --arg cpu "$cpu" --arg memory "$memory" --argjson pulls "$pulls" '
+     {apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"gsj.io/pull-probe":$release}},
+      spec:{restartPolicy:"Never",automountServiceAccountToken:false,enableServiceLinks:false,imagePullSecrets:$pulls,
+            activeDeadlineSeconds:($deadline+([($deadline/10|floor),300]|max)),
+            nodeSelector:(if $node=="" then {} else {"kubernetes.io/hostname":$node} end),
+            containers:[{name:("pull-"+$role),image:$image,imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:$cpu,memory:$memory},limits:{cpu:$cpu,memory:$memory}}}]}}' | k create -f - -o jsonpath='{.metadata.uid}' 2>"$GSJ_WORK/pull-probe-create.err"); then
+     PROBE_POD=''
+     atomic "$STATE_DIR/pull-probe-create.err" < "$GSJ_WORK/pull-probe-create.err"
+     local why next="If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
+     why=$(kubectl_failure_condition "$GSJ_WORK/pull-probe-create.err")
+     [[ $why != *LimitRange* ]] || next="Each probe Pod, one per image in turn, has one container requesting cpu $cpu and memory $memory, with limits equal to those requests: the namespace's LimitRange must admit that (its minimum, maximum and maxLimitRequestRatio) and its ResourceQuota must leave room for it"
+     # The cure is the namespace's policy, never a site value. An install or an
+     # upgrade is continued by resume, the closing line's own default; a
+     # restore by the verb its phase accepts, which resume is not in every one.
+     [[ -z $verb ]] || RECOVERY_HINT="$verb once the namespace admits the probe Pod (wait 180 s first: this operation's Lease must go unrenewed that long)"
+     fail "the image pull probe could not be created in namespace $NAMESPACE, so whether the node can pull from $where is unproven: $why; kubectl's own words are kept in $STATE_DIR/pull-probe-create.err. $next"
+   fi
+   # Every rule below is timed from what THIS Pod reported; only the time
+   # spent carries over, against the one bound.
+   failing_since=-1; unscheduled_since=-1; placed=''; words=''; words_rank=-1; retrying=false
+   while :; do
+     # A Pod the API no longer holds answers nothing under --ignore-not-found,
+     # read as null: gone. A get that FAILS -- the API server unreachable for a
+     # moment -- is a poll without a status ({}), as it always was.
+     status=$(k get pod "$pod" -o json --ignore-not-found 2>/dev/null) || status='{}'
+     [[ -n $status ]] || status=null
+     spent=$(( SECONDS - began ))
+     # pulled: the runtime reports the image's ID, or the container got as far as
+     # being created. `terminated` alone is NOT proof -- a Pod evicted before its
+     # pull reports terminated/ContainerStatusUnknown with no imageID. ended: the
+     # Pod or its container is over without the image (restartPolicy Never:
+     # nothing starts it again). replaced: another uid under this Pod's name.
+     # failing: the verdict, then the container's words on a line of their own.
+     # The image is named by the reference composed above, never by the status.
+     verdict=$(jq -r --arg uid "$uid" '
+       if . == null then "gone"
+       elif $uid != "" and (.metadata.uid // $uid) != $uid then "replaced"
+       else
+       [(.status.containerStatuses // [])[] | {
+          failed: ((.state.waiting.reason // "") | test("^(ErrImage|ImagePull|ImageInspect|InvalidImageName|RegistryUnavailable)")),
+          words: ((.state.waiting.message // .state.waiting.reason // "") | gsub("[\\r\\n\\t]+";" ")),
+          pulled: (((.imageID // "") != "") or (.state.running != null)
+                   or ((.state.terminated != null) and ((.state.terminated.reason // "") != "ContainerStatusUnknown"))
+                   or ((.state.waiting.reason // "") | IN("RunContainerError","CreateContainerError","CrashLoopBackOff"))),
+          ended: (.state.terminated != null)}] as $c
+       | if ($c|length) == 1 and $c[0].pulled then "pulled"
+         elif ((.status.phase // "") | IN("Failed","Succeeded")) or any($c[]; .ended) then "ended"
+         elif any($c[]; .failed) then "failing", ($c[]|select(.failed)|.words)
+         else ([(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | (.reason // "Unschedulable")] | first) as $unplaced
+           | if $unplaced != null then "unscheduled " + ($unplaced|tostring|gsub("[\\r\\n\\t]+";" "))
+             elif ($c|length) > 0 then "pulling" else "waiting" end end end' <<< "$status")
+     # unscheduled: PodScheduled is False, and nothing pulls. pulling: placed,
+     # and the container reports a pull that has neither finished nor failed.
+     # waiting: no container status at all -- not yet placed, or not read.
+     case "$verdict" in
+       pulled) break;;
+       failing*)
+         unscheduled_since=-1
+         (( failing_since >= 0 )) || failing_since=$spent
+         # The cause is in the FIRST failure message (ErrImagePull: "not found",
+         # "unauthorized", "no such host"); ImagePullBackOff replaces it with
+         # "Back-off pulling image". Keep the most telling cause this Pod's
+         # container has reported: a definitive one over one a retry can clear,
+         # and either over that back-off.
+         while IFS= read -r said; do
+           rank=1; [[ $(pull_failure_condition "$said") != definitive* ]] || rank=2
+           [[ $rank == 2 || ( -n $said && $said != Back-off* ) ]] || rank=0
+           if (( rank > words_rank )); then words=$said; words_rank=$rank; fi
+         done <<< "${verdict#*$'\n'}"
+         verdict=${verdict%%$'\n'*};;
+       unscheduled*)
+         failing_since=-1; words=''; words_rank=-1
+         (( unscheduled_since >= 0 )) || unscheduled_since=$spent
+         # the scheduler's reason, repeated only when it is a word this
+         # installer knows; its message stays in the status kept below
+         placed=$(known_word "${verdict#unscheduled }" Unschedulable SchedulerError);;
+       *) failing_since=-1; words=''; words_rank=-1; unscheduled_since=-1;;
+     esac
+     # The kubelet retries a failed pull with backoff, and a registry can stumble
+     # once: refuse a definitive failure once it has outlived 90 s of retries.
+     # Wait out any other for deadlines.dependencies_seconds from its first
+     # report: a large image on a slow link can time out once and pull on the
+     # next attempt, and that attempt takes minutes with the first failure on
+     # the Pod all along. A failure reported that long is refused, as the
+     # previous release's provisioning hook refused its Forgejo image's, and is
+     # never waited out to the long bound, which is a pull in progress's alone.
+     # A Pod the scheduler has not placed is refused after 300 s: the running
+     # deployment's reservations or the node's own state keep it there, and no
+     # registry or slow link is involved. A failure or an unplaced Pod still
+     # reported when the bound arrives is refused by what it is, which a short
+     # deadlines.dependencies_seconds would otherwise turn into a nameless timeout.
+     refuse=''
+     if [[ $verdict == ended || $verdict == gone || $verdict == replaced ]]; then refuse=stopped
+     elif [[ $verdict == failing* ]] && (( (words_rank == 2 && spent - failing_since >= 90) || spent - failing_since >= deadline || spent >= bound )); then refuse=failing
+     elif [[ $verdict == unscheduled* ]] && (( spent - unscheduled_since >= 300 || spent >= bound )); then refuse=unscheduled
+     elif (( spent >= bound )); then refuse=deadline; fi
+     if [[ -n $refuse ]]; then
+       # the Pod's status, kept 0600 for the operator: the runtime's own words
+       # and the scheduler's live there, never in the refusal
+       [[ $verdict == gone ]] || printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
+       # The same ImagePullBackOff comes from a changed site (a wrong base, digest or
+       # pull Secret: a repair after the correction) and from the node's side (a
+       # registry CA it does not trust, DNS, a proxy, a full disk, a rate limit, an
+       # outage: resume once it can pull); the probe cannot tell them apart, so the
+       # hint names both. A restore stopped here is restore-repair's, not resume's.
+       # A restore keeps its site byte for byte (every continuation refuses a
+       # changed registry.base or registry.pull_secret) and is continued by the
+       # verb its phase accepts (read above). For an install or upgrade the
+       # recorded status decides: "owned" is a first install with nothing
+       # applied or quiesced, which must not be sent to repair (it would
+       # complete without the storage check); past the backup the deployment is
+       # quiesced, abandon refuses, and a changed site value is repair's.
+       # In main and resume's owned phase this probe runs BEFORE the backup, so
+       # the status is "owned" for an upgrade too: a first install is "owned"
+       # WITHOUT an installed record (read before the probe on both paths).
+       # The deadline takes the same dispatch: its site change is a raised
+       # deadline, which a restore cannot take either, and a registry that
+       # answers late needs none. An unplaced Pod's cure is room on the node,
+       # which every operation takes with its own site; the one site change is
+       # another storage.node, a first install's alone: an installed release's
+       # claims stay where they are.
+       local fix when kept progress="$(( n - 1 )) pulled before it, $(( want - n )) not yet tried"
+       case $refuse in
+         failing)
+           fix="after correcting registry.base, the registry's contents or registry.pull_secret"
+           when="once the node can pull (a registry CA the node does not trust, node DNS or a proxy, a full node disk, a rate limit or an outage)"
+           kept=", or after correcting the registry's contents (wait 180 s first: this operation's Lease must go unrenewed that long); a changed registry.base or registry.pull_secret";;
+         unscheduled)
+           fix="with another storage.node"
+           when="once room is freed on $room for the probe Pod's cpu $cpu and memory $memory"
+           kept=" (wait 180 s first: this operation's Lease must go unrenewed that long); a changed storage.node";;
+         stopped)
+           fix="with another storage.node"
+           when="once $room admits and keeps the probe Pod (cpu $cpu and memory $memory, with no eviction under resource pressure) and nothing else deletes or replaces Pods labelled gsj.io/pull-probe in namespace $NAMESPACE"
+           kept=" (wait 180 s first: this operation's Lease must go unrenewed that long); a changed storage.node";;
+         *)
+           fix="after raising deadlines.dependencies_seconds"
+           when="once the registry answers and the probe Pod can be scheduled"
+           kept=" (wait 180 s first: this operation's Lease must go unrenewed that long); a raised deadlines.dependencies_seconds";;
+       esac
+       if [[ $kind == restore ]]; then
+         RECOVERY_HINT="$verb $when$kept cannot continue this restore, whose site is retained byte for byte"
+       elif [[ ( $opstatus == owned || -z $opstatus ) && ! -s $GSJ_WORK/installed.json ]]; then
+         RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file $fix (a repair would complete this first install without the storage check), or resume --operation $OPERATION $when"
+       elif [[ $refuse == unscheduled || $refuse == stopped ]]; then
+         RECOVERY_HINT="resume --operation $OPERATION $when; a changed storage.node is refused for an installed release, whose claims stay where they are"
+       elif [[ $opstatus == owned || -z $opstatus ]]; then
+         # the operation's own verb again: an interrupted upgrade is not told to install
+         local again="run install again"; [[ $kind != upgrade ]] || again="run upgrade --to VERSION again"
+         RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and $again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $when"
+       else
+         RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $when"
+       fi
+       if [[ $refuse == stopped ]]; then
+         local what reported='' cause kept_status=" The Pod's status is kept in $STATE_DIR/pull-probe-status.json."
+         case $verdict in
+           gone)
+             what="was deleted"; kept_status=''
+             cause="another client deleted it (an operator, a cleanup job or a policy controller)";;
+           replaced)
+             what="was replaced by another Pod of the same name (another uid)"
+             cause="another client deleted it and created one of that name, whose pull proves nothing about the Pod this probe asked for";;
+           *)
+             # the phase and the reason, each repeated only when it is a value
+             # this installer knows; the kubelet's message is kept, never
+             # repeated. Terminated and NodeShutdown are the kubelet's graceful
+             # node shutdown (Shutdown before them).
+             what=ended
+             reported=" (phase $(known_word "$(jq -r '.status.phase // "unknown"' <<< "$status")" Pending Running Succeeded Failed Unknown unknown), reason $(known_word "$(jq -r '.status.reason // "unknown"' <<< "$status")" Evicted OutOfcpu OutOfmemory DeadlineExceeded NodeLost Shutdown Terminated NodeShutdown unknown))"
+             cause="the kubelet evicted it under resource pressure or refused to admit it, the node shut down or was lost, or it outlived its activeDeadlineSeconds";;
+         esac
+         # A Pod of this name that is not the probe's own is another client's:
+         # cleanup_exit must not delete it.
+         [[ $verdict == ended ]] || PROBE_POD=''
+         fail "the image pull probe's Pod $what before its image was pulled$reported, so whether the node can pull image $n of $want, $ref ($progress), from $where is unproven: $cause.$kept_status Helm has applied nothing in this run"
+       fi
+       if [[ $refuse == failing ]]; then
+         local after=''
+         if (( spent >= bound )); then after=", still failing at the end of $within while the kubelet retried"
+         elif (( spent - failing_since >= deadline )); then after=", still failing deadlines.dependencies_seconds ($deadline s) after it was first reported, while the kubelet retried"; fi
+         condition=$(pull_failure_condition "$words")
+         fail "the node cannot pull this release from $where: image $n of $want, $ref ($progress). The container runtime reported ${condition#*$'\t'}$after; its own words are kept in $STATE_DIR/pull-probe-status.json. $advice The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
+       fi
+       if [[ $refuse == unscheduled ]]; then
+         local waited="300 s" placement
+         (( spent - unscheduled_since >= 300 )) || waited=$within
+         if [[ -n $node ]]; then placement="storage.node ($node) has no room for its request, cpu $cpu and memory $memory, beside what the Pods already there request (the running deployment's too, when there is one), or does not accept it (cordoned, tainted, or no node of that name)"
+         else placement="storage.node is not set, and no node the scheduler may use has room for its request, cpu $cpu and memory $memory, beside what the Pods already there request, or accepts it (cordoned or tainted)"; fi
+         fail "the image pull probe's Pod was not scheduled (PodScheduled: $placed) within $waited, so whether the node can pull image $n of $want from $where is unproven: $placement. The Pod's status, with the scheduler's own words, is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
+       fi
+       # the conditions' types and REASONS, each repeated only when it is a
+       # value this installer knows (the API does not constrain a reason
+       # string); their messages are the scheduler's free text and are kept,
+       # never repeated
+       local conditions='' ctype creason
+       while IFS=$'\t' read -r ctype creason; do
+         [[ -n $ctype ]] || continue
+         conditions+="${conditions:+; }$(known_word "$ctype" PodScheduled Initialized ContainersReady Ready PodReadyToStartContainers DisruptionTarget): $(known_word "$creason" Unschedulable SchedulerError ContainersNotReady ContainersNotInitialized PodCompleted PodFailed ReadinessGatesNotReady unknown)"
+       done < <(jq -r '(.status.conditions // [])[]|select(.status=="False")|[.type, (.reason // "unknown")]|@tsv' <<< "$status")
+       fail "the node did not finish pulling this release's images from $where within $within: image $n of $want, $ref ($progress), was not pulled${conditions:+; $conditions}; the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
      fi
-     fail "the node cannot pull this release from $where: ${verdict#failing }. The container runtime reported, of the first, $(pull_failure_condition "$words"); its own words are kept in $STATE_DIR/pull-probe-status.json. The repository is <registry.base>/<the last path segment of the release's repository> and the digest is always the signed release's -- a registry holding different bytes under that name is refused by the pull itself. Check that every digest was copied there unchanged, that the prefix is exact, and that registry.pull_secret carries a credential for that host. The same failure also comes from the node's side, with no site value wrong: a registry CA the container runtime does not trust, the node's DNS or proxy, a full node disk, a registry rate limit or outage -- then continue with the command the closing line names. Helm has applied nothing in this run"
-   fi
-   if (( spent >= deadline )); then
-     RECOVERY_HINT="resume --operation $OPERATION once the registry answers, or repair --operation $OPERATION --config $CONFIG --non-interactive after raising deadlines.dependencies_seconds"
-     # the conditions' types and REASONS, each repeated only when it is a
-     # value this installer knows (the API does not constrain a reason
-     # string); their messages are the scheduler's free text and are kept,
-     # never repeated [review sweep B2]
-     printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
-     local conditions='' ctype creason
-     while IFS=$'\t' read -r ctype creason; do
-       [[ -n $ctype ]] || continue
-       conditions+="${conditions:+; }$(known_word "$ctype" PodScheduled Initialized ContainersReady Ready PodReadyToStartContainers DisruptionTarget): $(known_word "$creason" Unschedulable SchedulerError ContainersNotReady ContainersNotInitialized PodCompleted PodFailed ReadinessGatesNotReady unknown)"
-     done < <(jq -r '(.status.conditions // [])[]|select(.status=="False")|[.type, (.reason // "unknown")]|@tsv' <<< "$status")
-     fail "the node did not finish pulling this release's images from $where within deadlines.dependencies_seconds ($deadline s): $conditions; the Pod's status is kept in $STATE_DIR/pull-probe-status.json. Helm has applied nothing in this run"
-   fi
-   sleep 5; spent=$(( spent + 5 ))
- done
- k delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true; PROBE_POD=''
+     if [[ $verdict == failing* ]] && (( spent - failing_since >= 90 )) && ! $retrying; then
+       retrying=true
+       condition=$(pull_failure_condition "$words")
+       local limit="deadlines.dependencies_seconds ($deadline s) after it was first reported"
+       (( failing_since + deadline < bound )) || limit=$within
+       log "The node's pull of this release's images from $where is failing and being retried, for image $n of $want, $ref. The container runtime reported ${condition#*$'\t'}, which a retry can clear, so the wait goes on up to $limit while the kubelet retries, and a failure still reported then is refused"
+     fi
+     # Only a Pod placed on a node whose container reports its pull is on a
+     # slow link: an unplaced Pod, or one no container status is reported for,
+     # is not pulling at all.
+     if [[ $verdict == pulling ]] && (( spent >= deadline )) && ! $slow; then
+       slow=true
+       log "The node is still pulling this release's images from $where at deadlines.dependencies_seconds ($deadline s), as on a slow link to the registry; the wait goes on for up to deadlines.initialization_seconds more ($(( bound - deadline )) s), the time the previous release gave these pulls, and a pull that fails definitively (a refused credential, a name or digest the registry does not hold, an invalid name) is still refused after 90 s, any other failure once it has been reported for deadlines.dependencies_seconds"
+     fi
+     sleep 5
+   done
+   # Waited for, and bounded: the scheduler counts a Pod being deleted until
+   # it is gone, and the next Pod must not be judged beside it.
+   k delete pod "$pod" --ignore-not-found --wait=true --timeout=60s >/dev/null 2>&1 || true; PROBE_POD=''
+ done <<< "$refs"
  log "All $want images pulled from $where by digest"
 }
 maintenance_pod() {
@@ -3048,6 +3577,16 @@ maintenance_pod() {
  # transfer directory cleanup_exit must hand back when the operation stops.
  TRANSFER_HANDBACK_POD=$name
  k wait --for=condition=Ready "pod/$name" --timeout=300s
+ # A hostPath the kubelet creates (DirectoryOrCreate) is root's with mode 0755:
+ # every account on the node could read the plaintext this Pod is about to
+ # stage there. Private before the first byte; the handback later gives it to
+ # the operator as it is. An emptyDir lives inside the Pod's own kubelet
+ # directory and needs nothing. A refused chmod never fails the operation: the
+ # log names the directory, which stays as every earlier release left it.
+ if [[ -n $(j '.storage.transfer_path // ""') ]]; then
+   k exec "$name" -- chmod 700 /transfer >/dev/null 2>"$STATE_DIR/transfer-private.err" ||
+     log "The transfer directory $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node) could not be made private (mode 0700), so other accounts on that node may read what this operation stages there; kubectl's own words are kept in $STATE_DIR/transfer-private.err"
+ fi
 }
 immutable_file() {
  # Publish stdin on the destination filesystem without replacing any entry.
@@ -3590,6 +4129,17 @@ backup_complete() {
  object=$(k get pod "$pod" -o json --ignore-not-found)
  if [[ -n $object ]]; then
    jq -e --arg owner "$pod" '.metadata.labels["gsj.io/operation"]==$owner' <<< "$object" >/dev/null || fail 'backup maintenance pod belongs to another operation'
+   # The encrypted archive is verified: the two plaintext copies of all three
+   # volumes the Pod staged -- the snapshot it encrypted and the round trip it
+   # verified, 13 G measured per backup -- are nobody's recovery point now, and
+   # a hostPath kept them for good. Removed HERE and nowhere else: backup-repair
+   # and restore-repair read a stopped Pod's /transfer, so no failure path
+   # removes anything. A refused removal never fails the operation it is
+   # closing; the log names the directory to clean by hand. An emptyDir goes
+   # with the Pod below either way.
+   if ! k exec "$pod" -- rm -f /transfer/snapshot.tar.gz /transfer/roundtrip.tar.gz >/dev/null 2>"$STATE_DIR/transfer-remove.err" && [[ -n $(j '.storage.transfer_path // ""') ]]; then
+     log "The plaintext copies this backup staged, snapshot.tar.gz and roundtrip.tar.gz, could not be removed from $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node); the encrypted archive is verified, so remove them there by hand. kubectl's own words are kept in $STATE_DIR/transfer-remove.err"
+   fi
    transfer_handback "$pod"
    k delete pod "$pod" --wait=true >/dev/null
  fi
@@ -3655,7 +4205,7 @@ backup() {
  rm "$archive.resources.enc.partial"
  sha_file "$archive.resources.enc" | immutable_file "$archive.resources.enc.sha256"
  # Verify transport/decryption bytes with the pod's public archive verifier.
- openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass "file:$BACKUP_PASSWORD" -in "$archive" | k exec -i "$pod" -- sh -c 'cat > /transfer/roundtrip.tar.gz'
+ openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass "file:$BACKUP_PASSWORD" -in "$archive" | k exec -i "$pod" -- sh -c 'umask 077; cat > /transfer/roundtrip.tar.gz'
  k exec "$pod" -- python -m gsj_deploy.backup verify --archive /transfer/roundtrip.tar.gz
  validate_backup_closure "$snapshot"
  # Bind retries to the recovery key without storing it or decrypting customer
@@ -3701,7 +4251,10 @@ restart_backup_source() {
 backup_operation() {
  read_installed
  [[ -s $GSJ_WORK/installed.json ]] && jq -e --arg identity "$RELEASE_ID" '.status=="complete" and .manifest.identity==$identity' "$GSJ_WORK/installed.json" >/dev/null || fail 'backup requires the exact completed installed release installer'
- jq -e --slurpfile site "$SITE" '(.site|del(.backup,.delivery,.verification))==($site[0]|del(.backup,.delivery,.verification))' "$GSJ_WORK/installed.json" >/dev/null || fail 'backup cannot change application settings; use the saved site configuration'
+ # The staging directory and the free-space floor are not application
+ # settings either (compatibility says why): correcting the one is what makes
+ # this backup possible, and the capacity check reads both from this site.
+ jq -e --slurpfile site "$SITE" 'def settings: del(.backup,.delivery,.verification,.storage.transfer_path,.storage.minimum_free_bytes); (.site|settings)==($site[0]|settings)' "$GSJ_WORK/installed.json" >/dev/null || fail 'backup cannot change application settings; use the saved site configuration'
  acquire
  read_installed
  jq -e --arg identity "$RELEASE_ID" '.status=="complete" and .manifest.identity==$identity' "$GSJ_WORK/installed.json" >/dev/null || fail 'installed release changed before backup ownership was acquired'
@@ -3761,13 +4314,34 @@ helm_application_prepare() {
  # The pointer and phase commit together, before the Helm process can start.
  jq --arg attempt "$attempt" '.status="applying"|.helm_application=$attempt' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
 }
+restore_fresh_route() {
+ # Where a fresh restore of this deployment goes, in the words every such
+ # hint uses. Most sites have one cluster, so the empty namespace is on
+ # another cluster or this one recreated once the deployment is removed, from
+ # a new site directory either way. The removal is named in the guide's
+ # order: abandon, the release's uninstall (the release lives in the
+ # namespace, so it names it), sweep, the namespace, and last the managed
+ # add-ons: each one's owner record hashes the namespace's uid, so a
+ # recreated namespace is another identity and the restore's add-on step
+ # refuses the add-ons the old one owns. abandon refuses an operation the
+ # canonical record already names abandoned or swept, so the route for one
+ # of those starts at the uninstall.
+ local abandon="abandon --operation $OPERATION, " last="then delete namespace $NAMESPACE"
+ ! jq -e --arg op "$OPERATION" '.operation==$op and (.status|IN("abandoned","swept"))' "$STATE_DIR/operation.json" >/dev/null 2>&1 || abandon=''
+ [[ $(j .ingress.profile) != managed-traefik && $(j .tls.profile) != managed-acme && $(j .storage.profile) != managed-local-path ]] || last="delete namespace $NAMESPACE, then remove its managed add-ons and their CRDs (see the guide)"
+ printf 'into an empty namespace %s from a new site directory: on another cluster, or on this one once the deployment is removed (%shelm -n %s uninstall %s, sweep, %s)' "$NAMESPACE" "$abandon" "$NAMESPACE" "$RELEASE" "$last"
+}
 restore_fresh_fail() {
  # A restore whose evidence changed outside its recorded writes has one named
  # recovery; its retained operation is never deleted, reset or replayed. $2
- # overrides which fresh restore it names.
- local fresh="${2:-its verified archive with the exact source installer}"
- RECOVERY_HINT="restore of $fresh in another Kubernetes context whose namespace $NAMESPACE is empty; keep operation $OPERATION retained"
- fail "$1; keep operation $OPERATION retained and restore $fresh in another Kubernetes context whose namespace $NAMESPACE is empty"
+ # overrides which fresh restore it names. The site directory keeps the
+ # retained operation's evidence, and on this cluster its unfinished
+ # checkpoint refuses a fresh restore (restore_archive retires only a completed
+ # one), so the fresh one runs from a new directory (restore_fresh_route).
+ local fresh="${2:-its verified archive with the exact source installer}" into
+ into=$(restore_fresh_route)
+ RECOVERY_HINT="restore of $fresh $into; keep operation $OPERATION retained with this site directory as it is"
+ fail "$1; keep operation $OPERATION retained with this site directory as it is, and restore $fresh $into"
 }
 helm_application_validate() {
  local attempt directory current uid revision name kind object latest
@@ -3852,7 +4426,11 @@ helm_apply() {
  local result=0; wait "$HELM_PID" || result=$?; HELM_PID=''
  if (( result != 0 )); then
    tail -n 25 "$STATE_DIR/helm.log" >&2
-   if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null; then RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after fixing the cause"; fi
+   # The operation stays in phase applying, where resume refuses (the target
+   # Helm revision has not completed) and repair re-applies the saved target:
+   # for an install or upgrade as for a restore. A startup continuation is not
+   # what a plain repair re-applies; it keeps its own recovery.
+   if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null || { [[ ${STARTUP_HELM_CONTINUATION:-false} != true ]] && jq -e '.kind=="install" or .kind=="upgrade"' "$STATE_DIR/operation.json" >/dev/null; }; then RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive after fixing the cause"; fi
    fail 'Helm provisioning failed; persistent state was retained'
  fi
  helm_application_validate
@@ -3861,14 +4439,15 @@ helm_apply() {
 initializer_failure() {
  # A failed corpus-copy/corpus-initialize leaves one allowlisted
  # code as its termination message. A running retry is still in progress.
- # One tab-separated line: KIND:CODE, then the name and the uid of the Pod
- # whose verdict it is -- whatever acts on the verdict acts on THAT Pod, never
- # on the first Pod the labels list (a foreign controller's Pod can carry them).
- jq -r '[.items[]|select(.metadata.deletionTimestamp==null)|. as $pod|.status.initContainerStatuses[]?|
+ # One tab-separated line per verdict, in the order the Pods are listed:
+ # KIND:CODE, then the name and the uid of the Pod whose verdict it is --
+ # whatever acts on a verdict acts on THAT Pod, never on the first Pod the
+ # labels list (a foreign controller's Pod can carry them).
+ jq -r '.items[]|select(.metadata.deletionTimestamp==null)|. as $pod|.status.initContainerStatuses[]?|
    select(.name=="corpus-copy" or .name=="corpus-initialize")|
    (if .state.terminated then (if .state.terminated.exitCode!=0 then .state.terminated.message else null end)
     elif .state.waiting then .lastState.terminated.message else null end)//""|
-   capture("^gsj-(?<kind>corpus|copy):(?<code>[a-z0-9]+(-[a-z0-9]+)*)\\s*$")|[.kind+":"+.code,$pod.metadata.name,$pod.metadata.uid]][0]//empty|@tsv' "$1"
+   capture("^gsj-(?<kind>corpus|copy):(?<code>[a-z0-9]+(-[a-z0-9]+)*)\\s*$")|[.kind+":"+.code,$pod.metadata.name,$pod.metadata.uid]|@tsv' "$1"
 }
 initializer_pod_owned() {
  # The Pod named in $2 with the uid in $3, as listed in the Pod list $1, is
@@ -3879,7 +4458,25 @@ initializer_pod_owned() {
  local pods=$1 name=$2 uid=$3 deploy_uid=$4 rs='' rs_uid=''
  IFS=$'\t' read -r rs rs_uid < <(jq -r --arg name "$name" --arg uid "$uid" '[.items[]|select(.metadata.name==$name and .metadata.uid==$uid)|.metadata.ownerReferences[]?|select(.controller==true and .kind=="ReplicaSet")|[.name,.uid]][0]//empty|@tsv' "$pods") || true
  [[ -n $rs && -n $rs_uid ]] || return 1
- k get replicasets "$rs" -o json 2>/dev/null | jq -e --arg rs_uid "$rs_uid" --arg name "$RELEASE-web" --arg uid "$deploy_uid" '.metadata.uid==$rs_uid and any(.metadata.ownerReferences[]?; .controller==true and .kind=="Deployment" and .name==$name and .uid==$uid)' >/dev/null
+ # A kubeconfig that may not read ReplicaSets proves no chain, and the
+ # release's own Pod looked foreign on every poll: no progress, no log, and
+ # its terminal verdict unjudged until the deadline ran out. Only a read
+ # refused as forbidden is that gap (a missing ReplicaSet proves nothing):
+ # it is said once, and a Pod a ReplicaSet controls is judged as the release
+ # before the chain judged every Pod, by the release's labels and not being
+ # deleted. kubectl's words are classified, never repeated.
+ # replicasets_readable is wait_application's local: once per wait, and no
+ # exported value decides it.
+ if ${replicasets_readable:-true}; then
+   if k get replicasets "$rs" -o json > "$GSJ_WORK/initializer-replicaset.json" 2> "$GSJ_WORK/initializer-replicaset.err"; then
+     jq -e --arg rs_uid "$rs_uid" --arg name "$RELEASE-web" --arg uid "$deploy_uid" '.metadata.uid==$rs_uid and any(.metadata.ownerReferences[]?; .controller==true and .kind=="Deployment" and .name==$name and .uid==$uid)' "$GSJ_WORK/initializer-replicaset.json" >/dev/null
+     return
+   fi
+   [[ $(tr '[:upper:]' '[:lower:]' < "$GSJ_WORK/initializer-replicaset.err") == *forbidden* ]] || return 1
+   replicasets_readable=false
+   log "This kubeconfig may not get replicasets.apps in namespace $NAMESPACE, so an application Pod's owner chain to Deployment $RELEASE-web cannot be proven; the wait judges a Pod that a ReplicaSet controls, carries release $RELEASE's labels and is not being deleted. Grant get on replicasets.apps to restore the proof"
+ fi
+ jq -e --arg name "$name" --arg uid "$uid" --arg release "$RELEASE" 'any(.items[]; .metadata.name==$name and .metadata.uid==$uid and .metadata.deletionTimestamp==null and .metadata.labels["app.kubernetes.io/instance"]==$release and .metadata.labels["app.kubernetes.io/component"]=="gsj")' "$pods" >/dev/null
 }
 initializer_stop() {
  # Terminal codes never clear by waiting; the others retry inside the Pod.
@@ -3934,19 +4531,38 @@ initializer_stop() {
  esac
 }
 wait_application() {
- local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod state code verdict_pod verdict_uid
+ local end=$((SECONDS+$(j .deadlines.initialization_seconds)+1800)) pod pod_uid state deploy_uid verdicts code verdict_pod verdict_uid line_code line_pod line_uid replicasets_readable=true
  while (( SECONDS < end )); do
    assert_owner
    helm_application_validate
    state=$(k get deploy "$RELEASE-web" -o json)
    if jq -e '.status.observedGeneration >= .metadata.generation and .status.updatedReplicas==1 and .status.availableReplicas==1 and .status.readyReplicas==1' <<< "$state" >/dev/null; then return; fi
+   deploy_uid=$(jq -r '.metadata.uid//""' <<< "$state")
    k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gsj" -o json > "$GSJ_WORK/application-pods.json"
-   pod=$(jq -r '.items[0].metadata.name // empty' "$GSJ_WORK/application-pods.json")
-   if [[ -n $pod ]]; then
-     jq -c '.items[0]|{pod:.metadata.name,phase:.status.phase,init:[.status.initContainerStatuses[]?|{name,state}],containers:[.status.containerStatuses[]?|{name,ready,state}]}' "$GSJ_WORK/application-pods.json"
+   # The progress line and the initializer's log come from this release's own
+   # Pods, each named: the two labels also list a foreign controller's Pod,
+   # and the first Pod listed need not be the release's.
+   while IFS=$'\t' read -r pod pod_uid; do
+     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$pod" "$pod_uid" "$deploy_uid" || continue
+     jq -c --arg uid "$pod_uid" '.items[]|select(.metadata.uid==$uid)|{pod:.metadata.name,phase:.status.phase,init:[.status.initContainerStatuses[]?|{name,state}],containers:[.status.containerStatuses[]?|{name,ready,state}]}' "$GSJ_WORK/application-pods.json"
      k logs "$pod" -c corpus-initialize --tail=3 2>/dev/null || true
-   fi
-   IFS=$'\t' read -r code verdict_pod verdict_uid <<< "$(initializer_failure "$GSJ_WORK/application-pods.json")"
+   done < <(jq -r '.items[]|select(.metadata.deletionTimestamp==null)|[.metadata.name,.metadata.uid]|@tsv' "$GSJ_WORK/application-pods.json")
+   verdicts=$(initializer_failure "$GSJ_WORK/application-pods.json") || verdicts=''
+   # A verdict is judged only from this release's own Pod, by name, uid and
+   # owner chain: a foreign controller's Pod can carry the two labels and a
+   # crafted verdict. The restart and the stop below act on ONE verdict,
+   # chosen here: the first from a Pod the release owns. The restart read the
+   # first line alone, so a foreign verdict listed first ended the operation
+   # through its refusal, or hid the release's own verdict from it. A Pod not
+   # owned by this release that reports one is named once per poll, and the
+   # wait goes on.
+   code=''; verdict_pod=''; verdict_uid=''
+   while IFS=$'\t' read -r line_code line_pod line_uid; do
+     [[ -n $line_code ]] || continue
+     if ! initializer_pod_owned "$GSJ_WORK/application-pods.json" "$line_pod" "$line_uid" "$deploy_uid"; then
+       log "Pod $line_pod reported an initializer verdict but is not owned by release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); the verdict is not judged and the wait goes on"
+     elif [[ -z $code ]]; then code=$line_code; verdict_pod=$line_pod; verdict_uid=$line_uid; fi
+   done <<< "$verdicts"
    if [[ $code == corpus:source-verification-failed && ${VECTORS_STAGED_IN_THIS_RUN:-} == true && ${STAGED_RESTART:-} != done ]]; then
      # The initializer started at helm_apply and may have judged the released
      # vectors BEFORE stage_vectors put them in place [review, the major]:
@@ -3956,15 +4572,11 @@ wait_application() {
      # came. ONE fresh attempt on the staged bytes decides: the Pod is
      # recreated now (the Deployment brings it back; the checkpoint is on the
      # volume); a second such verdict is on the staged bytes and terminal.
-     # The Pod recreated is exactly the one whose verdict was read -- by name
-     # AND uid, as the API's precondition, so a replacement under the same
-     # name is never touched -- and only when its owner chain leads to this
-     # release's own Deployment: the two labels alone also list a foreign
-     # controller's Pod, and the first Pod listed is not the verdict's. A
-     # deletion the API refuses or that fails is an error, never a restart
-     # that is counted: the next verdict would be read as the terminal second.
-     initializer_pod_owned "$GSJ_WORK/application-pods.json" "$verdict_pod" "$verdict_uid" "$(jq -r '.metadata.uid//""' <<< "$state")" \
-       || fail "Pod $verdict_pod reported the initializer's verdict but is not the application Pod of release $RELEASE (its owner chain does not lead to Deployment $RELEASE-web); it is not recreated and the verdict is not judged"
+     # The Pod recreated is exactly the release's own Pod whose verdict was
+     # chosen above -- by name AND uid, as the API's precondition, so a
+     # replacement under the same name is never touched. A deletion the API
+     # refuses or that fails is an error, never a restart that is counted:
+     # the next verdict would be read as the terminal second.
      log "corpus-initialize refused the released vectors with a verdict that may predate their staging in this run; restarting it once on the staged blocks"
      jq -n --arg uid "$verdict_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$GSJ_WORK/initializer-delete.json"
      if ! k delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$verdict_pod" -f "$GSJ_WORK/initializer-delete.json" >/dev/null 2>&1; then
@@ -3981,7 +4593,7 @@ wait_application() {
 }
 public_verify() {
  local url host port ca connect asset
- url=$(j .public_url); url=${url%/}; host=$(printf '%s' "$url" | sed -E 's#https://([^/:]+).*#\1#'); port=$(printf '%s' "$url" | sed -nE 's#https://[^/:]+:([0-9]+).*#\1#p'); port=${port:-443}
+ url=$(j .public_url); url=${url%/}; host=$(printf '%s' "$url" | sed -nE 's#^https://([^/:@?\#]+)(:[0-9]+)?([/?\#].*)?$#\1#p'); port=$(printf '%s' "$url" | sed -nE 's#^https://[^/:@?\#]+:([0-9]+)([/?\#].*)?$#\1#p'); port=${port:-443}
  local args=(--silent --show-error --max-time 30) end code
  ca=$(j .verification.ca_file); [[ -z $ca ]] || args+=(--cacert "$(resolve_file "$ca")")
  connect=$(j .verification.connect_host); [[ -z $connect ]] || args+=(--connect-to "$host:$port:$connect:$(j .verification.connect_port)")
@@ -4120,7 +4732,7 @@ except OSError as e: print(getattr(e,"verify_message",None) or getattr(e,"reason
    resume="resume --operation $OPERATION with the operation's exact target installer"; fresh='install afresh into an empty namespace'
    if [[ ${RESTORE_PROGRAM_ACTIVE:-false} == true ]]; then
      resume="resume --operation $OPERATION with this installer"
-     fresh="restore its verified archive with the exact source installer in another Kubernetes context whose namespace $NAMESPACE is empty"
+     fresh="restore its verified archive with the exact source installer $(restore_fresh_route)"
    fi
    next="If the failure was transient, $resume once the route is reachable"
    RECOVERY_HINT="$resume once the route is reachable, if the failure was transient; otherwise keep operation $OPERATION retained and $fresh"
@@ -4172,11 +4784,43 @@ verification_bot_step() {
 }
 verify_application() {
  assert_owner
- local pod run generation remote staged settings rc existing old_binding mode control nsuid active="$STATE_DIR/verification-active.json"
+ local pod run generation remote staged settings rc existing old_binding mode control nsuid prior recorded retire=false active="$STATE_DIR/verification-active.json"
  pod=$(k get pods -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/component=gsj" -o json | jq -er '[.items[]|select(.status.phase=="Running")]|if length==1 then .[0].metadata.name else error("one application pod required") end')
  generation=$(k get cm "$RELEASE-provisioned" -o json | jq -er .data.generation)
  jq '.status="verifying"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
  public_verify; network_verify
+ # Another operation's run is resumed under its old binding only where its
+ # ledger can still be. A restore rebuilt every claim from its archive, so a
+ # finished run (complete or cleaned: its owned resources are already clean)
+ # has nothing left to resume; a namespace replaced since that operation (on
+ # one cluster: deleted, recreated, then installed or restored afresh from the
+ # same site directory) took the run's ledger with its claims. Resumed, both
+ # stopped with 'verification ownership ledger is missing after launch' after
+ # everything was rebuilt. Such a record is retired beside its run's evidence
+ # and this operation starts its own run; any other keeps its reconciliation.
+ # That operation ended: this one was admitted after it.
+ if [[ -f $active && ! -L $active ]] && jq -e --arg op "$OPERATION" '.operation!=$op and (.operation|test("^[a-f0-9]{24}$")) and (.run_id|test("^[a-f0-9]{12}$")) and (.status|IN("active","complete","cleaned"))' "$active" >/dev/null 2>&1; then
+   run=$(jq -r .run_id "$active"); prior=$(jq -r .operation "$active")
+   recorded=$(jq -r '.namespace_uid//""' "$STATE_DIR/operation-intents/$prior/intent.json" 2>/dev/null) || recorded=''
+   if [[ -n $recorded ]]; then
+     nsuid=$(k get namespace "$NAMESPACE" -o json | jq -er '.metadata.uid|select(type=="string" and length>0)') || fail 'operation namespace identity is unavailable'
+     # A restore into the replaced namespace brings back the archive's
+     # claims, and the run's ledger with them: retired on the namespace alone,
+     # an active run lost the cleanup that removes its test accounts under its
+     # old binding. So the namespace retires the run only once its ledger is
+     # found absent; a ledger that is there keeps the reconciliation below.
+     if [[ $recorded != "$nsuid" ]]; then
+       existing=$(k exec "$pod" -c gsj-web -- python -c 'import json,pathlib,sys; print(json.dumps((pathlib.Path(sys.argv[1])/"ledger.json").is_file()))' "/data/verification/$run") || fail 'cannot inspect the persistent verification ledger'
+       [[ $existing != false ]] || retire=true
+     fi
+   fi
+   if jq -e '.kind=="restore"' "$STATE_DIR/operation.json" >/dev/null && jq -e '.status|IN("complete","cleaned")' "$active" >/dev/null; then retire=true; fi
+   if $retire; then
+     # its settings.json carries the operator password; public-settings.json stays as its evidence
+     mkdir -p "$STATE_DIR/verification/$run"; mv "$active" "$STATE_DIR/verification/$run/retired-verification-active.json"; rm -f "$STATE_DIR/verification/$run/settings.json"
+     log "Retired verification run $run of ended operation $prior to $STATE_DIR/verification/$run/retired-verification-active.json: its ledger went with the claims this operation replaced; this operation starts its own run"
+   fi
+ fi
  while true; do
    old_binding=false
    if [[ -f $active ]] && jq -e '.status|IN("active","complete","cleaned")' "$active" >/dev/null; then
@@ -4260,6 +4904,37 @@ record_ready() {
 
 record_installed() {
  assert_owner
+ # A corpus change this operation admitted (compatibility recorded it under
+ # the Lease) is complete once this record is written, and the consent that
+ # admitted it is spent: left true, the next release's corpus would be adopted
+ # without anyone being asked. The merged site is changed first, so the
+ # installed record carries false, and the ready-state record is published
+ # again from it: record_ready wrote that from the site while it said true,
+ # and two records of the same release and controllers whose sites differ
+ # make read_backup_source refuse every later backup round and replacement
+ # repair as ambiguous. The operator's file and the operation's saved site
+ # only after the operation is complete, because until then a resume
+ # compares them with the site its Helm target was compiled from. A
+ # file that is a link is never rewritten through it, and then nothing is:
+ # records that say false beside a file that says true would refuse every
+ # later backup as a settings change. The marker goes into the operation
+ # before any of it: a stop after the operation is complete and before both
+ # rewrites are done left a Lease whose resume said "already complete" beside
+ # a file that still said true, or refused the file it had rewritten as a
+ # changed configuration; with the marker the resume finishes them
+ # (corpus_reset_finish). The merged site is rewritten before the marker: it
+ # is this run's own copy, so jq failing on it is not an operator's edit, and
+ # the stop leaves the operation incomplete with nothing changed.
+ local corpus_reset=''
+ if jq -e --slurpfile release "$GSJ_PAYLOAD/release.json" '(.kind//"")!="restore" and (.corpus_update_from//"")!="" and .corpus_update_from!=$release[0].corpus.fingerprint' "$STATE_DIR/operation.json" >/dev/null && [[ $(j .corpus.allow_update) == true ]]; then
+   if [[ -f $CONFIG && ! -L $CONFIG ]]; then
+     corpus_reset=rewrite
+     allow_update_false "$SITE"
+     jq '.corpus_update_reset="pending"' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
+     atomic "$SITE" < "$GSJ_WORK/corpus-reset.json"
+     record_ready
+   else corpus_reset=kept; fi
+ fi
  storage_identity > "$GSJ_WORK/storage.json"
  jq -n --slurpfile manifest "$GSJ_PAYLOAD/release.json" --slurpfile site "$SITE" --slurpfile storage "$GSJ_WORK/storage.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg operation "$OPERATION" --arg nsuid "$(k get namespace "$NAMESPACE" -o json | jq -r .metadata.uid)" '{format:"gsj.installed/1",manifest:$manifest[0],site:$site[0],storage:$storage[0],namespace_uid:$nsuid,operation:$operation,verification:{application:$verification[0],public:$public[0],network:$network[0]},status:"complete"}' | atomic "$GSJ_WORK/installed.json"
  k create configmap "$RELEASE-installed" --from-file="installed.json=$GSJ_WORK/installed.json" --dry-run=client -o json | jq --arg owner "$RELEASE" '.metadata.labels={"gsj.io/owner":$owner}' | k apply -f - >/dev/null
@@ -4269,7 +4944,51 @@ record_installed() {
  if [[ $(jq -r '.kind//""' "$STATE_DIR/operation.json") == restore && -f $STATE_DIR/restoration.json ]]; then
    jq '.status="complete"' "$STATE_DIR/restoration.json" | atomic "$STATE_DIR/restoration.json"
  fi
+ if [[ $corpus_reset == rewrite ]]; then corpus_reset_finish
+ elif [[ $corpus_reset == kept ]]; then
+   log "The corpus change this operation admitted is complete (fingerprint $(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")), but $CONFIG is a symbolic link or no longer a regular file, so corpus.allow_update stays true there and in the installed record: set it to false in the file the link names, or a later release's corpus change is admitted without being asked for"
+ fi
  installation_summary
+}
+allow_update_false() {
+ # $1, a site file, with corpus.allow_update false, into
+ # $GSJ_WORK/corpus-reset.json for the caller to publish with atomic. Piped
+ # straight into atomic, a file jq could not read (the operator edited it into
+ # a syntax error during a day-long upgrade) was replaced by jq's EMPTY output.
+ # Only a JSON object is rewritten (-e fails an empty file); jq's own words go
+ # to $STATE_DIR/corpus-reset.err, never to the log: they can quote the file.
+ jq -e 'select(type=="object")|.corpus.allow_update=false' "$1" > "$GSJ_WORK/corpus-reset.json" 2> "$STATE_DIR/corpus-reset.err"
+}
+corpus_reset_finish() {
+ # The rest of spending corpus.allow_update, once the operation is complete:
+ # the operator's file and the operation's saved site, then the marker
+ # record_installed wrote before any of it. record_installed runs this, and so
+ # does a resume of that complete operation while the marker is there; every
+ # write is idempotent, so a stop anywhere here is finished the same way.
+ assert_owner
+ local change file files=("$CONFIG" "$STATE_DIR/site.pending.json"); change="$(jq -r '.corpus_update_from[:12]' "$STATE_DIR/operation.json") to $(jq -r '.corpus.fingerprint[:12]' "$GSJ_PAYLOAD/release.json")"
+ # The file first: a stop between the two writes leaves the file and the
+ # installed record agreeing, which is what the next backup compares. A file
+ # that became a link after the records said false is not rewritten: those
+ # cannot be taken back, so the file the link names is the operator's to
+ # correct.
+ [[ -f $CONFIG && ! -L $CONFIG ]] || files=("$STATE_DIR/site.pending.json")
+ for file in "${files[@]}"; do
+   # A file jq cannot read keeps its bytes, and the marker stays to record
+   # that the reset is unfinished: the operation is complete either way, and
+   # the file is the operator's to correct.
+   if ! allow_update_false "$file"; then
+     log "The corpus change this operation admitted is complete (fingerprint $change), but corpus.allow_update is still true in $file: it does not read as a JSON object and was left as it is (jq's own words are kept in $STATE_DIR/corpus-reset.err). Correct it and set corpus.allow_update to false there; while $CONFIG says true, a later release's corpus change is admitted without being asked for"
+     return
+   fi
+   atomic "$file" < "$GSJ_WORK/corpus-reset.json"
+ done
+ if (( ${#files[@]} == 2 )); then
+   log "The corpus change this operation admitted is complete (fingerprint $change); corpus.allow_update is set back to false in $CONFIG, the operation's saved site and the installed record, so a later release's corpus change is refused until it is admitted again after its own pre-migration backup"
+ else
+   log "The corpus change this operation admitted is complete (fingerprint $change) and corpus.allow_update is false in the operation's saved site and the installed record, but $CONFIG is now a symbolic link or no longer a regular file and was not rewritten: set it to false in the file the link names, or every later backup is refused as a settings change"
+ fi
+ jq 'del(.corpus_update_reset)' "$STATE_DIR/operation.json" | atomic "$STATE_DIR/operation.json"
 }
 installation_summary() {
  # The install summary: URL, operator login, redacted settings, identities,
@@ -4280,8 +4999,7 @@ installation_summary() {
  # backup.offbox_url, tls.acme_server; llm.allowed_origins are origins by
  # schema) -- goes through url_origin_only, the one function: the origin,
  # never a path, query or userinfo (a path segment is schema-valid and can
- # carry a credential). The full values stay in site.json beside it
- # [review B2].
+ # carry a credential). The full values stay in site.json beside it.
  jq -n --slurpfile site "$SITE" --slurpfile release "$GSJ_PAYLOAD/release.json" --slurpfile verification "$STATE_DIR/verification.json" --slurpfile public "$STATE_DIR/public-check.json" --slurpfile network "$STATE_DIR/network-check.json" --arg chart "$(sha_file "$GSJ_PAYLOAD/chart.tgz")" --arg operation "$OPERATION" --arg record "$STATE_DIR/installed.json" --arg report "$STATE_DIR/verification.json" \
    --arg public_url "$(url_origin_only "$(j '.public_url // ""')")" --arg llm_url "$(url_origin_only "$(j '.llm.base_url // ""')")" --arg ocr_url "$(url_origin_only "$(j '.ocr.url // ""')")" --arg vectors_url "$(url_origin_only "$(j '.corpus.vectors_url // ""')")" --arg offbox_url "$(url_origin_only "$(j '.backup.offbox_url // ""')")" --arg acme_server "$(url_origin_only "$(j '.tls.acme_server // ""')")" '
    $site[0] as $s | $release[0] as $r | $verification[0] as $v |
@@ -4360,6 +5078,15 @@ acquire_target() {
    [[ -z ${CONTINUE_FROM_PROGRAM:-} ]] || next+=(--continue-from-program "$CONTINUE_FROM_PROGRAM")
  fi
  if $INTERACTIVE; then next+=(--interactive); else next+=(--non-interactive); fi
+ # The child runs the preflight this run skipped, and with it the refusal
+ # of a fetched kubectl skewed from the server. Without the set it fetched
+ # nothing and took this run's fetched clients, first on the PATH it
+ # inherits, for this box's own: that skew was only warned about. The same
+ # pins come from the cache by checksum, so nothing downloads twice. All
+ # three go as the bare flag, the one form a release older than
+ # --fetch-tools=TOOL parses.
+ if [[ ${FETCH_SET:-} == 'jq kubectl helm' ]]; then next+=(--fetch-tools)
+ elif [[ -n ${FETCH_SET:-} ]]; then next+=("--fetch-tools=${FETCH_SET// /,}"); fi
  log "Verified target $version; executing that release's installer"
  bash "$target" "${next[@]}"
 }
@@ -4446,7 +5173,12 @@ resume_operation() {
    # launching Helm. The immutable target and a fresh Job must match first.
    helm_application_validate; stage_vectors; wait_application;;
  backup-verified) secret_inputs; relocated_images_probe; managed_dependencies; helm_apply; stage_vectors; wait_application;;
- complete) log 'Operation is already complete'; return;;
+ complete)
+   # record_installed was stopped after completing the operation and before
+   # both site rewrites were done (retained_site_matches admitted exactly that
+   # difference above): finish them.
+   if jq -e '.corpus_update_reset=="pending"' "$STATE_DIR/operation.json" >/dev/null; then corpus_reset_finish; fi
+   log 'Operation is already complete'; return;;
  *) fail "operation stopped in $phase; inspect saved state before explicit repair";;
  esac
  record_ready; verify_application; record_installed
@@ -4552,8 +5284,9 @@ finish_repair_transition() {
  # (--interactive is a different route: the wizard writes a complete file.)
  # The trade, stated: the file now follows a LATER release's defaults, exactly
  # as a site that never ran a repair does -- including where that refuses. An
- # upgrade compares .site.storage whole, so a release that changes a storage
- # default refuses both; the complete write had made a repaired site immune.
+ # upgrade compares .site.storage whole except transfer_path and
+ # minimum_free_bytes, so a release that changes another storage default
+ # refuses both; the complete write had made a repaired site immune.
  config_after="$GSJ_WORK/repair-config-complete.json"
  jq '.site_after' "$intent" > "$config_after"
  if jq --slurpfile intent "$intent" '.corpus.repair_generation=$intent[0].site_after.corpus.repair_generation' "$CONFIG" > "$GSJ_WORK/repair-config-narrow.json" 2>/dev/null &&
@@ -4738,7 +5471,61 @@ restore_files() {
  restore_resource "$GSJ_WORK/restore-pod.json"
  TRANSFER_HANDBACK_POD=$pod
  k wait --for=condition=Ready "pod/$pod" --timeout=300s
+ # Private before the decrypted archive arrives, as in maintenance_pod.
+ if [[ -n $(j '.storage.transfer_path // ""') ]]; then
+   k exec "$pod" -- chmod 700 /transfer >/dev/null 2>"$STATE_DIR/transfer-private.err" ||
+     log "The transfer directory $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node) could not be made private (mode 0700), so other accounts on that node may read the decrypted archive this restore stages there; kubectl's own words are kept in $STATE_DIR/transfer-private.err"
+ fi
  restore_no_writers "$pod"; restore_bindings; assert_owner
+ # The stream below writes the whole decrypted archive into /transfer before
+ # anything verifies it, and nothing asked whether it fits: a full node disk
+ # would end it partway, after all the time the transfer took. Measure the
+ # directory inside the Pod first. The decrypted archive is never larger than
+ # the encrypted one (a header and a padding block less); what must stay free
+ # after it is the largest of these floors, and the refusal names the one that
+ # decided:
+ # - 256 MiB, and a tenth of the archive, for whatever else lands on that
+ #   filesystem meanwhile;
+ # - 15 % of the filesystem, for the emptyDir alone (storage.transfer_path
+ #   empty): it lives on the node's root filesystem, where the kubelet's
+ #   default hard eviction thresholds evict Pods below 10 % free
+ #   (nodefs.available) and below 15 % (imagefs.available), which on a node
+ #   whose images share that one disk applies to the same filesystem; an
+ #   archive that fit with 256 MiB, or a tenth, to spare could push the node
+ #   under that line and get the restore Pod evicted after the whole
+ #   transfer. A transfer_path hostPath is a directory the operator chose, a
+ #   dedicated data disk among others, which those thresholds do not watch: a
+ #   tenth of it kept free (over 200 GiB of a 2 TiB disk) refused restores
+ #   that fit;
+ # - storage.minimum_free_bytes when /transfer shares its filesystem (f_fsid)
+ #   with an application volume: the stream spends the room the application
+ #   needs there, and the backup's capacity check charges that floor the same.
+ # A refusal here has streamed nothing: the operation is retained, and
+ # restore-repair continues it once there is room.
+ local size margin floor need free total shared measured where verb="restore-repair --operation $OPERATION with the exact saved target"
+ [[ ${RESTORE_PROGRAM_ACTIVE:-false} != true ]] || verb="restore-repair --operation $OPERATION with this corrected installer"
+ size=$(wc -c < "$ARCHIVE" | tr -d ' ')
+ if [[ -n $(j '.storage.transfer_path // ""') ]]; then where="$(j .storage.transfer_path)/$OPERATION on node $(j .storage.node)"
+ else where="the restore Pod's emptyDir on node $(j .storage.node)'s own filesystem (storage.transfer_path is empty)"; fi
+ measured=$(k exec "$pod" -- python -c 'import os; t=os.statvfs("/transfer"); print(t.f_bavail*t.f_frsize, t.f_blocks*t.f_frsize, int(any(os.statvfs(v).f_fsid==t.f_fsid for v in ("/volumes/gsj","/volumes/forgejo","/volumes/chroma"))))' 2>"$STATE_DIR/restore-transfer-space.err") || measured=''
+ read -r free total shared <<< "$measured"
+ if [[ ! $free =~ ^[0-9]+$ || ! $total =~ ^[0-9]+$ || ! $shared =~ ^[01]$ ]]; then
+   RECOVERY_HINT="$verb once the restore Pod answers"
+   fail "restore staging space is unmeasured: the free space of $where could not be read inside the restore Pod, so whether the decrypted archive ($size bytes and its margin) fits is unknown; nothing was streamed. kubectl's own words are kept in $STATE_DIR/restore-transfer-space.err; continue with the command the closing line names"
+ fi
+ margin=268435456; floor='256 MiB, the least margin'
+ (( size / 10 <= margin )) || { margin=$(( size / 10 )); floor='a tenth of the archive'; }
+ if [[ -z $(j '.storage.transfer_path // ""') ]] && (( total * 15 / 100 > margin )); then
+   margin=$(( total * 15 / 100 )); floor="15 % of the filesystem's $total bytes, which keeps the node clear of the kubelet's default eviction thresholds (imagefs.available<15 % where the images share this filesystem, nodefs.available<10 %)"
+ fi
+ if (( shared )) && (( $(j .storage.minimum_free_bytes) > margin )); then
+   margin=$(j .storage.minimum_free_bytes); floor='storage.minimum_free_bytes, the site'"'"'s floor for the filesystem the application volumes share with it'
+ fi
+ need=$(( size + margin ))
+ if (( free < need )); then
+   RECOVERY_HINT="$verb once $where has $need bytes free"
+   fail "restore staging space is insufficient: $where has $free bytes free and the decrypted archive needs $need (the encrypted archive's $size bytes plus a margin of $margin: $floor); nothing was streamed. Make room there, then continue with the command the closing line names; this operation stays retained for it"
+ fi
  log 'Transferring and verifying the immutable restore archive; existing partial data remains owned by this operation'
  local remote="/transfer/snapshot-$(jq -r .archive_sha256 "$STATE_DIR/restoration.json").tar.gz"
  # The receiver verifies the complete archive before publishing it. Broken
@@ -4804,7 +5591,7 @@ restore_validate_result() {
  ' "$result" >/dev/null || fail 'restore file completion does not match the exact archive and target binding'
 }
 restore_finish_pod() {
- local pod uid object saved="$STATE_DIR/restore-$OPERATION"
+ local pod uid object remote saved="$STATE_DIR/restore-$OPERATION"
  pod=$(jq -er .pod "$STATE_DIR/restoration.json")
  [[ $(k get namespace "$NAMESPACE" -o json | jq -er .metadata.uid) == $(jq -er .target_namespace_uid "$STATE_DIR/restoration.json") ]] || fail 'restore target namespace identity changed'
  restore_validate_result "$saved/files-result.json"
@@ -4814,6 +5601,13 @@ restore_finish_pod() {
  if [[ -z $object ]]; then return; fi
  [[ $(jq -r .metadata.uid <<< "$object") == "$uid" ]] || fail 'restore Pod identity changed before cleanup'
  jq -n --arg uid "$uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' > "$GSJ_WORK/restore-pod-delete.json"
+ # The restored files are proven (above): the decrypted archive they came from
+ # is plaintext of every volume, and a hostPath kept it for good. As in
+ # backup_complete, a refused removal is logged, never a failure.
+ remote="/transfer/snapshot-$(jq -r .archive_sha256 "$STATE_DIR/restoration.json").tar.gz"
+ if ! k exec "$pod" -- rm -f "$remote" >/dev/null 2>"$STATE_DIR/transfer-remove.err" && [[ -n $(j '.storage.transfer_path // ""') ]]; then
+   log "The decrypted restore archive $(basename "$remote") could not be removed from $(j .storage.transfer_path)/${OPERATION:-} on node $(j .storage.node); the restored files are verified, so remove it there by hand. kubectl's own words are kept in $STATE_DIR/transfer-remove.err"
+ fi
  transfer_handback "$pod"
  k delete --raw "/api/v1/namespaces/$NAMESPACE/pods/$pod" -f "$GSJ_WORK/restore-pod-delete.json" >/dev/null
  k wait --for=delete "pod/$pod" --timeout=300s >/dev/null
@@ -5215,6 +6009,31 @@ restore_archive() {
      ARCHIVE=$(jq -r .archive "$STATE_DIR/restoration.json")
    fi
  else
+   # One cluster restores into its recreated namespace from the site directory
+   # of the deployment it replaces, where that deployment's restore left its
+   # completed checkpoint, which refused this restore. Once that operation has
+   # ended, the checkpoint is retired beside its evidence: the canonical record
+   # names it complete, abandoned or swept (abandon and sweep mark it after
+   # writing their own records), or names a later operation, which acquire
+   # admits only after this one ended. Any other checkpoint keeps the refusal.
+   local prior ended=''
+   prior=$(jq -r 'select(.status=="complete")|.operation|select(type=="string" and test("^[a-f0-9]{24}$"))' "$STATE_DIR/restoration.json" 2>/dev/null) || prior=''
+   if [[ -n $prior && -f $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json && -f $STATE_DIR/operation.json && ! -L $STATE_DIR/operation.json && ! -L $STATE_DIR/restore-$prior ]] &&
+     jq -e --arg op "$prior" '.operation!=$op or (.status|IN("complete","abandoned","swept"))' "$STATE_DIR/operation.json" >/dev/null 2>&1; then
+     mkdir -p "$STATE_DIR/restore-$prior"; mv "$STATE_DIR/restoration.json" "$STATE_DIR/restore-$prior/retired-restoration.json"
+     log "Retired the completed restore checkpoint of ended operation $prior to $STATE_DIR/restore-$prior/retired-restoration.json; this restore records its own"
+   fi
+   # An unfinished checkpoint stays: it is its operation's own evidence. The
+   # refusal below names restore-repair and resume, which continue it; once the
+   # canonical record names that operation abandoned or swept, both refuse it,
+   # so the refusal names the one route left, a fresh restore from a new site
+   # directory. restore_fresh_route is asked about that operation, which this
+   # run does not hold: it finds it ended, so the route names no abandon.
+   if [[ -f $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json && -f $STATE_DIR/operation.json && ! -L $STATE_DIR/operation.json ]]; then
+     prior=$(jq -r 'select(.status!="complete")|.operation' "$STATE_DIR/restoration.json" 2>/dev/null) || prior=''
+     [[ ! $prior =~ ^[a-f0-9]{24}$ ]] || ended=$(jq -r --arg op "$prior" 'select(.operation==$op)|.status' "$STATE_DIR/operation.json" 2>/dev/null) || ended=''
+   fi
+   [[ ! $ended =~ ^(abandoned|swept)$ ]] || fail "restore checkpoint already exists for operation $prior, which was $ended before its restore completed, so restore-repair and resume refuse it; keep this site directory as it is, and restore $(OPERATION=$prior restore_fresh_route)"
    [[ ! -e $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json ]] || fail 'restore checkpoint already exists; use restore-repair --operation ID for its recorded resource/file phase or resume for application startup'
  fi
  [[ -n $ARCHIVE ]] || fail 'restore requires --archive BACKUP.tar.gz.enc'
@@ -5474,7 +6293,7 @@ tls_repair() {
  jq --arg now "$(date -u +%FT%T.000000Z)" '.spec.renewTime=$now' <<< "$current" | k replace -f - >/dev/null
  start_renewal
  before=$(sha_file "$directory/ca.crt")
- secret=$(j .tls.secret); host=$(j .public_url | sed -E 's#https://([^/:]+).*#\1#')
+ secret=$(j .tls.secret); host=$(j .public_url | sed -nE 's#^https://([^/:@?\#]+)(:[0-9]+)?([/?\#].*)?$#\1#p')
  k get secret "$secret" -o json > "$GSJ_WORK/tls-secret.json"
  jq -r '.data["tls.crt"]' "$GSJ_WORK/tls-secret.json" | base64 --decode > "$GSJ_WORK/tls-leaf.crt"
  reissue_local_ca "$directory" "$GSJ_WORK/reissued-ca.crt"
@@ -5620,10 +6439,23 @@ init_json_line() {
  # A string value from canonical JSON (build.py writes release.json and the
  # descriptor with sorted keys at two-space indents), read the way
  # verify-release.sh reads the descriptor: no jq, which may be one of the
- # tools init reports missing. $1 file, $2 indent, $3 key. One line, or none.
- sed -n 's/^'"$2"'"'"$3"'": "\([^"]*\)",*$/\1/p' "$1" 2>/dev/null | head -n1
+ # tools init reports missing, and EXACTLY one matching line. A second one (a
+ # nested object with the same key at that indent, a repeated key) leaves the
+ # value empty, so the caller's "names no ..." refusal fires: reading the
+ # first line passed a signed descriptor the verifier refuses, and one with a
+ # second installer length, which the verifier never reads. $1 file, $2
+ # indent, $3 key. The value, or nothing.
+ local found
+ found=$(sed -n 's/^'"$2"'"'"$3"'": "\([^"]*\)",*$/\1/p' "$1" 2>/dev/null; printf .); found=${found%.}
+ [[ $found == *$'\n' && ${found%$'\n'} != *$'\n'* ]] || return 0
+ printf '%s\n' "${found%$'\n'}"
 }
-init_json_number() { sed -n 's/^'"$2"'"'"$3"'": \([0-9][0-9]*\),*$/\1/p' "$1" 2>/dev/null | head -n1; }
+init_json_number() {
+ local found
+ found=$(sed -n 's/^'"$2"'"'"$3"'": \([0-9][0-9]*\),*$/\1/p' "$1" 2>/dev/null; printf .); found=${found%.}
+ [[ $found == *$'\n' && ${found%$'\n'} != *$'\n'* ]] || return 0
+ printf '%s\n' "${found%$'\n'}"
+}
 init_json_string() {
  # A JSON string literal from a bash value: backslash and quote escaped, the
  # control characters JSON forbids made spaces. Every value that reaches here
@@ -5701,14 +6533,37 @@ init_publish() {
  # A checked download, put create-only where the release lives: an existing
  # name of any kind is left alone, and only a file this call created is ever
  # removed. $1 name, $2 the directory. Returns 2 (INIT_WHY set) when a name
- # was already there, 1 when the directory could not be written; the checked
- # copy under $GSJ_WORK still serves this run either way.
- local name=$1 dest="$2/$1"
- if ! ( set -o noclobber; : > "$dest" ) 2>/dev/null; then
-   if [[ -e $dest || -L $dest ]]; then INIT_WHY="$dest appeared during the download and was not replaced"; return 2; fi
-   INIT_WHY="$2 is not writable"; return 1
+ # was already there, 1 when the directory could not be written or takes no
+ # hard link; the checked copy under $GSJ_WORK still serves this run either
+ # way, and on 1 the caller tries the working folder. The destination is
+ # never opened: noclobber refuses only an existing REGULAR file, so a FIFO
+ # planted there (or a link to one) was opened for writing -- the run blocked
+ # on it -- and the write that followed opened the name a second time. The
+ # copy is written once, by the open that creates a fresh random name beside
+ # it (noclobber opens a name that is not there with O_EXCL), and link(1)
+ # links that into place: it is link(2) itself, which fails for an existing
+ # name of any type and never descends into one (ln links INTO an existing
+ # directory, or a link to one, and its -T that stops that is GNU's alone: on
+ # a macOS box every publication failed as "not writable"). The hidden name
+ # is kept in INIT_PUBLISH_TEMP from before the write until after its rm, so
+ # init stopped by a signal in between leaves no copy there: cleanup_exit
+ # removes it.
+ local name=$1 dest="$2/$1" temp
+ temp=$(mktemp -u "$2/.$1.XXXXXXXXXX" 2>/dev/null) || { INIT_WHY="$2 is not writable"; return 1; }
+ INIT_PUBLISH_TEMP=$temp
+ if ! ( set -o noclobber; cat "$INIT_STAGE/$name" > "$temp" ) 2>/dev/null; then
+   [[ -e $temp ]] || { INIT_PUBLISH_TEMP=''; INIT_WHY="$2 is not writable"; return 1; }
+   rm -f "$temp"; INIT_PUBLISH_TEMP=''; INIT_WHY="$dest could not be written"; return 1
  fi
- cat "$INIT_STAGE/$name" > "$dest" 2>/dev/null || { rm -f "$dest"; INIT_WHY="$dest could not be written"; return 1; }
+ if ! link "$temp" "$dest" 2>/dev/null; then
+   rm -f "$temp"; INIT_PUBLISH_TEMP=''
+   if [[ -e $dest || -L $dest ]]; then INIT_WHY="$dest appeared during the download and was not replaced"; return 2; fi
+   # The copy was just written there, so the folder is writable: what failed
+   # is the link itself, which a FAT or exFAT file system and some network
+   # shares refuse (EPERM, ENOTSUP)
+   INIT_WHY="$2 is on a file system without hard links (FAT, exFAT, some network shares), and init puts a checked copy in place only by linking it"; return 1
+ fi
+ rm -f "$temp"; INIT_PUBLISH_TEMP=''
 }
 init_own_dir() {
  # The working folder and its credentials folder, on the add-on staging
@@ -5832,7 +6687,7 @@ init_box() {
  local name here self trust base origin version identity found dir where present=0 downloaded=0 missing='' why='' status detail utility target
  local -a wanted=() saved=()
  INIT_PASS=0; INIT_FAIL=0; INIT_UNKNOWN=0; INIT_ROWS=''; INIT_FIXES=''; INIT_WHY=''; INIT_RC=0
- for utility in df stat id dirname basename tr head tail sed wc readlink; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
+ for utility in df stat id dirname basename tr head tail sed wc readlink link; do command -v "$utility" >/dev/null || fail "bootstrap utility required: $utility"; done
  # This file, through any symlink it was run as: "beside the installer" is
  # beside the file itself.
  self=$0; while [[ -L $self ]]; do target=$(readlink -- "$self") || fail "the link $self could not be read"; [[ $target == /* ]] && self=$target || self="$(dirname -- "$self")/$target"; done
@@ -5956,7 +6811,16 @@ init_box() {
  local tool floor pinned kubectl_version='' kubectl_ok=false
  for tool in helm kubectl jq; do
    case $tool in helm) floor=$GSJ_HELM_FLOOR;; kubectl) floor=$GSJ_KUBECTL_FLOOR;; jq) floor=$GSJ_JQ_FLOOR;; esac
-   if gsj_client_info "$tool" "$GSJ_PLATFORM" >/dev/null 2>&1; then pinned="any other command accepts --fetch-tools (this release pins a $tool for $GSJ_PLATFORM for that run only; read the guide's note on kubectl and your server's version first)"; else pinned="--fetch-tools cannot help here: this release pins no $tool for $GSJ_PLATFORM"; fi
+   # The single-client form fetches this row's client alone and keeps the
+   # other two from this box.
+   if gsj_client_info "$tool" "$GSJ_PLATFORM" >/dev/null 2>&1; then
+     pinned="any other command accepts --fetch-tools=$tool (this release pins a $tool for $GSJ_PLATFORM for that run only"
+     case $tool in
+       helm) pinned+="; --fetch-tools=helm fetches Helm alone and keeps this box's kubectl and jq)";;
+       kubectl) pinned+="; read the guide's note on kubectl and your server's version first)";;
+       *) pinned+=")";;
+     esac
+   else pinned="--fetch-tools cannot help here: this release pins no $tool for $GSJ_PLATFORM"; fi
    where=$(command -v "$tool" 2>/dev/null) || where=''
    if [[ -z $where ]]; then init_row "$tool" FAIL 'none on PATH' "requires $tool >= $floor, found none on PATH" "install $tool >= $floor with your distribution; $pinned"; continue; fi
    found=$(client_version "$tool")
@@ -6123,6 +6987,7 @@ configure_interaction() {
 }
 main() {
  COMMAND=${1:-help}; [[ $# == 0 ]] || shift
+ local fetch_list='' fetch_rest fetch_name
  CONFIG=site.json; CONTEXT_ARG=''; TO=''; EXPECTED_VERSION=''; RESUME_ID=''; ARCHIVE=''; ADDON=''; REVISION=''; GENERATION=''; BACKUP_ROUND=''; SOURCE_INSTALLER=''; CONTINUE_HELM_INSTALLER=''; ABANDON_REASON=''; CONTINUE_FROM_PROGRAM=''; INTERACTIVE=false; NON_INTERACTIVE=false; FETCH_TOOLS=false
  while (( $# )); do
    case "$1" in
@@ -6136,12 +7001,25 @@ main() {
      --continue-from-program) CONTINUE_FROM_PROGRAM=$2; shift 2;;
      --reason) ABANDON_REASON=$2; shift 2;;
      --interactive) INTERACTIVE=true; shift;; --non-interactive) NON_INTERACTIVE=true; shift;;
-     --fetch-tools) FETCH_TOOLS=true; shift;;
+     # Bare: the three pinned clients. =TOOL[,TOOL]: those alone, and this
+     # box's others stay in use and in the preflight. The pinned kubectl is
+     # pinned for the release, not for this server's one-minor window, while
+     # only the four offline-render recovery paths need Helm 4: =helm brings
+     # that one without the other two.
+     --fetch-tools|--fetch-tools=*)
+       FETCH_TOOLS=true; fetch_rest=jq,kubectl,helm; [[ $1 != *=* ]] || fetch_rest=${1#*=}; fetch_list+=",$fetch_rest"; fetch_rest+=,
+       while [[ -n $fetch_rest ]]; do
+         fetch_name=${fetch_rest%%,*}; fetch_rest=${fetch_rest#*,}
+         case $fetch_name in jq|kubectl|helm) ;; *) fail "unknown --fetch-tools client: ${fetch_name:-an empty name}. It fetches helm, kubectl and jq: name the ones this run needs, comma-separated (--fetch-tools=helm), or give --fetch-tools alone for all three";; esac
+       done; shift;;
      *) fail "unknown argument: $1";;
    esac
  done
+ # FETCH_SET: the clients this run downloads, space-separated in bootstrap's
+ # order, '' when none; FETCH_TOOLS is true exactly when it is not empty.
+ FETCH_SET=''; for fetch_name in jq kubectl helm; do [[ ,$fetch_list, != *,$fetch_name,* ]] || FETCH_SET+="${FETCH_SET:+ }$fetch_name"; done
  if [[ $COMMAND == help || $COMMAND == --help ]]; then
-   printf '%s\n' 'gsj-install.sh init [--context NAME]' 'gsj-install.sh inspect [--context NAME]' 'any command but init also accepts --fetch-tools (download this release'"'"'s pinned helm/kubectl/jq instead of using the ones installed here)' 'gsj-install.sh install --interactive [--config site.json]' 'gsj-install.sh install --config site.json --non-interactive' 'gsj-install.sh upgrade --to VERSION --config site.json [--interactive|--non-interactive]' 'gsj-install.sh resume --operation ID --config site.json --non-interactive' 'gsj-install.sh repair --operation ID [--to VERSION] [--backup-round N | --source-installer PATH | --continue-helm-installer PATH [--continue-from-program PATH]] --config site.json --non-interactive' 'gsj-install.sh credential-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh tls-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh lease-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh abandon --operation ID --reason TEXT --config site.json --non-interactive' 'gsj-install.sh sweep --config site.json --reason "why" --non-interactive' 'gsj-install.sh addon-repair --operation ID --addon traefik|certManager --revision N --config site.json --non-interactive' 'gsj-install.sh backup --config site.json [--interactive|--non-interactive]' 'gsj-install.sh backup-repair --operation ID --generation N --config site.json --non-interactive' 'gsj-install.sh restore --archive BACKUP.tar.gz.enc --config site.json --non-interactive' 'gsj-install.sh restore-repair --operation ID [--source-installer PATH] --config site.json --non-interactive'
+   printf '%s\n' 'gsj-install.sh init [--context NAME]' 'gsj-install.sh inspect [--context NAME]' 'any command but init also accepts --fetch-tools (download this release'"'"'s pinned helm/kubectl/jq instead of using the ones installed here) or --fetch-tools=TOOL[,TOOL] (only those; --fetch-tools=helm fetches the Helm 4 that four recovery paths need and keeps your own kubectl and jq)' 'gsj-install.sh install --interactive [--config site.json]' 'gsj-install.sh install --config site.json --non-interactive' 'gsj-install.sh upgrade --to VERSION --config site.json [--interactive|--non-interactive]' 'gsj-install.sh resume --operation ID --config site.json --non-interactive' 'gsj-install.sh repair --operation ID [--to VERSION] [--backup-round N | --source-installer PATH | --continue-helm-installer PATH [--continue-from-program PATH]] --config site.json --non-interactive' 'gsj-install.sh credential-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh tls-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh lease-repair --operation ID --config site.json --non-interactive' 'gsj-install.sh abandon --operation ID --reason TEXT --config site.json --non-interactive' 'gsj-install.sh sweep --config site.json --reason "why" --non-interactive' 'gsj-install.sh addon-repair --operation ID --addon traefik|certManager --revision N --config site.json --non-interactive' 'gsj-install.sh backup --config site.json [--interactive|--non-interactive]' 'gsj-install.sh backup-repair --operation ID --generation N --config site.json --non-interactive' 'gsj-install.sh restore --archive BACKUP.tar.gz.enc --config site.json --non-interactive' 'gsj-install.sh restore-repair --operation ID [--source-installer PATH] --config site.json --non-interactive'
    return
  fi
  [[ -z $BACKUP_ROUND || ( $COMMAND == repair && $BACKUP_ROUND =~ ^[1-9][0-9]{0,5}$ ) ]] || fail '--backup-round requires repair and a positive bounded round number'
@@ -6151,12 +7029,14 @@ main() {
  [[ -z $GENERATION || ( $COMMAND == backup-repair && $GENERATION =~ ^[1-9][0-9]{0,5}$ ) ]] || fail '--generation requires backup-repair and a positive bounded generation number'
  # The verified child of --to receives --expected-version; interactive mode prompts.
  [[ $COMMAND != upgrade || -n $TO || -n $EXPECTED_VERSION ]] || $INTERACTIVE || fail 'non-interactive upgrade requires --to VERSION; repeat the installed release with --to <installed version>'
- # init reports on the clients this machine has and downloads nothing but its own release's files.
+ # init reports on the clients this machine has and downloads nothing but its own release's files, under every --fetch-tools form.
  [[ $COMMAND != init ]] || ! $FETCH_TOOLS || fail 'init reports on the clients this machine has and downloads nothing but its own release; run it without --fetch-tools'
- # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal); init sets
- # none, and an operator's exported leftovers must not reach a cluster through init's exit trap.
- [[ $COMMAND != init ]] || unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT
- bootstrap; install_exit_traps
+ # cleanup_exit acts on what these name (a probe Pod to delete, a Lease to release, a process group to signal, a file
+ # to remove); every verb sets its own after bootstrap installs the exit trap, and an operator's exported leftovers must
+ # reach neither a cluster, a process nor a file: an exported HELM_PID made inspect's exit signal a process group it
+ # never started.
+ unset PROBE_POD TRANSFER_HANDBACK_POD OPERATION LEASE_ACQUIRED RENEWER HELM_PID GSJ_ADDON_COMMAND_PID RECOVERY_HINT INIT_PUBLISH_TEMP
+ bootstrap
  source "$GSJ_PAYLOAD/helpers/verification-cleanup.sh"
  source "$GSJ_PAYLOAD/helpers/startup-recovery.sh"
  # Startup proof inputs are separately inventoried signed helpers.
@@ -6192,7 +7072,9 @@ main() {
  if [[ $COMMAND == upgrade ]]; then [[ -s $GSJ_WORK/installed.json ]] && jq -e '.status=="complete"' "$GSJ_WORK/installed.json" >/dev/null || fail 'upgrade requires a completed installed-release record'; fi
  compatibility; acquire
  # A preceding operation may have completed between the read-only preview
- # and acquiring the lease. Reconcile the actual source again under ownership.
+ # and acquiring the lease. Reconcile the actual source again under ownership;
+ # this call, not the preview, records an admitted corpus change on the
+ # operation for record_installed.
  compatibility
  # Before backup: backup quiesces a running deployment, and a refused pull must
  # leave what was running, running.

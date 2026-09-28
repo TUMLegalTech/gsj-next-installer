@@ -17,6 +17,8 @@ from tests.pinned_web import needs_web
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / "ops/installer/ci"
+# What a qualification runner's clients print, as a report records them.
+QUALIFIED_CLIENTS = {"helm": "v4.2.2+gb05881c", "kubectl": "v1.33.6", "jq": "jq-1.8.2", "server": "v1.33.6+k3s1"}
 
 
 @pytest.fixture
@@ -142,7 +144,7 @@ def test_a_digest_mismatch_names_the_image_and_both_digests_through_the_cli(modu
 
 
 def real_or_stubbed_expected_checks(module, monkeypatch):
-    """Review finding N2: three upgrade-mode tests stubbed
+    """A review finding: three upgrade-mode tests stubbed
     expected_checks() unconditionally, so the hand-run gate -- with the
     pinned Git objects present -- never ran the real check-list read in
     them. The stub is now the public CI's alone (no Git directory carries
@@ -250,7 +252,7 @@ def qualified_files(module, tmp_path, monkeypatch):
     (tmp_path / "manifest.json").write_text(data)
     (tmp_path / "image-inventory.json").write_text(json.dumps({"images": images, "all_remote_manifests_verified": True}))
     descriptor = {"qualification": False, "releaseId": "target", "version": "1.1.0", "manifestSha256": hashlib.sha256(data.encode()).hexdigest(),
-                  "installer": {"sha256": "c" * 64}}
+                  "trustKeySha256": module.RELEASE_TRUST_KEY_SHA256, "installer": {"sha256": "c" * 64}}
     staged = staged_release()
     (tmp_path / "staging.json").write_text(json.dumps(staged))
     monkeypatch.setattr(module, "bundle", lambda path: descriptor)
@@ -269,7 +271,7 @@ def qualified_files(module, tmp_path, monkeypatch):
                         "upgrade": ["populated-source-created", "full-populated-source-to-target-upgrade", "source-backup-and-preservation",
                                     "selected-version-repeat-converges", "hard-restart-cookie-and-attempt", "fresh-restore-to-target-acceptance"]}.items():
         report = {"schema": "gsj.installer-qualification/1", "mode": mode, "status": "passed", "disposable_target_cleanup": "passed",
-                  "release_identity": "target", "installer_sha256": "c" * 64,
+                  "release_identity": "target", "installer_sha256": "c" * 64, "clients": dict(QUALIFIED_CLIENTS),
                   "checks": [{"name": name, "status": "passed"} for name in names]}
         if mode == "upgrade":
             fault = qualified_hardfault(images)
@@ -375,6 +377,7 @@ def test_failed_delivery_preflight_prevents_source_install_or_cluster_mutation(m
                    target / "baseline": {"releaseId": "source", "version": "1.0.0", "installer": {"sha256": "b" * 64}}}
     monkeypatch.setattr(module, "bundle", lambda path: descriptors[path])
     monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the environment's concern, tested on its own
+    monkeypatch.setattr(module, "client_versions", lambda context: dict(QUALIFIED_CLIENTS))   # read on its own below
     def unavailable(*args):
         raise ValueError("delivery readback unavailable")
     monkeypatch.setattr(module, "release_readback", unavailable)
@@ -396,7 +399,7 @@ def test_failed_delivery_preflight_prevents_source_install_or_cluster_mutation(m
 def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp_path, monkeypatch, failure):
     import base64
     module = modules[1]
-    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (a review finding)
     if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     target = tmp_path / "candidate"
     target.mkdir()
@@ -418,6 +421,7 @@ def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp
                    target / "baseline": {"releaseId": "source", "version": "1.0.0", "installer": {"sha256": "b" * 64}}}
     monkeypatch.setattr(module, "bundle", lambda path: descriptors[path])
     monkeypatch.setattr(module, "release_readback", lambda *args: {})
+    monkeypatch.setattr(module, "client_versions", lambda context: dict(QUALIFIED_CLIENTS))   # read on its own below
     namespace_reads = 0
     captured = []
     cleaned = []
@@ -460,7 +464,7 @@ def test_populated_fixture_uses_ca_materialized_by_source_installer(modules, tmp
 @pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM])
 def test_cancellation_signal_saves_interruption_before_owned_cleanup(modules, tmp_path, monkeypatch, number):
     module = modules[1]
-    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (a review finding)
     if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     target = tmp_path / "candidate"
     target.mkdir()
@@ -472,6 +476,7 @@ def test_cancellation_signal_saves_interruption_before_owned_cleanup(modules, tm
     site.write_text(json.dumps({"target": {"context": "disposable", "namespace": "gsj-qualification-test", "release": "gsj"}}))
     site.chmod(0o600)
     monkeypatch.setattr(module, "bundle", lambda path: {"releaseId": "target"})
+    monkeypatch.setattr(module, "client_versions", lambda context: dict(QUALIFIED_CLIENTS))   # read on its own below
     report = tmp_path / "report.json"
     namespace_reads, seen, unwinding = 0, [], []
     def cancel(number):
@@ -519,7 +524,7 @@ def test_populated_hard_restart_kills_web_runner_and_mcp_with_proven_sigkill(mod
     import httpx
     import hardfault
     module = modules[1]
-    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (review finding N2)
+    expected = real_or_stubbed_expected_checks(module, monkeypatch)   # real where the pinned objects are present (a review finding)
     if module.webpin.available(): assert "operator-login" in expected and "synthetic-check" not in expected   # the real list, proven in force
     images = {role: {"repository": "example.test/" + role, "digest": "sha256:" + "a" * 64}
               for role in ("web", "runner", "mcp", "forgejo", "chroma", "decisionsData")}
@@ -548,6 +553,7 @@ def test_populated_hard_restart_kills_web_runner_and_mcp_with_proven_sigkill(mod
     monkeypatch.setattr(module, "release_readback", lambda *args: {})
     monkeypatch.setattr(module, "check_application", lambda *args: None)
     monkeypatch.setattr(module, "delete_owned_namespace", lambda *args: None)
+    monkeypatch.setattr(module, "client_versions", lambda context: dict(QUALIFIED_CLIENTS))   # read on its own below
     ids = {"agent-runner": "a" * 64, "gsj-mcp": "c" * 64, "gsj-web": "b" * 64}
     state = {"killed": False, "session": False, "namespace_reads": 0}
 
@@ -680,6 +686,161 @@ def test_qualification_gate_rejects_unproved_actual_delivery_readback(modules, t
         receipt[key] = "changed"
     reports[1].write_text(json.dumps(report))
     with pytest.raises(ValueError, match="readback"):
+        module.gate(tmp_path, reports)
+
+
+# --- the clients a report vouches for ---
+
+def _clients_answer(fault=None):
+    """A runner's three clients as run() sees them; `fault` breaks one."""
+    document = {"clientVersion": {"gitVersion": "v1.33.6", "platform": "linux/amd64"},
+                "kustomizeVersion": "v5.6.0", "serverVersion": {"gitVersion": "v1.33.6+k3s1"}}
+    calls = []
+
+    def execute(*args, capture=False, **kwargs):
+        calls.append((args, capture))
+        tool = args[0]
+        if fault == tool + "-missing":
+            raise FileNotFoundError(2, "No such file or directory", tool)
+        if tool == "helm":
+            return "" if fault == "helm-silent" else "v4.2.2+gb05881c\n"
+        if tool == "jq":
+            if fault == "jq-fails":
+                raise subprocess.CalledProcessError(2, args, output="")
+            return "  \n" if fault == "jq-blank" else "jq-1.8.2\n"
+        assert tool == "kubectl"
+        value = copy.deepcopy(document)
+        if fault == "kubectl-fails":
+            # an unreachable server: kubectl prints its own version and exits 1
+            value.pop("serverVersion")
+            raise subprocess.CalledProcessError(1, args, output=json.dumps(value, indent=2))
+        if fault == "kubectl-not-json":
+            return "Client Version: v1.33.6\nKustomize Version: v5.6.0\n"
+        if fault == "kubectl-empty-client":
+            value["clientVersion"]["gitVersion"] = ""
+        if fault == "no-server":
+            value.pop("serverVersion")
+        if fault == "server-not-object":
+            value["serverVersion"] = "v1.33.6"
+        return json.dumps(value, indent=2) + "\n"
+    return execute, calls
+
+
+def test_the_qualification_reads_the_exact_clients_and_server_it_runs_with(modules, monkeypatch):
+    """helm's short version, kubectl's client gitVersion and the server
+    gitVersion the site's context answers, and jq's own spelling -- each as
+    the tool prints it, so a report names what actually ran."""
+    module = modules[1]
+    execute, calls = _clients_answer()
+    monkeypatch.setattr(module, "run", execute)
+    assert module.client_versions("disposable") == QUALIFIED_CLIENTS
+    assert calls == [(("helm", "version", "--short"), True),
+                     (("kubectl", "--context", "disposable", "version", "-o", "json"), True),
+                     (("jq", "--version"), True)]
+
+
+@pytest.mark.parametrize("fault,named", [
+    ("helm-missing", "helm"), ("helm-silent", "helm"),
+    ("kubectl-missing", "kubectl"), ("kubectl-not-json", "kubectl"), ("kubectl-empty-client", "kubectl"),
+    ("kubectl-fails", "server"), ("no-server", "server"), ("server-not-object", "server"),
+    ("jq-fails", "jq"), ("jq-blank", "jq"),
+])
+def test_the_qualification_refuses_in_words_a_client_or_server_it_cannot_name(modules, monkeypatch, fault, named):
+    module = modules[1]
+    execute, _ = _clients_answer(fault)
+    monkeypatch.setattr(module, "run", execute)
+    with pytest.raises(module.Refused) as refused:
+        module.client_versions("disposable")
+    message = str(refused.value)
+    assert message.startswith(f"the {named} version this qualification runs with cannot be read"), message
+    assert "Client Version" not in message and "v1.33.6" not in message, message   # the tool's own text is never repeated
+
+
+def test_the_report_names_its_clients_before_the_first_phase_and_a_run_without_them_stops_in_words(modules, tmp_path, monkeypatch):
+    """The clients are read once, after the site names its context and
+    before the first phase, and the report carries them from its first save
+    on. A run that cannot name one stops there, in words: nothing read from
+    the target namespace, no report written."""
+    module = modules[1]
+    real = module.client_versions
+    target = tmp_path / "candidate"
+    target.mkdir()
+    (target / "manifest.json").write_text(json.dumps({"identity": "target", "corpus": {"fingerprint": "f" * 64, "rows": 3, "chunks": 3}}))
+    (target / "gsj-install.sh").write_text("must not execute")
+    site = tmp_path / "ordinary/site.json"
+    site.parent.mkdir()
+    site.write_text(json.dumps({"target": {"context": "disposable", "namespace": "gsj-qualification-test", "release": "gsj"}}))
+    site.chmod(0o600)
+    monkeypatch.setattr(module, "bundle", lambda path: {"releaseId": "target", "version": "1.1.0", "installer": {"sha256": "a" * 64}})
+    monkeypatch.setattr(module, "expected_checks", lambda: {"synthetic-check"})   # the environment's concern, tested on its own
+    report = tmp_path / "report.json"
+    args = SimpleNamespace(bundle=target, config=site, report=report, mode="ordinary", disposable_target=True)
+    asked, seen = [], []
+    monkeypatch.setattr(module, "client_versions", lambda context: asked.append(context) or dict(QUALIFIED_CLIENTS))
+    def cluster(*argv, **kwargs):
+        seen.append(json.loads(report.read_bytes()))   # the report as it stood at the first cluster read
+        raise RuntimeError("synthetic cluster unavailable")
+    monkeypatch.setattr(module, "run", cluster)
+    with pytest.raises(ValueError, match="qualification did not pass"):
+        module.qualify(args)
+    assert asked == ["disposable"]
+    assert seen[0]["phase"] == "target-preflight" and seen[0]["clients"] == QUALIFIED_CLIENTS
+    assert json.loads(report.read_bytes())["clients"] == QUALIFIED_CLIENTS
+    report.unlink()
+    calls = []
+    def nothing_installed(*argv, **kwargs):
+        calls.append(argv)
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+    monkeypatch.setattr(module, "client_versions", real)
+    monkeypatch.setattr(module, "run", nothing_installed)
+    with pytest.raises(module.Refused, match="the helm version this qualification runs with cannot be read"):
+        module.qualify(args)
+    assert [argv[0] for argv in calls] == ["helm", "kubectl", "jq"] and not report.exists()
+
+
+@pytest.mark.parametrize("index", [0, 1])
+@pytest.mark.parametrize("fault", ["missing", "not-an-object", "empty-helm", "blank-server", "number-kubectl", "no-jq"])
+def test_the_gate_requires_every_report_to_name_the_clients_and_server_it_ran_with(modules, tmp_path, monkeypatch, index, fault):
+    module = modules[1]
+    _, reports = qualified_files(module, tmp_path, monkeypatch)
+    module.gate(tmp_path, reports)
+    value = json.loads(reports[index].read_text())
+    clients = value["clients"]
+    if fault == "missing": value.pop("clients")
+    elif fault == "not-an-object": value["clients"] = "helm v4.2.2"
+    elif fault == "empty-helm": clients["helm"] = ""
+    elif fault == "blank-server": clients["server"] = "  "
+    elif fault == "number-kubectl": clients["kubectl"] = 1.33
+    else: clients.pop("jq")
+    reports[index].write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="helm, kubectl, jq and server versions"):
+        module.gate(tmp_path, reports)
+
+
+# --- the key a released candidate carries ---
+
+def test_the_permanent_release_key_is_the_published_one(modules):
+    """The SHA-256 of the release.pem published beside every installer:
+    changing it is a decision about the product's trust root, never a
+    side effect."""
+    assert modules[1].RELEASE_TRUST_KEY_SHA256 == "8cd0a432a238866178c10f7b49d36cfc417125f32d53d445ea28f0de73d30bc3"
+
+
+@pytest.mark.parametrize("key,qualification", [("f" * 64, False), ("f" * 64, True), (None, False)])
+def test_the_gate_refuses_a_candidate_not_signed_for_the_permanent_release_key(modules, tmp_path, monkeypatch, key, qualification):
+    """Every installed release verifies its successor under the key it
+    carries, so a candidate signed with any other key -- a throwaway one, on
+    a bundle marked qualification:false -- passed every other check and then
+    stopped every upgrade --to at 'target release signature is invalid'. The
+    gate refuses it first, before it reads anything else."""
+    module = modules[1]
+    descriptor, reports = qualified_files(module, tmp_path, monkeypatch)
+    module.gate(tmp_path, reports)                  # the fixture is a candidate the gate passes
+    descriptor["qualification"] = qualification
+    if key is None: descriptor.pop("trustKeySha256")
+    else: descriptor["trustKeySha256"] = key
+    (tmp_path / "manifest.json").unlink()           # nothing else is read before the key is judged
+    with pytest.raises(module.Refused, match="not signed for the permanent release key"):
         module.gate(tmp_path, reports)
 
 
@@ -1093,6 +1254,7 @@ def test_qualification_refuses_a_missing_pinned_git_directory_in_its_first_secon
         raise RuntimeError("synthetic cluster unavailable")
     monkeypatch.setattr(module, "run", cluster)
     monkeypatch.setattr(module, "sha", lambda path: "a" * 64)
+    monkeypatch.setattr(module, "client_versions", lambda context: dict(QUALIFIED_CLIENTS))   # read on its own below
     with pytest.raises(ValueError, match="qualification did not pass"):
         module.qualify(args)
     assert calls and calls[0][:7] == ("kubectl", "--context", "disposable", "--namespace", "gsj-qualification-test", "get", "namespace")

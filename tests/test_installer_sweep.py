@@ -266,7 +266,7 @@ def test_a_removed_namespace_is_absent_not_unreadable_and_still_sweeps_the_host_
 
 
 def test_a_foreign_lease_holder_is_never_repeated(runtime, tmp_path):
-    """review sweep B2: the refusal printed the Lease's holderIdentity
+    """a review finding: the refusal printed the Lease's holderIdentity
     verbatim -- text this installer writes as a 24-hex operation id, but which
     a foreign Lease of the same name can carry as anything. Only an id this
     installer writes is printed."""
