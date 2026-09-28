@@ -3913,8 +3913,10 @@ that was refused after it had already prepared its operation, or a release that
 was uninstalled leave behind what no other verb reaches: a canonical operation
 record every later operation refuses (`another active operation or later phase
 owns canonical state`), the installer's own Jobs and their Pods, its record
-ConfigMaps, the three token Secrets the provisioning Job mints, a free Lease and
-a per-operation transfer directory.
+ConfigMaps, the three token Secrets the provisioning Job mints, the image pull
+probe's Pod a killed run left (every other exit deletes its own; sweep finds it
+by its label, `gsj.io/pull-probe` with the release's name), a free Lease and a
+per-operation transfer directory.
 
 ```sh
 ./gsj-install.sh sweep --config "$HOME/gsj-operator/site.json" --reason "why" --non-interactive
