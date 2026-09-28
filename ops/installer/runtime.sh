@@ -3239,14 +3239,28 @@ relocated_images_probe() {
  # runner, mcp and the corpus image under the initialization deadline (24 h by
  # default): a slow link it installed over must not be refused by 900 s now,
  # so the wait goes on to dependencies_seconds + initialization_seconds, said
- # once when the first is spent while a container reports its pull. The bound
- # is the probe's, not each Pod's: the six Pods spend it together, as the six
- # containers of one Pod once did, and each Pod's activeDeadlineSeconds
- # follows it.
+ # once when the first is spent while a container reports its pull. Only a
+ # Pod that may still pull is waited on: Pending or Running, its container
+ # waiting for its image or not yet reported. A Pod that can no longer pull is
+ # refused on the poll that reads it, since no wait can change it: one that
+ # ENDED without its image (phase Failed or Succeeded, or its container
+ # terminated: evicted, refused by the kubelet at admission, past its own
+ # activeDeadlineSeconds), one the API no longer holds, and one of the same
+ # name and another uid, which another client created and whose pull proves
+ # nothing about the Pod this probe asked for.
+ # The bound is the probe's, not each Pod's: the six Pods spend it together,
+ # as the six containers of one Pod once did. Every time here is wall time,
+ # $SECONDS, the bound from the probe's start and each rule from what the Pod
+ # in hand reported: counting the 5 s sleeps left out every API round trip,
+ # and a wait of a day ran past the Pod's own deadline. That deadline, each
+ # Pod's activeDeadlineSeconds, is the bound and a tenth of it, 300 s at the
+ # least: the kubelet times it on the node's clock from the Pod's start, and
+ # a margin that grows with the wait keeps the Pod alive until the probe
+ # itself refuses.
  #
  # WHERE IN THE CHAIN. Before backup quiesces a running deployment: a refusal
  # here leaves whatever was running, running.
- local base recorded='' pod spent=0 failing_since=-1 unscheduled_since=-1 placed='' status verdict words='' words_rank=-1 said rank condition where deadline want bound within slow=false retrying=false refuse node refs role ref n=0 pulls
+ local base recorded='' pod uid began spent=0 failing_since=-1 unscheduled_since=-1 placed='' status verdict words='' words_rank=-1 said rank condition where deadline want bound within slow=false retrying=false refuse node refs role ref n=0 pulls
  base=$(j '.registry.base // ""'); node=$(j .storage.node)
  if [[ -s ${GSJ_WORK:-}/installed.json ]]; then recorded=$(jq -r '.site.registry.base // ""' "$GSJ_WORK/installed.json"); fi
  # registry.base has no scheme (the schema holds it to host[:port][/path]), so
@@ -3315,15 +3329,18 @@ relocated_images_probe() {
  [[ -n $node ]] || room="a node the scheduler may use"
  pulls=$(jq '(.image.pullSecrets // [])|map({name:.})' "$GSJ_WORK/values.pending.json")
  refs=$(jq -r --arg base "$base" "$JQ_IMAGE"' .images|to_entries[]|[(.key|ascii_downcase), (.value|image_ref($base))]|@tsv' "$GSJ_PAYLOAD/release.json")
+ began=$SECONDS
  while IFS=$'\t' read -r role ref; do
    n=$(( n + 1 )); pod="gsj-pull-${OPERATION:0:12}-$role"
    PROBE_POD=$pod
-   if ! jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$node" --arg role "$role" --arg image "$ref" --argjson deadline "$bound" --arg cpu "$cpu" --arg memory "$memory" --argjson pulls "$pulls" '
+   # The uid the API gave THIS Pod: a Pod of the same name and another uid is
+   # another client's.
+   if ! uid=$(jq -n --arg name "$pod" --arg release "$RELEASE" --arg node "$node" --arg role "$role" --arg image "$ref" --argjson deadline "$bound" --arg cpu "$cpu" --arg memory "$memory" --argjson pulls "$pulls" '
      {apiVersion:"v1",kind:"Pod",metadata:{name:$name,labels:{"gsj.io/pull-probe":$release}},
       spec:{restartPolicy:"Never",automountServiceAccountToken:false,enableServiceLinks:false,imagePullSecrets:$pulls,
-            activeDeadlineSeconds:($deadline+300),
+            activeDeadlineSeconds:($deadline+([($deadline/10|floor),300]|max)),
             nodeSelector:(if $node=="" then {} else {"kubernetes.io/hostname":$node} end),
-            containers:[{name:("pull-"+$role),image:$image,imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:$cpu,memory:$memory},limits:{cpu:$cpu,memory:$memory}}}]}}' | k create -f - >/dev/null 2>"$GSJ_WORK/pull-probe-create.err"; then
+            containers:[{name:("pull-"+$role),image:$image,imagePullPolicy:"IfNotPresent",command:["/gsj-pull-probe-never-runs"],resources:{requests:{cpu:$cpu,memory:$memory},limits:{cpu:$cpu,memory:$memory}}}]}}' | k create -f - -o jsonpath='{.metadata.uid}' 2>"$GSJ_WORK/pull-probe-create.err"); then
      PROBE_POD=''
      atomic "$STATE_DIR/pull-probe-create.err" < "$GSJ_WORK/pull-probe-create.err"
      local why next="If an admission policy refused it, admit Pods labelled gsj.io/pull-probe in this namespace"
@@ -3339,24 +3356,36 @@ relocated_images_probe() {
    # spent carries over, against the one bound.
    failing_since=-1; unscheduled_since=-1; placed=''; words=''; words_rank=-1; retrying=false
    while :; do
-     status=$(k get pod "$pod" -o json 2>/dev/null) || status='{}'
+     # A Pod the API no longer holds answers nothing under --ignore-not-found,
+     # read as null: gone. A get that FAILS -- the API server unreachable for a
+     # moment -- is a poll without a status ({}), as it always was.
+     status=$(k get pod "$pod" -o json --ignore-not-found 2>/dev/null) || status='{}'
+     [[ -n $status ]] || status=null
+     spent=$(( SECONDS - began ))
      # pulled: the runtime reports the image's ID, or the container got as far as
      # being created. `terminated` alone is NOT proof -- a Pod evicted before its
-     # pull reports terminated/ContainerStatusUnknown with no imageID. failing:
-     # the verdict, then the container's words on a line of their own. The
-     # image is named by the reference composed above, never by the status.
-     verdict=$(jq -r '
+     # pull reports terminated/ContainerStatusUnknown with no imageID. ended: the
+     # Pod or its container is over without the image (restartPolicy Never:
+     # nothing starts it again). replaced: another uid under this Pod's name.
+     # failing: the verdict, then the container's words on a line of their own.
+     # The image is named by the reference composed above, never by the status.
+     verdict=$(jq -r --arg uid "$uid" '
+       if . == null then "gone"
+       elif $uid != "" and (.metadata.uid // $uid) != $uid then "replaced"
+       else
        [(.status.containerStatuses // [])[] | {
           failed: ((.state.waiting.reason // "") | test("^(ErrImage|ImagePull|ImageInspect|InvalidImageName|RegistryUnavailable)")),
           words: ((.state.waiting.message // .state.waiting.reason // "") | gsub("[\\r\\n\\t]+";" ")),
           pulled: (((.imageID // "") != "") or (.state.running != null)
                    or ((.state.terminated != null) and ((.state.terminated.reason // "") != "ContainerStatusUnknown"))
-                   or ((.state.waiting.reason // "") | IN("RunContainerError","CreateContainerError","CrashLoopBackOff")))}] as $c
+                   or ((.state.waiting.reason // "") | IN("RunContainerError","CreateContainerError","CrashLoopBackOff"))),
+          ended: (.state.terminated != null)}] as $c
        | if ($c|length) == 1 and $c[0].pulled then "pulled"
+         elif ((.status.phase // "") | IN("Failed","Succeeded")) or any($c[]; .ended) then "ended"
          elif any($c[]; .failed) then "failing", ($c[]|select(.failed)|.words)
          else ([(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | (.reason // "Unschedulable")] | first) as $unplaced
            | if $unplaced != null then "unscheduled " + ($unplaced|tostring|gsub("[\\r\\n\\t]+";" "))
-             elif ($c|length) > 0 then "pulling" else "waiting" end end' <<< "$status")
+             elif ($c|length) > 0 then "pulling" else "waiting" end end end' <<< "$status")
      # unscheduled: PodScheduled is False, and nothing pulls. pulling: placed,
      # and the container reports a pull that has neither finished nor failed.
      # waiting: no container status at all -- not yet placed, or not read.
@@ -3398,13 +3427,14 @@ relocated_images_probe() {
      # reported when the bound arrives is refused by what it is, which a short
      # deadlines.dependencies_seconds would otherwise turn into a nameless timeout.
      refuse=''
-     if [[ $verdict == failing* ]] && (( (words_rank == 2 && spent - failing_since >= 90) || spent - failing_since >= deadline || spent >= bound )); then refuse=failing
+     if [[ $verdict == ended || $verdict == gone || $verdict == replaced ]]; then refuse=stopped
+     elif [[ $verdict == failing* ]] && (( (words_rank == 2 && spent - failing_since >= 90) || spent - failing_since >= deadline || spent >= bound )); then refuse=failing
      elif [[ $verdict == unscheduled* ]] && (( spent - unscheduled_since >= 300 || spent >= bound )); then refuse=unscheduled
      elif (( spent >= bound )); then refuse=deadline; fi
      if [[ -n $refuse ]]; then
        # the Pod's status, kept 0600 for the operator: the runtime's own words
        # and the scheduler's live there, never in the refusal
-       printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
+       [[ $verdict == gone ]] || printf '%s\n' "$status" | atomic "$STATE_DIR/pull-probe-status.json"
        # The same ImagePullBackOff comes from a changed site (a wrong base, digest or
        # pull Secret: a repair after the correction) and from the node's side (a
        # registry CA it does not trust, DNS, a proxy, a full disk, a rate limit, an
@@ -3436,6 +3466,10 @@ relocated_images_probe() {
            fix="with another storage.node"
            when="once room is freed on $room for the probe Pod's cpu $cpu and memory $memory"
            kept=" (wait 180 s first: this operation's Lease must go unrenewed that long); a changed storage.node";;
+         stopped)
+           fix="with another storage.node"
+           when="once $room admits and keeps the probe Pod (cpu $cpu and memory $memory, with no eviction under resource pressure) and nothing else deletes or replaces Pods labelled gsj.io/pull-probe in namespace $NAMESPACE"
+           kept=" (wait 180 s first: this operation's Lease must go unrenewed that long); a changed storage.node";;
          *)
            fix="after raising deadlines.dependencies_seconds"
            when="once the registry answers and the probe Pod can be scheduled"
@@ -3445,7 +3479,7 @@ relocated_images_probe() {
          RECOVERY_HINT="$verb $when$kept cannot continue this restore, whose site is retained byte for byte"
        elif [[ ( $opstatus == owned || -z $opstatus ) && ! -s $GSJ_WORK/installed.json ]]; then
          RECOVERY_HINT="abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and install again from the corrected file $fix (a repair would complete this first install without the storage check), or resume --operation $OPERATION $when"
-       elif [[ $refuse == unscheduled ]]; then
+       elif [[ $refuse == unscheduled || $refuse == stopped ]]; then
          RECOVERY_HINT="resume --operation $OPERATION $when; a changed storage.node is refused for an installed release, whose claims stay where they are"
        elif [[ $opstatus == owned || -z $opstatus ]]; then
          # the operation's own verb again: an interrupted upgrade is not told to install
@@ -3453,6 +3487,29 @@ relocated_images_probe() {
          RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or abandon --operation $OPERATION --reason \"...\" --config $CONFIG --non-interactive after 180 s and $again from the corrected file (abandon refuses while a backup has left controllers scaled to zero, and says so), or resume --operation $OPERATION $when"
        else
          RECOVERY_HINT="repair --operation $OPERATION --config $CONFIG --non-interactive $fix (wait 180 s first: this operation's Lease must go unrenewed that long before a repair may take it), or resume --operation $OPERATION $when"
+       fi
+       if [[ $refuse == stopped ]]; then
+         local what reported='' cause kept_status=" The Pod's status is kept in $STATE_DIR/pull-probe-status.json."
+         case $verdict in
+           gone)
+             what="was deleted"; kept_status=''
+             cause="another client deleted it (an operator, a cleanup job or a policy controller)";;
+           replaced)
+             what="was replaced by another Pod of the same name (another uid)"
+             cause="another client deleted it and created one of that name, whose pull proves nothing about the Pod this probe asked for";;
+           *)
+             # the phase and the reason, each repeated only when it is a value
+             # this installer knows; the kubelet's message is kept, never
+             # repeated. Terminated and NodeShutdown are the kubelet's graceful
+             # node shutdown (Shutdown before them).
+             what=ended
+             reported=" (phase $(known_word "$(jq -r '.status.phase // "unknown"' <<< "$status")" Pending Running Succeeded Failed Unknown unknown), reason $(known_word "$(jq -r '.status.reason // "unknown"' <<< "$status")" Evicted OutOfcpu OutOfmemory DeadlineExceeded NodeLost Shutdown Terminated NodeShutdown unknown))"
+             cause="the kubelet evicted it under resource pressure or refused to admit it, the node shut down or was lost, or it outlived its activeDeadlineSeconds";;
+         esac
+         # A Pod of this name that is not the probe's own is another client's:
+         # cleanup_exit must not delete it.
+         [[ $verdict == ended ]] || PROBE_POD=''
+         fail "the image pull probe's Pod $what before its image was pulled$reported, so whether the node can pull image $n of $want, $ref ($progress), from $where is unproven: $cause.$kept_status Helm has applied nothing in this run"
        fi
        if [[ $refuse == failing ]]; then
          local after=''
@@ -3493,7 +3550,7 @@ relocated_images_probe() {
        slow=true
        log "The node is still pulling this release's images from $where at deadlines.dependencies_seconds ($deadline s), as on a slow link to the registry; the wait goes on for up to deadlines.initialization_seconds more ($(( bound - deadline )) s), the time the previous release gave these pulls, and a pull that fails definitively (a refused credential, a name or digest the registry does not hold, an invalid name) is still refused after 90 s, any other failure once it has been reported for deadlines.dependencies_seconds"
      fi
-     sleep 5; spent=$(( spent + 5 ))
+     sleep 5
    done
    # Waited for, and bounded: the scheduler counts a Pod being deleted until
    # it is gone, and the next Pod must not be judged beside it.

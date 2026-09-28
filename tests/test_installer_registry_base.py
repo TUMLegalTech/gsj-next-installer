@@ -256,22 +256,26 @@ def test_managed_addon_images_are_named_as_unmoved_not_silently_left_behind(runt
 # --- the pull probe: the node's own runtime answers, by name ------------------------
 
 # The fake serves the probe's Pods one at a time, as the probe creates them:
-# the i-th create is answered from status-<i>.json, from that Pod's m-th poll
-# on by status-<i>-after-<m>.json when there is one, and every create and
+# the i-th create answers the uid probe-uid-<i>, its gets are answered from
+# status-<i>.json, from that Pod's m-th poll on by status-<i>-after-<m>.json
+# when there is one (an empty file: the Pod is gone), and every create and
 # delete is logged in order to events. ADMIT is where a test puts the
-# namespace's admission in front of a create.
+# namespace's admission in front of a create. The probe times itself by
+# SECONDS; unset, it is an ordinary variable that only a sleep advances, so a
+# poll count is a time: 5 s a poll unless a test's sleep says otherwise.
 ADMIT = 'create) doc=$(cat)'
 PROBE_PRELUDE = '''
 GSJ_PAYLOAD="{payload}"; OPERATION=aaaaaaaaaaaabbbbbbbbbbbb; CONFIG="$TEST_WORK/site.json"
 # what cleanup_exit would remove, and what it would print as the next step
 trap 'echo "PROBE_POD=${{PROBE_POD:-}}" >&2; echo "HINT=${{RECOVERY_HINT:-}}" >&2' EXIT
-sleep() {{ :; }}
+unset SECONDS; SECONDS=0
+sleep() {{ SECONDS=$((SECONDS + 5)); }}
 k() {{
   case "$1" in
     ''' + ADMIT + '''
             i=$(( $(cat "$TEST_WORK/creates" 2>/dev/null || echo 0) + 1 )); echo "$i" > "$TEST_WORK/creates"
             printf '%s' "$doc" > "$TEST_WORK/probe-pod-$i.json"
-            echo "create $(jq -r .metadata.name <<< "$doc")" >> "$TEST_WORK/events";;
+            echo "create $(jq -r .metadata.name <<< "$doc")" >> "$TEST_WORK/events"; echo "probe-uid-$i";;
     get) n=$(cat "$TEST_WORK/polls" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$TEST_WORK/polls"
          i=$(cat "$TEST_WORK/creates"); m=$(cat "$TEST_WORK/polls-$i" 2>/dev/null || echo 0); m=$((m+1)); echo "$m" > "$TEST_WORK/polls-$i"
          if [ -f "$TEST_WORK/status-$i-after-$m.json" ]; then cp "$TEST_WORK/status-$i-after-$m.json" "$TEST_WORK/status-$i.json"; fi
@@ -1365,3 +1369,180 @@ def test_a_probe_pod_a_restore_could_not_create_names_the_verb_its_state_accepts
     assert "once the namespace admits the probe Pod (wait 180 s first" in hint, hint
     if status == "restoring-resources" or program:
         assert "resume --operation" not in hint
+
+
+# --- a probe Pod that ends, disappears or is replaced before its pull ---------------
+
+ENDED_WORDS = "The node was low on resource: ephemeral-storage. ZZSECRET-CANARY"
+
+
+def _ended(reason, containers=True):
+    """A Pod the kubelet ended before its pull: phase Failed, the kubelet's
+    reason, and its own words. An evicted Pod's container reports
+    terminated/ContainerStatusUnknown with no imageID; a Pod the kubelet
+    rejected at admission reports no container status at all."""
+    status = {"phase": "Failed", "reason": reason, "message": ENDED_WORDS}
+    if containers:
+        status["containerStatuses"] = [{"name": "pull-runner", "state": {"terminated": {"reason": "ContainerStatusUnknown", "exitCode": 137}}}]
+    return json.dumps({"status": status})
+
+
+def test_a_probe_pod_evicted_before_its_pull_is_refused_at_once_on_a_plain_site(runtime, tmp_path):
+    """An evicted Pod pulls nothing and never will, and it read as a pull
+    still in progress: on a site without registry.base it was waited on to
+    the long bound, about a day by default, and then blamed on a slow link.
+    It is refused on the poll that reads it, by its phase, its reason and the
+    image, and the kubelet's words are kept, never repeated."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED, CREATING] + [PULLED] * 4, after={(2, 4): _ended("Evicted")},
+                   dependencies=600, initialization=1200)
+    assert result.returncode != 0
+    assert _polls(work) == 1 + 4, "refused on the poll that read the eviction, not at the 1800 s bound"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    runner = _refs(_public_release(), base="")[1]
+    assert ("the image pull probe's Pod ended before its image was pulled (phase Failed, reason Evicted), so whether the node can pull image 2 of 6, "
+            + runner + " (1 pulled before it, 4 not yet tried), from the release's own repositories is unproven: ") in line, line
+    assert "pull-probe-status.json" in line and "Helm has applied nothing in this run" in line, line
+    assert "did not finish pulling" not in result.stderr and "still pulling" not in result.stderr, "an ended Pod is not a slow link"
+    assert "ZZSECRET-CANARY" not in result.stdout + result.stderr
+    assert ENDED_WORDS in (work / "pull-probe-status.json").read_text()
+    assert len(_pods(work)) == 2, "no Pod is created for the four images after it"
+
+
+@pytest.mark.parametrize("reason, word", [("OutOfcpu", "OutOfcpu"), ("OutOfmemory", "OutOfmemory"),
+                                          ("DeadlineExceeded", "DeadlineExceeded"), ("Evicted" + "ZZSECRETCANARY", "other")],
+                         ids=["out-of-cpu", "out-of-memory", "deadline", "crafted"])
+def test_a_probe_pod_the_kubelet_rejected_is_refused_at_once_by_its_reason(runtime, tmp_path, reason, word):
+    """A Pod the kubelet refused to admit (OutOfcpu, OutOfmemory) reports
+    phase Failed and no container status, which read as a Pod not yet placed
+    and was waited on to the long bound; one past its own
+    activeDeadlineSeconds likewise. Refused at once, by the reason when it is
+    one this installer knows and by the word "other" when it is not."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", status=_ended(reason, containers=False), dependencies=600, initialization=1200)
+    assert result.returncode != 0
+    assert _polls(work) == 1
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    web = _refs(_public_release(), base="")[0]
+    assert ("the image pull probe's Pod ended before its image was pulled (phase Failed, reason " + word + "), so whether the node can pull image 1 of 6, "
+            + web + " (0 pulled before it, 5 not yet tried), from the release's own repositories is unproven: ") in line, line
+    assert "ZZSECRETCANARY" not in result.stderr and "ZZSECRET-CANARY" not in result.stdout + result.stderr
+    assert "did not finish pulling" not in line and "was not scheduled" not in line
+
+
+def test_a_probe_pod_deleted_under_the_probe_is_refused_at_once_by_name(runtime, tmp_path):
+    """A Pod another client deleted was read as one with no status yet and
+    waited on to the long bound. The API says it is gone: refused on that
+    poll, by the image, and cleanup_exit is left no Pod to delete."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED, CREATING] + [PULLED] * 4, after={(2, 3): ""},
+                   dependencies=600, initialization=1200)
+    assert result.returncode != 0
+    assert _polls(work) == 1 + 3
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    runner = _refs(_public_release(), base="")[1]
+    assert ("the image pull probe's Pod was deleted before its image was pulled, so whether the node can pull image 2 of 6, "
+            + runner + " (1 pulled before it, 4 not yet tried), from the release's own repositories is unproven: another client deleted it") in line, line
+    assert "did not finish pulling" not in result.stderr
+    assert "PROBE_POD=\n" in result.stderr
+
+
+def test_a_get_that_fails_for_a_moment_is_waited_through_and_not_read_as_a_deleted_pod(runtime, tmp_path):
+    """Only the API's own answer that the Pod is gone ends it: a get that
+    fails -- the API server unreachable for a moment -- is a poll without a
+    status, as it always was."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", states=[PULLED, CREATING] + [PULLED] * 4,
+                   after={(2, 3): "not json: the fake's get fails", (2, 5): PULLED}, dependencies=600, initialization=1200)
+    assert result.returncode == 0, result.stderr
+    assert "All 6 images pulled" in result.stderr and "was deleted" not in result.stderr
+
+
+def test_a_probe_pod_replaced_under_its_name_is_refused_at_once_even_when_the_other_pulled(runtime, tmp_path):
+    """Another client that deletes the Pod and creates one of the same name
+    leaves a Pod this probe did not ask for: whatever it reports, pulled
+    included, proves nothing. The uid the create answered tells them apart:
+    refused on that poll, and cleanup_exit must not delete another client's
+    Pod."""
+    run, _, work = runtime
+    other = json.loads(_pod_status(2, PULLED))
+    other["metadata"] = {"name": "gsj-pull-aaaaaaaaaaaa-runner", "uid": "another-uid"}
+    result = _slow(run, work, tmp_path, base="", states=[PULLED, CREATING] + [PULLED] * 4, after={(2, 3): json.dumps(other)},
+                   dependencies=600, initialization=1200)
+    assert result.returncode != 0, "a Pod of another uid proves nothing"
+    assert _polls(work) == 1 + 3
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    runner = _refs(_public_release(), base="")[1]
+    assert ("the image pull probe's Pod was replaced by another Pod of the same name (another uid) before its image was pulled, so whether the node can pull image 2 of 6, "
+            + runner + " (1 pulled before it, 4 not yet tried), from the release's own repositories is unproven: ") in line, line
+    assert "another-uid" not in result.stderr
+    assert "PROBE_POD=\n" in result.stderr
+
+
+@pytest.mark.parametrize("operation, installed, starts, present, absent", [
+    ({"kind": "install", "status": "owned"}, False, "abandon --operation aaaaaaaaaaaabbbbbbbbbbbb",
+     ("install again from the corrected file with another storage.node",
+      "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once node synthetic-node admits and keeps the probe Pod"),
+     (" repair --operation", "after raising")),
+    ({"kind": "upgrade", "status": "backup-verified"}, True, "resume --operation aaaaaaaaaaaabbbbbbbbbbbb once node synthetic-node admits and keeps the probe Pod",
+     ("nothing else deletes or replaces Pods labelled gsj.io/pull-probe", "a changed storage.node is refused for an installed release"),
+     ("repair --operation", "abandon", "after raising")),
+    ({"kind": "restore", "status": "restoring-resources"}, False,
+     "restore-repair --operation aaaaaaaaaaaabbbbbbbbbbbb with the exact saved target once node synthetic-node admits and keeps the probe Pod",
+     ("a changed storage.node cannot continue this restore",), ("resume --operation", " repair --operation")),
+], ids=["first-install", "upgrade-after-backup", "restoring-resources"])
+def test_an_ended_probe_pod_names_the_verb_the_operation_s_state_accepts(runtime, tmp_path, operation, installed, starts, present, absent):
+    """The cure is on the node or with whoever deletes the Pods, never a
+    raised deadline: every operation continues with its own site once the
+    node keeps the Pod, a first install may also start again from a file
+    naming another node, and a restore is continued by the verb its phase
+    accepts."""
+    run, _, work = runtime
+    if installed:
+        (work / "installed.json").write_text(json.dumps({"status": "complete"}))
+    result = _slow(run, work, tmp_path, base=BASE, status=_ended("Evicted"), dependencies=400, operation=operation, prefix='STATE_DIR="$TEST_WORK"; ')
+    assert result.returncode != 0 and "ended before its image was pulled" in result.stderr
+    hint = result.stderr.rsplit("HINT=", 1)[1]
+    assert hint.startswith(starts), hint
+    for words in present:
+        assert words in hint, (words, hint)
+    for words in absent:
+        assert words not in hint, (words, hint)
+
+
+# --- the probe's clock -------------------------------------------------------------
+
+@pytest.mark.parametrize("state, polls, words", [
+    (CREATING, 31, "did not finish pulling this release's images from the release's own repositories within deadlines.dependencies_seconds plus deadlines.initialization_seconds (300 s)"),
+    (UNAUTHORIZED, 10, "the registry refused the pull (unauthorized"),
+    (_unscheduled(), 31, "was not scheduled (PodScheduled: Unschedulable) within 300 s"),
+], ids=["bound", "definitive-90s", "unscheduled-300s"])
+def test_the_probe_times_itself_by_the_clock_not_by_counting_its_sleeps(runtime, tmp_path, state, polls, words):
+    """The probe's clock advanced by its 5 s sleeps alone, and every API
+    round trip around them went uncounted: a long wait ran past its bound,
+    and past the Pod's own activeDeadlineSeconds, which the kubelet times on
+    a real clock. Here each poll takes 10 s, and the bound, the 90 s of a
+    definitive failure and the 300 s of an unplaced Pod each arrive at their
+    time, not at twice it."""
+    run, _, work = runtime
+    result = _slow(run, work, tmp_path, base="", status=state, dependencies=100, initialization=200,
+                   prefix="sleep() { SECONDS=$((SECONDS + 10)); }; ")
+    assert result.returncode != 0
+    assert _polls(work) == polls, "one poll every 10 s: a poll at 0 s, and the refusal at the rule's own time"
+    line = [l for l in result.stderr.splitlines() if l.startswith("GSJ:")][-1]
+    assert words in line, line
+
+
+def test_each_probe_pod_s_own_deadline_outlasts_the_probe_s_bound_by_a_tenth_of_it(runtime, tmp_path):
+    """Each Pod's activeDeadlineSeconds runs on the node's clock from the
+    kubelet's start of the Pod, the probe's bound on this machine's from the
+    probe's start. The 300 s they differed by was a fixed margin on a wait of
+    up to a day; a tenth of the bound, never less than 300 s, keeps the Pod
+    alive until the probe itself refuses. A plain site's default bound is
+    deadlines.dependencies_seconds plus deadlines.initialization_seconds,
+    87300 s."""
+    run, _, work = runtime
+    _queue(work, [PULLED] * 6)
+    _, result = _probe(run, work, tmp_path, base="")
+    assert result.returncode == 0, result.stderr
+    assert [pod["spec"]["activeDeadlineSeconds"] for pod in _pods(work)] == [87300 + 8730] * 6
