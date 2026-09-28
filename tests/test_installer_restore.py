@@ -339,12 +339,12 @@ def test_owned_pod_refuses_unsupported_or_inexact_quantities_even_when_identical
 GIB = 1024 ** 3
 
 
-def _staging(runtime, tmp_path, transfer, free, size=1000, total=2 * GIB, shared=False, floor=None):
+def _staging(runtime, tmp_path, transfer, free, size=1000, total=GIB, shared=False, floor=None):
     """restore_files up to its stream: the Pod is Ready, the writers and the
     bindings are proven, and the fake exec answers the measurement -- free
     bytes, the filesystem's size, and whether /transfer shares its filesystem
     with an application volume. The default filesystem is small enough that
-    its tenth never decides the margin."""
+    its 15 % never decides the margin."""
     run, state, work = runtime
     site = json.loads((work / "site.json").read_text())
     site["storage"]["transfer_path"] = transfer
@@ -422,21 +422,25 @@ def _refusal(result):
     return next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
 
 
-def test_a_tenth_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path):
+def test_fifteen_percent_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path):
     """An emptyDir lives on the node's root filesystem, where the kubelet
-    evicts Pods below 10 % free by default: an archive that fit with 256 MiB
-    to spare could push the node under that line and get the restore Pod
-    evicted after the whole transfer. What stays free after the stream is at
-    least a tenth of the filesystem."""
+    evicts Pods by default below 10 % free (nodefs.available) and, where the
+    images share that filesystem as on a single-disk node, below 15 %
+    (imagefs.available): an archive that fit with 256 MiB to spare could push
+    the node under that line and get the restore Pod evicted after the whole
+    transfer. A tenth kept free was still under the image line. What stays
+    free after the stream is at least 15 % of the filesystem."""
     transfer, total, size = "", 100 * GIB, 1000
-    result, calls = _staging(runtime, tmp_path, transfer, free=size + 10 * GIB - 1, total=total, size=size)
+    margin = total * 15 // 100
+    result, calls = _staging(runtime, tmp_path, transfer, free=size + margin - 1, total=total, size=size)
     assert result.returncode != 0
     assert _streamed(calls) == [], "refused before a byte was streamed"
     refusal = _refusal(result)
     assert refusal.startswith("GSJ: restore staging space is insufficient"), refusal
-    assert f"a margin of {total // 10}" in refusal and str(size + total // 10) in refusal, refusal
-    assert f"a tenth of the filesystem's {total} bytes" in refusal and "eviction" in refusal, refusal
-    result, calls = _staging(runtime, tmp_path, transfer, free=size + total // 10, total=total, size=size)
+    assert f"a margin of {margin}" in refusal and str(size + margin) in refusal, refusal
+    assert f"15 % of the filesystem's {total} bytes" in refusal, refusal
+    assert "eviction thresholds" in refusal and "imagefs.available" in refusal, refusal
+    result, calls = _staging(runtime, tmp_path, transfer, free=size + margin, total=total, size=size)
     assert "restore staging space" not in result.stderr
     assert len(_streamed(calls)) == 1
 
@@ -444,10 +448,10 @@ def test_a_tenth_of_the_filesystem_stays_free_after_the_stream(runtime, tmp_path
 HOST_PATH = "/data/gsj-install/transfer"
 
 
-def test_a_transfer_hostpath_is_not_held_to_a_tenth_of_its_filesystem(runtime, tmp_path):
-    """The kubelet's eviction threshold watches the node's root filesystem,
+def test_a_transfer_hostpath_is_not_held_to_a_share_of_its_filesystem(runtime, tmp_path):
+    """The kubelet's eviction thresholds watch the node's root filesystem,
     where an emptyDir lives. storage.transfer_path is a directory the operator
-    chose, a dedicated data disk among others: a tenth of that disk kept free
+    chose, a dedicated data disk among others: a share of that disk kept free
     refused restores that fit. There the least margin and a tenth of the
     archive hold, and nothing about the filesystem's size."""
     total, size = 2000 * GIB, 1000
@@ -458,7 +462,7 @@ def test_a_transfer_hostpath_is_not_held_to_a_tenth_of_its_filesystem(runtime, t
     assert result.returncode != 0 and _streamed(calls) == []
     refusal = _refusal(result)
     assert "a margin of 268435456: 256 MiB, the least margin" in refusal, refusal
-    assert "a tenth of the filesystem" not in refusal and "eviction" not in refusal, refusal
+    assert "of the filesystem's" not in refusal and "eviction" not in refusal, refusal
 
 
 @pytest.mark.parametrize("size, total, shared, floor, named", [
@@ -470,12 +474,12 @@ def test_a_transfer_hostpath_is_not_held_to_a_tenth_of_its_filesystem(runtime, t
 def test_a_transfer_hostpath_refusal_names_only_the_floor_that_applied(runtime, tmp_path, size, total, shared, floor, named):
     """On a hostPath the floors are the least margin, a tenth of the archive and,
     on the application volumes' filesystem, storage.minimum_free_bytes: the
-    refusal names the one that decided and never the filesystem's tenth."""
+    refusal names the one that decided and never the filesystem's share."""
     result, calls = _staging(runtime, tmp_path, HOST_PATH, free=1000, total=total, size=size, shared=shared, floor=floor)
     assert result.returncode != 0 and _streamed(calls) == []
     refusal = _refusal(result)
     assert named in refusal, refusal
-    for other in {"256 MiB, the least margin", "a tenth of the archive", "a tenth of the filesystem's", "storage.minimum_free_bytes"} - {named}:
+    for other in {"256 MiB, the least margin", "a tenth of the archive", "15 % of the filesystem's", "storage.minimum_free_bytes"} - {named}:
         assert other not in refusal, (other, refusal)
     margin = {"256 MiB, the least margin": 268435456, "a tenth of the archive": size // 10, "storage.minimum_free_bytes": floor}[named]
     assert f"needs {size + margin} (" in refusal, refusal
@@ -500,18 +504,18 @@ def test_a_transfer_directory_on_the_volumes_filesystem_leaves_the_sites_free_sp
 
 
 @pytest.mark.parametrize("size, total, shared, floor, named", [
-    (1000, 2 * GIB, False, None, "256 MiB, the least margin"),
-    (3 * GIB, 2 * GIB, False, None, "a tenth of the archive"),
-    (1000, 100 * GIB, False, None, "a tenth of the filesystem's"),
+    (1000, GIB, False, None, "256 MiB, the least margin"),
+    (3 * GIB, GIB, False, None, "a tenth of the archive"),
+    (1000, 100 * GIB, False, None, "15 % of the filesystem's"),
     (1000, 100 * GIB, True, 20 * GIB, "storage.minimum_free_bytes"),
-    (1000, 100 * GIB, True, GIB, "a tenth of the filesystem's"),      # a floor below the tenth does not decide
-], ids=["least", "archive", "filesystem", "site-floor", "floor-below-the-tenth"])
+    (1000, 100 * GIB, True, 12 * GIB, "15 % of the filesystem's"),    # a floor below the 15 % does not decide
+], ids=["least", "archive", "filesystem", "site-floor", "floor-below-the-share"])
 def test_the_refusal_names_the_floor_that_decided_the_margin(runtime, tmp_path, size, total, shared, floor, named):
     result, calls = _staging(runtime, tmp_path, "", free=1000, total=total, size=size, shared=shared, floor=floor)
     assert result.returncode != 0 and _streamed(calls) == []
     refusal = _refusal(result)
     assert named in refusal, refusal
-    for other in {"256 MiB, the least margin", "a tenth of the archive", "a tenth of the filesystem's", "storage.minimum_free_bytes"} - {named}:
+    for other in {"256 MiB, the least margin", "a tenth of the archive", "15 % of the filesystem's", "storage.minimum_free_bytes"} - {named}:
         assert other not in refusal, (other, refusal)
 
 
