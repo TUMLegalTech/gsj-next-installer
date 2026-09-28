@@ -627,7 +627,9 @@ def test_the_unfinished_checkpoint_of_an_ended_restore_names_a_fresh_restore_fro
     or swept still refuses a fresh restore from its site directory -- it is
     that operation's own evidence -- but the refusal named restore-repair and
     resume, and both refuse an ended operation. It names the route that is
-    left: this site directory kept as it is, and a restore from a new one."""
+    left: this site directory kept as it is, and a restore from a new one.
+    abandon refuses an ended operation too, so that route starts at the
+    uninstall."""
     invoke, _ = _restore_fixture(runtime, tmp_path)
     _, state, work = runtime
     _prior_restore(work, checkpoint, (PRIOR, ended))
@@ -635,9 +637,10 @@ def test_the_unfinished_checkpoint_of_an_ended_restore_names_a_fresh_restore_fro
     result = invoke()
     assert result.returncode != 0
     route = ("into an empty namespace synthetic-namespace from a new site directory: on another cluster, or on this one "
-             f"once the deployment is removed (abandon --operation {PRIOR}, helm -n synthetic-namespace uninstall synthetic-release, sweep, "
+             "once the deployment is removed (helm -n synthetic-namespace uninstall synthetic-release, sweep, "
              "then delete namespace synthetic-namespace)")
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
+    assert "abandon --operation" not in refusal, refusal
     assert refusal == (f"GSJ: restore checkpoint already exists for operation {PRIOR}, which was {ended} before its restore "
                        f"completed, so restore-repair and resume refuse it; keep this site directory as it is, and restore {route}"), refusal
     assert "use restore-repair" not in result.stderr
@@ -675,7 +678,9 @@ def test_the_one_cluster_route_removes_the_managed_add_ons_a_recreated_namespace
     """Each managed add-on's owner record hashes the namespace's uid: once the
     namespace is deleted and made again, the restore's add-on step refuses
     the add-ons the old identity owns. The route named only the application's
-    release, and spelled its uninstall without the namespace it lives in."""
+    release, and spelled its uninstall without the namespace it lives in. The
+    steps run in the guide's order: abandon, the uninstall, sweep, the
+    namespace, and last the add-ons with their CRDs."""
     run, _, work = runtime
     site = json.loads((work / "site.json").read_text())
     site[key]["profile"] = profile
@@ -686,8 +691,8 @@ install_exit_traps
 restore_fresh_fail 'the restored evidence changed'
 ''')
     assert result.returncode != 0
-    route = (f"(abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release and its managed "
-             "add-ons with their CRDs (see the guide), sweep, then delete namespace synthetic-namespace)")
+    route = (f"(abandon --operation {operation}, helm -n synthetic-namespace uninstall synthetic-release, sweep, "
+             "delete namespace synthetic-namespace, then remove its managed add-ons and their CRDs (see the guide))")
     refusal = next(line for line in result.stderr.splitlines() if line.startswith("GSJ: "))
     assert route in refusal, refusal
     assert route in result.stderr.rsplit("Use restore of", 1)[1], "the closing line names the same route"

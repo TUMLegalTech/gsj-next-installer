@@ -4310,13 +4310,18 @@ restore_fresh_route() {
  # Where a fresh restore of this deployment goes, in the words every such
  # hint uses. Most sites have one cluster, so the empty namespace is on
  # another cluster or this one recreated once the deployment is removed, from
- # a new site directory either way. The release lives in the namespace, so its
- # uninstall names it. A managed add-on goes too: its owner record hashes the
- # namespace's uid, so a recreated namespace is another identity and the
- # restore's add-on step refuses the add-ons the old one owns.
- local addons=''
- [[ $(j .ingress.profile) != managed-traefik && $(j .tls.profile) != managed-acme && $(j .storage.profile) != managed-local-path ]] || addons=' and its managed add-ons with their CRDs (see the guide)'
- printf 'into an empty namespace %s from a new site directory: on another cluster, or on this one once the deployment is removed (abandon --operation %s, helm -n %s uninstall %s%s, sweep, then delete namespace %s)' "$NAMESPACE" "$OPERATION" "$NAMESPACE" "$RELEASE" "$addons" "$NAMESPACE"
+ # a new site directory either way. The removal is named in the guide's
+ # order: abandon, the release's uninstall (the release lives in the
+ # namespace, so it names it), sweep, the namespace, and last the managed
+ # add-ons: each one's owner record hashes the namespace's uid, so a
+ # recreated namespace is another identity and the restore's add-on step
+ # refuses the add-ons the old one owns. abandon refuses an operation the
+ # canonical record already names abandoned or swept, so the route for one
+ # of those starts at the uninstall.
+ local abandon="abandon --operation $OPERATION, " last="then delete namespace $NAMESPACE"
+ ! jq -e --arg op "$OPERATION" '.operation==$op and (.status|IN("abandoned","swept"))' "$STATE_DIR/operation.json" >/dev/null 2>&1 || abandon=''
+ [[ $(j .ingress.profile) != managed-traefik && $(j .tls.profile) != managed-acme && $(j .storage.profile) != managed-local-path ]] || last="delete namespace $NAMESPACE, then remove its managed add-ons and their CRDs (see the guide)"
+ printf 'into an empty namespace %s from a new site directory: on another cluster, or on this one once the deployment is removed (%shelm -n %s uninstall %s, sweep, %s)' "$NAMESPACE" "$abandon" "$NAMESPACE" "$RELEASE" "$last"
 }
 restore_fresh_fail() {
  # A restore whose evidence changed outside its recorded writes has one named
@@ -6013,8 +6018,8 @@ restore_archive() {
    # refusal below names restore-repair and resume, which continue it; once the
    # canonical record names that operation abandoned or swept, both refuse it,
    # so the refusal names the one route left, a fresh restore from a new site
-   # directory. restore_fresh_route names the operation to abandon, and this
-   # run holds none yet, so it names that one.
+   # directory. restore_fresh_route is asked about that operation, which this
+   # run does not hold: it finds it ended, so the route names no abandon.
    if [[ -f $STATE_DIR/restoration.json && ! -L $STATE_DIR/restoration.json && -f $STATE_DIR/operation.json && ! -L $STATE_DIR/operation.json ]]; then
      prior=$(jq -r 'select(.status!="complete")|.operation' "$STATE_DIR/restoration.json" 2>/dev/null) || prior=''
      [[ ! $prior =~ ^[a-f0-9]{24}$ ]] || ended=$(jq -r --arg op "$prior" 'select(.operation==$op)|.status' "$STATE_DIR/operation.json" 2>/dev/null) || ended=''
