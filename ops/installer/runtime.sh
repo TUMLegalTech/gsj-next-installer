@@ -1305,15 +1305,17 @@ preflight() {
  [[ -n $platform ]] || fail 'selected storage node is unavailable'
  while IFS= read -r nodes; do jq -e --arg p "$nodes" '.platforms | index($p)' "$GSJ_PAYLOAD/release.json" >/dev/null || fail "release has no qualified native images for $nodes"; done <<< "$platform"
  # get replicasets.apps: the initializer wait proves its Pod is this release's
- # own through the ReplicaSet that owns it, and is named here with the rest --
- # by the verbs that reach that wait, and by them alone: the other verbs never
- # get a ReplicaSet, and a Role that ran them on the previous release, which
- # asked for none, must still run them.
+ # own through the ReplicaSet that owns it. It is asked for by the verbs that
+ # reach that wait, and by them alone, and a denial is named, never refused:
+ # the previous release asked for none, a Role that ran it must still run
+ # this one, and the wait judges the Pod by its labels when the read is refused.
  permissions=('get pods' 'create pods' 'create secrets' 'create configmaps' 'create leases.coordination.k8s.io' 'patch deployments.apps')
  if [[ $COMMAND =~ ^(install|upgrade|resume|repair|restore|restore-repair)$ ]]; then permissions+=('get replicasets.apps'); fi
  permissions+=('create jobs.batch' 'get persistentvolumeclaims' 'create persistentvolumeclaims' 'create networkpolicies.networking.k8s.io')
  for permission in "${permissions[@]}"; do
-   read -r verb resource <<< "$permission"; [[ $(k auth can-i "$verb" "$resource") == yes ]] || fail "missing deployment permission: $permission"
+   read -r verb resource <<< "$permission"; [[ $(k auth can-i "$verb" "$resource") == yes ]] && continue
+   [[ $permission == 'get replicasets.apps' ]] || fail "missing deployment permission: $permission"
+   log "This kubeconfig may not get replicasets.apps in namespace $NAMESPACE, so the corpus initializer wait cannot prove that an application Pod is Deployment $RELEASE-web's own and judges a Pod that a ReplicaSet controls, carries release $RELEASE's labels and is not being deleted. Grant get on replicasets.apps to restore the proof"
  done
  # A referenced pull Secret is never created here. Refuse before the first
  # write instead of after image pulls back off; restore recreates it. sweep,

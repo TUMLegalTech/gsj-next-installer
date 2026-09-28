@@ -1067,11 +1067,15 @@ def test_preflight_asks_for_every_namespace_permission_in_its_first_seconds(runt
 
 
 @pytest.mark.parametrize("command", INITIALIZING)
-def test_a_credential_that_may_not_read_replicasets_is_refused_by_name(runtime, tmp_path, command):
+def test_a_credential_that_may_not_read_replicasets_is_warned_and_runs(runtime, tmp_path, command):
+    """The previous release never asked for get on replicasets.apps, so a Role
+    that ran these verbs then still runs them: preflight names the missing read
+    once, and the initializer wait judges the Pod by its labels instead."""
     run, state, work = runtime
     _baseline(tmp_path, state, work)
-    _refusal(_preflight(run, work, command, denied="get replicasets.apps"), state,
-             "missing deployment permission: get replicasets.apps")
+    result = _preflight(run, work, command, denied="get replicasets.apps")
+    _admitted(result, state)
+    _logged(result, "get replicasets.apps", "may not", "labels", "Grant")
 
 
 @pytest.mark.parametrize("command", NOT_INITIALIZING)

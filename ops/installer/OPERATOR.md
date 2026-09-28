@@ -1660,13 +1660,16 @@ asks in its first seconds (`kubectl auth can-i`) for what it creates there —
 Pods, Secrets, ConfigMaps, Leases, Jobs, PersistentVolumeClaims and
 NetworkPolicies, and patching Deployments — and, for the six verbs that wait
 for the corpus initializer (`install`, `upgrade`, `resume`, `repair`,
-`restore` and `restore-repair`), for `get` on ReplicaSets, and refuses by name
-(*"missing deployment permission: …"*, for example *"missing deployment
-permission: get replicasets.apps"*). The other verbs read no ReplicaSet and
-are not asked for it. The ReplicaSet read is how the wait for the corpus
-initializer proves that a Pod whose verdict it judges is this release's own: the Pod's ReplicaSet must belong to the
-release's Deployment. If that read is refused all the same once the wait has
-begun, the wait says so once — *"This kubeconfig may not get replicasets.apps
+`restore` and `restore-repair`), for `get` on ReplicaSets, and refuses a
+missing permission by name (*"missing deployment permission: …"*) — except the
+ReplicaSet read, which the previous release never asked for: its absence is
+logged (*"This kubeconfig may not get replicasets.apps in namespace …, so the
+corpus initializer wait cannot prove …"*) and the run goes on. The other verbs
+read no ReplicaSet and are not asked for it. The ReplicaSet read is how the
+wait for the corpus initializer proves that a Pod whose verdict it judges is
+this release's own: the Pod's ReplicaSet must belong to the release's
+Deployment. If that read is refused once the wait has begun, the wait says so
+once — *"This kubeconfig may not get replicasets.apps
 in namespace …, so an application Pod's owner chain to Deployment …-web cannot
 be proven; the wait judges a Pod that a ReplicaSet controls, carries release
 …'s labels and is not being deleted. Grant get on replicasets.apps to restore
